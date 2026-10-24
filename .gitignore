@@ -1,0 +1,12 @@
+# DeepUpgrade .gitignore
+node_modules/
+opencode_repo/
+.gradle/
+build/
+app/build/
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
+*.apk
+*.log

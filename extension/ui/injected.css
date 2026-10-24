@@ -1,0 +1,1082 @@
+/* Prevent DeepSeek action bar (copy, regenerate, thumbs up, etc.) from overlaying while tool is running */
+.opencode-tool-root[data-running="true"] ~ div:has(button[aria-label]),
+.opencode-tool-root[data-running="true"] ~ div:has(.ds-button),
+.opencode-tool-root[data-running="true"] ~ .ds-flex._0a3d93b {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: opacity 0.2s ease;
+}
+
+/* Also ensure tool widget itself isolates hover from parent bubble triggers */
+.opencode-tool-root {
+  pointer-events: auto;
+}
+.opencode-tool-root {
+  margin: 12px 0 14px 0;
+  width: 100%;
+  font-family: inherit;
+  animation: du-fade-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes du-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Header button: 1:1 match with DeepSeek "Thought for X seconds" */
+.opencode-tool-header-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent !important;
+  border: none !important;
+  padding: 3px 0 !important;
+  margin: 4px 0 6px 0;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+  color: #94a3b8;
+  border-radius: 4px;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.opencode-tool-header-btn:hover {
+  color: #e2e8f0;
+}
+
+/* Text styles matches the secondary collapsible headings on DeepSeek */
+.opencode-tool-text {
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: inherit;
+  line-height: 1.4;
+}
+
+/* Shimmer gradient effect while running */
+.opencode-tool-root[data-running="true"] .opencode-tool-text {
+  background: linear-gradient(
+    90deg,
+    #64748b 0%,
+    #64748b 35%,
+    #f8fafc 50%,
+    #64748b 65%,
+    #64748b 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: opencode-shimmer 1.6s infinite linear;
+}
+
+@keyframes opencode-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* Clean SVG chevron arrow */
+.opencode-tool-caret {
+  width: 14px;
+  height: 14px;
+  color: inherit;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* Folded by default: arrow points right (matches Thought for X seconds) */
+.opencode-tool-root[data-open="false"] .opencode-tool-caret {
+  transform: rotate(-90deg);
+}
+
+.opencode-tool-root[data-open="true"] .opencode-tool-caret {
+  transform: rotate(0deg);
+}
+
+/* Console Box with smooth slide-down animation */
+.opencode-terminal-box {
+  background: #141416;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  overflow: hidden;
+  font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.opencode-tool-root[data-open="false"] .opencode-terminal-box {
+  display: none;
+}
+
+.opencode-tool-root[data-open="true"] .opencode-terminal-box {
+  display: block;
+  animation: opencode-slide-down 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes opencode-slide-down {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Top section: Command & Git Diff */
+.opencode-terminal-input {
+  padding: 10px 14px;
+  color: #f4f4f5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #101012;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* OpenCode Git Diff styling */
+.du-diff-file-tag {
+  color: #94a3b8;
+  font-size: 11.5px;
+  margin-bottom: 6px;
+  opacity: 0.85;
+}
+
+.du-diff-del {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.12);
+  padding: 1px 6px;
+  border-left: 2px solid #ef4444;
+  margin: 1px 0;
+  border-radius: 2px;
+}
+
+.du-diff-add {
+  color: #4ade80;
+  background: rgba(34, 197, 94, 0.12);
+  padding: 1px 6px;
+  border-left: 2px solid #22c55e;
+  margin: 1px 0;
+  border-radius: 2px;
+}
+
+/* Bottom section: Output */
+.opencode-terminal-output {
+  padding: 10px 14px;
+  color: #a1a1aa;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #141416;
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+/* Hide user bubble if it contains the silent sandbox output */
+div.fbb737a4[data-du-silent="true"],
+.ds-message[data-du-silent="true"],
+div._11d6b3a[data-du-silent="true"] {
+  display: none !important;
+}
+
+/* Textarea & container anti-flicker: Lock container dimensions during silent operations */
+div._24fad49.du-locked-box,
+div._24fad49:has(textarea.du-freezing) {
+  max-height: 40px !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  overflow: hidden !important;
+}
+
+textarea.du-freezing,
+textarea[style*="height"].du-freezing {
+  height: 40px !important;
+  max-height: 40px !important;
+  min-height: 40px !important;
+  overflow: hidden !important;
+  color: transparent !important;
+  caret-color: transparent !important;
+}
+
+textarea.du-freezing::placeholder {
+  color: inherit !important;
+  opacity: 0.5 !important;
+}
+
+/* Hide action bar under any tool card message */
+div:has(> .opencode-tool-root) div.ds-flex._0a3d93b,
+div:has(> .opencode-tool-root) + div.ds-flex._0a3d93b,
+div:has(> .opencode-tool-root) ~ div.ds-flex._0a3d93b,
+.md-code-block[data-du-widget-attached="true"] + div.ds-flex._0a3d93b,
+.md-code-block[data-du-widget-attached="true"] ~ div.ds-flex._0a3d93b,
+div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
+  display: none !important;
+}
+
+/* Preemptive Instant Concealment */
+.md-code-block:has(pre[data-du-rendered="true"]) {
+  display: none !important;
+}
+
+/* --- Native Settings Tab: Skills Panel Styling --- */
+.du-native-skills-panel {
+  width: 100%;
+  padding-top: 6px;
+  animation: du-fade-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.du-native-skills-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.du-native-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+}
+
+.du-native-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-native-sub {
+  font-size: 12.5px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  margin-top: 2px;
+}
+
+.du-native-badge {
+  font-size: 11px;
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.du-native-skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.du-native-skill-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: 12px;
+  transition: background 0.15s;
+}
+
+.du-native-skill-row:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.du-native-skill-info {
+  flex: 1;
+}
+
+.du-native-skill-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.du-skill-svg-icon {
+  width: 14px;
+  height: 14px;
+  color: #3b82f6;
+  flex-shrink: 0;
+}
+
+/* Empty state styling */
+.du-skills-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.02));
+  border: 1px dashed var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 12px;
+  color: #71717a;
+  text-align: center;
+  gap: 8px;
+}
+
+.du-empty-text {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-empty-hint {
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  max-width: 360px;
+  line-height: 1.4;
+}
+
+/* Smart Import Box (Native DeepSeek Design System & Premium Minimalist Aesthetics) */
+.du-native-add-box {
+  margin-top: 8px;
+  padding: 16px;
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.025));
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.du-native-add-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-native-add-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.du-smart-import-area {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Modern Pill-like Search/Input Bar with Icon */
+.du-input-with-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.du-input-wrapper {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.du-input-icon {
+  position: absolute;
+  left: 12px;
+  color: var(--dsw-alias-label-tertiary, #71717a);
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.du-input {
+  width: 100%;
+  padding: 9px 12px 9px 34px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  color: var(--dsw-alias-label-primary, #ededed);
+  font-family: inherit;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+  box-sizing: border-box;
+}
+
+.du-input::placeholder {
+  color: var(--dsw-alias-label-tertiary, #71717a);
+  font-size: 12px;
+}
+
+.du-input:focus {
+  border-color: #3b82f6;
+  background: rgba(0, 0, 0, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+.du-btn-primary {
+  background: #3b82f6;
+  color: #ffffff;
+  border: none;
+  padding: 9px 16px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, transform 0.1s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.du-btn-primary:hover {
+  background: #2563eb;
+}
+
+.du-btn-primary:active {
+  transform: scale(0.98);
+}
+
+.du-drop-divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--dsw-alias-label-tertiary, #71717a);
+  font-size: 11px;
+  margin: 2px 0;
+}
+.du-drop-divider::before,
+.du-drop-divider::after {
+  content: '';
+  flex: 1;
+  border-bottom: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+}
+.du-drop-divider span {
+  padding: 0 10px;
+  font-weight: 400;
+}
+
+/* Subtle Modern Dropzone */
+.du-file-dropzone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1px dashed var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.12));
+  border-radius: 10px;
+  padding: 12px 14px;
+  text-align: center;
+  background: rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  color: var(--dsw-alias-label-secondary, #a1a1aa);
+}
+
+.du-file-dropzone:hover,
+.du-file-dropzone.dragover {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.05);
+  color: #3b82f6;
+}
+
+.du-dropzone-text {
+  font-size: 12px;
+  color: inherit;
+}
+
+.du-browse-link {
+  color: #60a5fa;
+  text-decoration: none;
+  font-weight: 500;
+}
+.du-browse-link:hover {
+  text-decoration: underline;
+}
+
+/* DeepSeek Styled Textarea */
+.du-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  color: var(--dsw-alias-label-primary, #ededed);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 64px;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+}
+
+.du-textarea::placeholder {
+  color: var(--dsw-alias-label-tertiary, #71717a);
+  font-size: 12px;
+}
+
+.du-textarea:focus {
+  border-color: #3b82f6;
+  background: rgba(0, 0, 0, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+/* Elegant Install Button */
+.du-btn-install {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.12));
+  color: var(--dsw-alias-label-primary, #ededed);
+  padding: 8px 16px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+}
+
+.du-btn-install:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.du-btn-install:active {
+  transform: scale(0.98);
+}
+
+.du-skill-main-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-native-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.du-native-tag.builtin {
+  background: rgba(59, 130, 246, 0.15);
+  color: #93c5fd;
+}
+
+.du-native-tag.custom {
+  background: rgba(168, 85, 247, 0.18);
+  color: #c084fc;
+}
+
+.du-native-skill-desc {
+  font-size: 12.5px;
+  color: var(--dsw-alias-label-secondary, #a1a1aa);
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+
+.du-native-prompt-box {
+  font-size: 11px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  color: #94a3b8;
+  white-space: pre-wrap;
+  max-height: 55px;
+  overflow-y: auto;
+}
+
+.du-native-skill-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.du-native-del-btn {
+  background: transparent;
+  border: none;
+  color: #71717a;
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+}
+
+.du-native-del-btn:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.12);
+}
+
+/* Switch Toggle */
+.du-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+}
+.du-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.du-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #3f3f46;
+  transition: .2s;
+  border-radius: 20px;
+}
+.du-slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .2s;
+  border-radius: 50%;
+}
+.du-switch input:checked + .du-slider {
+  background-color: #3b82f6;
+}
+.du-switch input:checked + .du-slider:before {
+  transform: translateX(16px);
+}
+
+/* Hide native DeepSeek floating action bar (copy/regenerate/read aloud) when hovering over active OpenCode tool widget */
+.opencode-tool-root ~ div._0a3d93b,
+.opencode-tool-root ~ div._11d6b3a,
+div:has(> .opencode-tool-root[data-running="true"]) ~ div._0a3d93b,
+div:has(> .opencode-tool-root[data-running="true"]) div._0a3d93b,
+div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
+  display: none !important;
+}
+
+/* --- Inline VFS Media & Artifact Rendering (Images & File Cards) --- */
+.du-vfs-image-card {
+  margin: 12px 0 16px 0;
+  display: inline-block;
+  max-width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #141416;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+}
+
+.du-vfs-image-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+  background: #0d0e10;
+  cursor: zoom-in;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.du-vfs-image-preview.du-zoomed {
+  max-height: none;
+  cursor: zoom-out;
+}
+
+.du-vfs-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #1a1b1e;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11.5px;
+  color: #94a3b8;
+}
+
+.du-vfs-file-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0;
+  padding: 10px 14px;
+  background: #18191c;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  color: #e2e8f0;
+  text-decoration: none;
+  transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  box-sizing: border-box;
+  max-width: 360px;
+  user-select: none;
+}
+
+.du-vfs-file-card:hover {
+  background: #212226;
+  border-color: rgba(255, 255, 255, 0.18);
+  transform: translateY(-1px);
+}
+
+.du-vfs-file-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.du-vfs-file-info {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex: 1;
+}
+
+.du-vfs-file-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #f1f5f9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.du-vfs-file-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
+.du-vfs-download-btn {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  padding: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+}
+
+.du-vfs-download-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* --- Interactive Question / Prompt Tool Widget (OpenCode Quiet Luxury 1:1) --- */
+.du-question-card {
+  padding: 16px 18px;
+  background: #141416;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  margin: 10px 0 14px 0;
+  font-family: inherit;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+}
+
+.du-question-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #f1f5f9;
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+
+.du-question-header svg {
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.du-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.du-question-opt-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #1c1d21;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  color: #e2e8f0;
+  font-size: 13.5px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.du-question-opt-btn:hover {
+  background: #25262c;
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #fff;
+}
+
+.du-question-opt-btn.selected {
+  background: #232730;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+.du-question-radio {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1.5px solid #64748b;
+  display: inline-block;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+  box-sizing: border-box;
+}
+
+.du-question-opt-btn.selected .du-question-radio {
+  border-color: #3b82f6;
+  background: radial-gradient(circle, #3b82f6 45%, transparent 50%);
+}
+
+.du-question-custom-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.du-question-input {
+  flex: 1;
+  background: #111214;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  padding: 9px 14px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+
+.du-question-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+.du-question-submit-btn {
+  background: #3b82f6;
+  color: #ffffff;
+  border: none;
+  padding: 9px 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.du-question-submit-btn:hover {
+  background: #2563eb;
+}
+
+.du-question-submit-btn:active {
+  transform: scale(0.98);
+}
+
+/* =========================================================================
+   Project Selector Dropdown (Exact Match with Figma Design)
+   ========================================================================= */
+.du-project-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 8px 16px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  user-select: none;
+}
+
+.du-project-select-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: transparent;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: #D5D5D5;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.du-project-select-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+.du-project-select-btn svg {
+  color: #94A3B8;
+  flex-shrink: 0;
+}
+
+.du-project-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #94A3B8;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.du-project-add-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+/* Subtle inner input area container separation matching Figma 2nd screenshot */
+div._24fad49:has(.du-project-bar),
+div:has(> .du-project-bar) {
+  padding-top: 2px !important;
+}
+
+div._24fad49:has(.du-project-bar) textarea {
+  padding-top: 10px !important;
+}
+.du-todo-float-panel {
+  position: fixed;
+  right: 24px;
+  top: 72px;
+  width: 280px;
+  background: #363638;
+  border-radius: 14px;
+  padding: 16px 18px;
+  box-shadow: none !important;
+  border: none !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "SF Pro Text", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: du-todo-appear 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  user-select: none;
+}
+
+@keyframes du-todo-appear {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.du-todo-badge {
+  font-size: 13px;
+  font-weight: 400;
+  color: #D5D5D5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1;
+  letter-spacing: -0.01em;
+}
+
+.du-todo-badge-icon {
+  width: 13px;
+  height: 13px;
+  color: #D5D5D5;
+}
+
+.du-todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.du-todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  word-break: break-word;
+}
+
+.du-todo-marker {
+  width: 14px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.du-todo-marker svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Status colors exact matching Figma */
+.du-todo-item.in-progress .du-todo-marker svg {
+  color: #FF8A00;
+}
+.du-todo-item.in-progress .du-todo-title {
+  color: #FFFFFF;
+  font-weight: 400;
+}
+
+.du-todo-item.pending .du-todo-marker svg {
+  color: #D5D5D5;
+}
+.du-todo-item.pending .du-todo-title {
+  color: #FFFFFF;
+}
+
+.du-todo-item.completed .du-todo-marker svg {
+  color: #555558;
+}
+.du-todo-item.completed .du-todo-title {
+  color: #7E7E82;
+}
+  transform: scale(0.98);
+}
+
+
+

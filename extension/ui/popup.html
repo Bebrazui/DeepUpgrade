@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>DeepUpgrade Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1013;
+      color: #e5e7eb;
+      padding: 16px;
+    }
+    h2 {
+      font-size: 16px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #fff;
+    }
+    .badge {
+      font-size: 10px;
+      background: #4d6bfe;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #fff;
+    }
+    .section {
+      margin-bottom: 16px;
+      background: #17181c;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #9ca3af;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 13px;
+    }
+    .row:last-child { margin-bottom: 0; }
+    select, input[type="text"] {
+      background: #0b0c0e;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #fff;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      outline: none;
+    }
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 38px;
+      height: 22px;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #374151;
+      transition: .2s;
+      border-radius: 22px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: #4d6bfe; }
+    input:checked + .slider:before { transform: translateX(16px); }
+    .status-text {
+      font-size: 11px;
+      color: #10b981;
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>⚡ DeepUpgrade <span class="badge">v1.0</span></h2>
+
+  <div class="section">
+    <div class="section-title">Инструменты & Песочница</div>
+    <div class="row">
+      <span>Tool Use (Bash/JS)</span>
+      <label class="toggle">
+        <input type="checkbox" id="toolToggle" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row">
+      <span>Автозапуск кода</span>
+      <label class="toggle">
+        <input type="checkbox" id="autoRunToggle" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="status-text">● Fetch Interceptor активен</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Приватность & Сеть</div>
+    <div class="row">
+      <span>Блокировка /api/v0/telemetry</span>
+      <label class="toggle">
+        <input type="checkbox" id="blockTelemetryToggle" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row">
+      <span>Direct Network API (Эксперимент)</span>
+      <label class="toggle">
+        <input type="checkbox" id="directNetworkApiToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div style="font-size: 11px; color: #9ca3af; margin-top: 6px; line-height: 1.3;">
+      Отправка шагов ReAct без кликов DOM — напрямую через /api/v0/chat/completion с динамическим PoW.
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Хранилище /added/ (OPFS)</div>
+    <div class="row">
+      <span>Автоочистка файлов</span>
+      <select id="cleanupDaysSelect">
+        <option value="1">1 день</option>
+        <option value="3">3 дня</option>
+        <option value="7" selected>7 дней</option>
+        <option value="14">14 дней</option>
+        <option value="30">30 дней</option>
+        <option value="0">Никогда</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Тема оформления</div>
+    <div class="row">
+      <span>Пресет</span>
+      <select id="themeSelect">
+        <option value="default">Default Dark</option>
+        <option value="oled">Pure OLED Black</option>
+        <option value="cyberpunk">Cyberpunk Neon</option>
+        <option value="glass">Liquid Glass</option>
+      </select>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "DeepUpgrade - Supercharged DeepSeek",
+  "version": "1.1.0",
+  "description": "Adds Tool Use (Bash/JS/Charts Sandbox), Theme Studio, and Advanced Controls to chat.deepseek.com",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "<all_urls>"
+  ],
+  "sandbox": {
+    "pages": ["sandbox/runner.html"]
+  },
+  "action": {
+    "default_popup": "ui/popup.html",
+    "default_title": "DeepUpgrade Settings"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["interceptor.js", "content.js"],
+      "css": ["ui/injected.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sandbox/runner.html",
+        "sandbox/pyodide/*",
+        "ui/*"
+      ],
+      "matches": ["https://chat.deepseek.com/*"]
+    }
+  ]
+}
