@@ -1822,80 +1822,77 @@ function injectAgentToggleButton() {
 let currentProjectName = localStorage.getItem('du_active_project') || 'DeepUpgrade';
 
 function injectProjectSelector() {
-  const inputContext = findDeepSeekInput();
-  if (!inputContext) return;
+  // Target the exact DeepSeek input card container from DOM
+  const card = document.querySelector('div._77cefa5._9996a53') || 
+               document.querySelector('div._020ab5b')?.parentElement ||
+               findDeepSeekInput()?.closest('div:has(textarea)');
+  if (!card) return;
 
-  const container = inputContext.closest('form, div:has(textarea), div:has([contenteditable])') || inputContext.parentElement;
-  if (!container || container.getAttribute('data-du-project-injected') === 'true' || container.querySelector('.du-project-bar')) return;
+  const parent = card.parentElement;
+  if (!parent) return;
 
-  // Mark container to prevent recursive MutationObserver loops
-  container.setAttribute('data-du-project-injected', 'true');
-  container.classList.add('du-has-project-bar');
+  let outerPlate = card.previousElementSibling?.classList.contains('du-project-plate') ? card.previousElementSibling : null;
+  
+  if (!outerPlate) {
+    // If not yet injected, create the outer card wrapper behind the input card
+    if (!parent.classList.contains('du-project-outer-wrapper')) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'du-project-outer-wrapper';
+      parent.insertBefore(wrapper, card);
+      
+      const bar = document.createElement('div');
+      bar.className = 'du-project-top-bar';
+      bar.innerHTML = `
+        <button class="du-project-select-btn" type="button" title="Выбрать активный проект">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+          </svg>
+          <span class="du-project-name">${escapeHtml(currentProjectName)}</span>
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
+            <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button class="du-project-add-btn" type="button" title="Открыть папку с диска в VFS">+</button>
+        <input type="file" class="du-project-folder-input" webkitdirectory directory multiple style="display: none;">
+      `;
 
-  const bar = document.createElement('div');
-  bar.className = 'du-project-bar';
+      const addBtn = bar.querySelector('.du-project-add-btn');
+      const fileInput = bar.querySelector('.du-project-folder-input');
+      addBtn.onclick = () => fileInput.click();
+      fileInput.onchange = async (e) => {
+        const files = e.target.files;
+        if (!files || files.length === 0) return;
+        const firstRel = files[0].webkitRelativePath || '';
+        const folderName = firstRel.split('/')[0] || 'Project';
+        currentProjectName = folderName;
+        localStorage.setItem('du_active_project', currentProjectName);
+        bar.querySelector('.du-project-name').innerText = currentProjectName;
 
-  bar.innerHTML = `
-    <button class="du-project-select-btn" type="button" title="Выбрать активный проект">
-      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-      </svg>
-      <span class="du-project-name">${escapeHtml(currentProjectName)}</span>
-      <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
-        <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-      </svg>
-    </button>
-    <button class="du-project-add-btn" type="button" title="Открыть папку с диска в VFS">+</button>
-    <input type="file" class="du-project-folder-input" webkitdirectory directory multiple style="display: none;">
-  `;
-
-  const addBtn = bar.querySelector('.du-project-add-btn');
-  const fileInput = bar.querySelector('.du-project-folder-input');
-
-  addBtn.onclick = () => {
-    fileInput.click();
-  };
-
-  fileInput.onchange = async (e) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-
-    const firstRel = files[0].webkitRelativePath || '';
-    const folderName = firstRel.split('/')[0] || 'Project';
-    currentProjectName = folderName;
-    localStorage.setItem('du_active_project', currentProjectName);
-    bar.querySelector('.du-project-name').innerText = currentProjectName;
-
-    let treeList = [];
-    console.log(`[DeepUpgrade Project] 📂 Импорт папки "${folderName}" (${files.length} файлов)...`);
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.webkitRelativePath.includes('/.git/') || file.webkitRelativePath.includes('/node_modules/')) continue;
-
-      const vfsPath = '/' + file.webkitRelativePath;
-      treeList.push(vfsPath);
-
-      try {
-        const text = await file.text();
-        if (sandboxIframe && sandboxIframe.contentWindow) {
-          sandboxIframe.contentWindow.postMessage({
-            type: 'DU_STORE_ATTACHMENT',
-            path: vfsPath,
-            data: text,
-            isBinary: false,
-            mtime: file.lastModified
-          }, '*');
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          if (file.webkitRelativePath.includes('/.git/') || file.webkitRelativePath.includes('/node_modules/')) continue;
+          const vfsPath = '/' + file.webkitRelativePath;
+          try {
+            const text = await file.text();
+            if (sandboxIframe && sandboxIframe.contentWindow) {
+              sandboxIframe.contentWindow.postMessage({
+                type: 'DU_STORE_ATTACHMENT',
+                path: vfsPath,
+                data: text,
+                isBinary: false,
+                mtime: file.lastModified
+              }, '*');
+            }
+          } catch (err) {
+            console.warn('[DeepUpgrade Project] Не удалось прочитать файл:', file.name, err);
+          }
         }
-      } catch (err) {
-        console.warn('[DeepUpgrade Project] Не удалось прочитать файл:', file.name, err);
-      }
+      };
+
+      wrapper.appendChild(bar);
+      wrapper.appendChild(card);
     }
-
-    console.log(`[DeepUpgrade Project] ✅ Папка "${folderName}" успешно смонтирована в VFS!`);
-  };
-
-  container.insertBefore(bar, container.firstChild);
+  }
 }
 
 const observer = new MutationObserver(() => {

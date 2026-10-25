@@ -962,38 +962,47 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   color: #FFFFFF;
 }
 
-/* 1:1 Figma: Nested Inner Input Pill Card */
-div.du-has-project-bar {
-  background: #1c1d21 !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  border-radius: 20px !important;
-  padding: 4px !important;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35) !important;
-}
-
-div.du-has-project-bar .du-inner-input-card {
-  background: #25262b !important;
-  border: 1px solid rgba(255, 255, 255, 0.07) !important;
-  border-radius: 16px !important;
-  padding: 10px 14px 8px 14px !important;
-  margin: 0 2px 2px 2px !important;
-  display: flex !important;
-  flex-direction: column !important;
-  transition: border-color 0.15s ease, background 0.15s ease !important;
-}
-
-div.du-has-project-bar .du-inner-input-card:focus-within {
-  border-color: rgba(255, 255, 255, 0.16) !important;
-  background: #28292f !important;
-}
-
-/* Remove default conflicting backgrounds/borders from DeepSeek inner wrapper */
-div.du-has-project-bar textarea {
+/* 1:1 Figma Outer Container Behind DeepSeek Input Card */
+.du-project-outer-wrapper {
   background: transparent !important;
   border: none !important;
-  box-shadow: none !important;
-  padding: 2px 0 6px 0 !important;
-  color: #FFFFFF !important;
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  box-sizing: border-box !important;
+  width: 100% !important;
+}
+
+.du-project-top-bar {
+  background: #1c1d21 !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-left: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-bottom: none !important;
+  border-top-left-radius: 20px !important;
+  border-top-right-radius: 20px !important;
+  border-bottom-left-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+  padding: 8px 14px 28px 14px !important;
+  margin-bottom: -22px !important;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  box-sizing: border-box !important;
+  width: 100% !important;
+  position: relative !important;
+  z-index: 1 !important;
+}
+
+/* DeepSeek native card sits on top with its original rounded corners intact */
+.du-project-outer-wrapper > div._77cefa5._9996a53,
+.du-project-outer-wrapper > div:has(textarea) {
+  margin: 0 !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+  position: relative !important;
+  z-index: 2 !important;
 }
 .du-todo-float-panel {
   position: fixed;
