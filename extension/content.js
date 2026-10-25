@@ -1826,21 +1826,11 @@ function injectProjectSelector() {
   if (!inputContext) return;
 
   const container = inputContext.closest('form, div:has(textarea), div:has([contenteditable])') || inputContext.parentElement;
-  if (!container || container.querySelector('.du-project-bar')) return;
+  if (!container || container.getAttribute('data-du-project-injected') === 'true' || container.querySelector('.du-project-bar')) return;
 
+  // Mark container to prevent recursive MutationObserver loops
+  container.setAttribute('data-du-project-injected', 'true');
   container.classList.add('du-has-project-bar');
-
-  // Wrap textarea & its bottom toolbar inside .du-inner-input-card to match Figma 1:1 nested design
-  if (!container.querySelector('.du-inner-input-card')) {
-    const innerCard = document.createElement('div');
-    innerCard.className = 'du-inner-input-card';
-    
-    // Move all current children of container into innerCard
-    while (container.firstChild) {
-      innerCard.appendChild(container.firstChild);
-    }
-    container.appendChild(innerCard);
-  }
 
   const bar = document.createElement('div');
   bar.className = 'du-project-bar';
