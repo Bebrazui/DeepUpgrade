@@ -904,15 +904,14 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
 }
 
 /* =========================================================================
-   Project Selector Dropdown (Exact Match with Figma Design)
+   Project Selector & Nested Inner Input Card (Exact 1:1 Figma Match)
    ========================================================================= */
+/* The outer container gets the top project bar */
 .du-project-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 16px 8px 16px;
-  margin-bottom: 2px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px 16px 8px 16px;
   user-select: none;
 }
 
@@ -922,7 +921,7 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   gap: 7px;
   background: transparent;
   border: none;
-  padding: 4px 8px;
+  padding: 3px 6px;
   border-radius: 6px;
   color: #D5D5D5;
   font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
@@ -946,8 +945,8 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   background: transparent;
   border: none;
   border-radius: 4px;
@@ -963,14 +962,38 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   color: #FFFFFF;
 }
 
-/* Subtle inner input area container separation matching Figma 2nd screenshot */
-div._24fad49:has(.du-project-bar),
-div:has(> .du-project-bar) {
-  padding-top: 2px !important;
+/* 1:1 Figma: Nested Inner Input Pill Card */
+div.du-has-project-bar {
+  background: #1c1d21 !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-radius: 20px !important;
+  padding: 4px !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35) !important;
 }
 
-div._24fad49:has(.du-project-bar) textarea {
-  padding-top: 10px !important;
+div.du-has-project-bar .du-inner-input-card {
+  background: #25262b !important;
+  border: 1px solid rgba(255, 255, 255, 0.07) !important;
+  border-radius: 16px !important;
+  padding: 10px 14px 8px 14px !important;
+  margin: 0 2px 2px 2px !important;
+  display: flex !important;
+  flex-direction: column !important;
+  transition: border-color 0.15s ease, background 0.15s ease !important;
+}
+
+div.du-has-project-bar .du-inner-input-card:focus-within {
+  border-color: rgba(255, 255, 255, 0.16) !important;
+  background: #28292f !important;
+}
+
+/* Remove default conflicting backgrounds/borders from DeepSeek inner wrapper */
+div.du-has-project-bar textarea {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 2px 0 6px 0 !important;
+  color: #FFFFFF !important;
 }
 .du-todo-float-panel {
   position: fixed;

@@ -1828,6 +1828,20 @@ function injectProjectSelector() {
   const container = inputContext.closest('form, div:has(textarea), div:has([contenteditable])') || inputContext.parentElement;
   if (!container || container.querySelector('.du-project-bar')) return;
 
+  container.classList.add('du-has-project-bar');
+
+  // Wrap textarea & its bottom toolbar inside .du-inner-input-card to match Figma 1:1 nested design
+  if (!container.querySelector('.du-inner-input-card')) {
+    const innerCard = document.createElement('div');
+    innerCard.className = 'du-inner-input-card';
+    
+    // Move all current children of container into innerCard
+    while (container.firstChild) {
+      innerCard.appendChild(container.firstChild);
+    }
+    container.appendChild(innerCard);
+  }
+
   const bar = document.createElement('div');
   bar.className = 'du-project-bar';
 
@@ -1849,7 +1863,6 @@ function injectProjectSelector() {
   const fileInput = bar.querySelector('.du-project-folder-input');
 
   addBtn.onclick = () => {
-    // Open system folder picker
     fileInput.click();
   };
 
@@ -1857,7 +1870,6 @@ function injectProjectSelector() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    // Detect folder root name
     const firstRel = files[0].webkitRelativePath || '';
     const folderName = firstRel.split('/')[0] || 'Project';
     currentProjectName = folderName;
@@ -1869,13 +1881,11 @@ function injectProjectSelector() {
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      // Skip .git, node_modules, .DS_Store
       if (file.webkitRelativePath.includes('/.git/') || file.webkitRelativePath.includes('/node_modules/')) continue;
 
       const vfsPath = '/' + file.webkitRelativePath;
       treeList.push(vfsPath);
 
-      // Read content and send to OPFS runner
       try {
         const text = await file.text();
         if (sandboxIframe && sandboxIframe.contentWindow) {
