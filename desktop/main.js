@@ -19,6 +19,13 @@ app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-proces
 app.commandLine.appendSwitch('enable-features', 'NetworkService,NetworkServiceInProcess');
 app.commandLine.appendSwitch('disable-site-isolation-trials');
 
+// Key fix for Google Accounts: prevent Google from identifying embedded framework / webview
+app.commandLine.appendSwitch('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36');
+app.commandLine.appendSwitch('lang', 'ru-RU');
+app.commandLine.appendSwitch('webrtc-max-cpu-consumption-percentage', '100');
+app.commandLine.appendSwitch('enable-webgl');
+app.commandLine.appendSwitch('ignore-certificate-errors');
+
 // Config file path in user data directory
 const CONFIG_PATH = path.join(app.getPath('userData'), 'deepupgrade_config.json');
 
@@ -124,8 +131,29 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false // needed for preload to execute local bridge operations
+      nativeWindowOpen: true,
+      webSecurity: true,
+      sandbox: false
     }
+  });
+
+  // Handle Google OAuth popups seamlessly: give popup full Chrome identity
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: 500,
+        height: 650,
+        autoHideMenuBar: true,
+        title: 'Sign in with Google',
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          nativeWindowOpen: true,
+          sandbox: true
+        }
+      }
+    };
   });
 
   mainWindow.setMenuBarVisibility(false);
