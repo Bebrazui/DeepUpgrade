@@ -3490,34 +3490,43 @@ function injectProjectSelector() {
 function injectNewProjectButton() {
   if (document.querySelector('.du-new-project-btn')) return;
 
-  // Exact target from DevTools tree:
-  // div._7b40dad > div.dc1f7bec._4bcc731
-  const newChatWrapper = document.querySelector('div.dc1f7bec._4bcc731') || 
-                         document.querySelector('div._5a8ac7a.a084f19e')?.parentElement;
+  // Find "New chat" button in sidebar by text content or icon
+  let newChatBtn = null;
+  const allBtns = document.querySelectorAll('div[tabindex="0"], a, button');
+  for (const el of allBtns) {
+    if (el.textContent && el.textContent.trim().toLowerCase().includes('new chat')) {
+      newChatBtn = el;
+      break;
+    }
+  }
 
+  if (!newChatBtn) return;
+
+  // The wrapper or container of the new chat button
+  const newChatWrapper = newChatBtn.closest('.dc1f7bec') || newChatBtn.parentElement;
   if (!newChatWrapper || !newChatWrapper.parentElement) return;
 
-  const parent = newChatWrapper.parentElement; // div._7b40dad
+  const parent = newChatWrapper.parentElement;
   if (parent.querySelector('.du-new-project-btn')) return;
 
-  // Create an identical wrapper matching dc1f7bec _4bcc731
+  // Create an identical wrapper matching new chat wrapper
   const projWrapper = document.createElement('div');
   projWrapper.className = (newChatWrapper.className || '') + ' du-new-project-wrapper';
-  projWrapper.style.cssText = 'margin-top: 8px !important; margin-bottom: 4px !important; width: 100% !important; box-sizing: border-box !important; position: relative !important; z-index: 10 !important;';
+  projWrapper.style.cssText = 'margin-top: 8px !important; margin-bottom: 6px !important; width: 100% !important; box-sizing: border-box !important; position: relative !important; z-index: 10 !important;';
 
   const btn = document.createElement('div');
-  btn.className = '_5a8ac7a a084f19e du-new-project-btn';
+  btn.className = (newChatBtn.className || '_5a8ac7a a084f19e') + ' du-new-project-btn';
   btn.setAttribute('tabindex', '0');
   btn.style.cssText = 'justify-content: center; cursor: pointer; height: 38px; min-height: 38px; box-sizing: border-box;';
 
   btn.innerHTML = `
-    <div class="ds-icon _1c42ad7" style="font-size: 16px; width: 16px; height: 16px;">
+    <div class="ds-icon _1c42ad7" style="font-size: 16px; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;">
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">
         <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
         <path d="M8 7V11M6 9H10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
       </svg>
     </div>
-    <span>New project</span>
+    <span style="margin-left: 8px; font-weight: 500;">New project</span>
     <div class="ds-focus-ring"></div>
   `;
 
