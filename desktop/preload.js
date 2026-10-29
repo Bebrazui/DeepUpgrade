@@ -116,7 +116,8 @@ contextBridge.exposeInMainWorld('__DU_DESKTOP__', {
   } catch (e) {}
 })();
 
-  // Inject seamless custom drag region for modern titleBarOverlay
+// Inject seamless custom drag region for modern titleBarOverlay
+window.addEventListener('DOMContentLoaded', () => {
   const dragBar = document.createElement('div');
   dragBar.id = 'du-desktop-drag-region';
   dragBar.style.cssText = `
