@@ -1463,31 +1463,11 @@ html[data-du-theme] body {
 
 /* Sidebar New Project button: exact 1:1 match with New chat button */
 .du-new-project-btn {
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  gap: 8px !important;
-  font-size: 14px !important;
-  font-weight: 500 !important;
-  color: var(--dsw-alias-label-primary, #e5e7eb) !important;
-  background: var(--dsw-alias-bg-layer-1, rgba(255, 255, 255, 0.05)) !important;
-  border-radius: 12px !important;
-  padding: 8px 12px !important;
-  border: 1px solid var(--dsw-alias-border-inverted2, rgba(255, 255, 255, 0.08)) !important;
-  transition: background 0.15s ease, border-color 0.15s ease !important;
-  cursor: pointer !important;
-  user-select: none !important;
+  position: relative !important;
   box-sizing: border-box !important;
   width: 100% !important;
-  height: 38px !important;
-  min-height: 38px !important;
-  max-height: 38px !important;
-  line-height: normal !important;
-  position: relative !important;
-}
-.du-new-project-btn:hover {
-  background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.1)) !important;
-  color: #ffffff !important;
+  cursor: pointer !important;
+  user-select: none !important;
 }
 
 .du-new-project-btn::after,
@@ -1527,18 +1507,7 @@ html[data-du-theme] body {
   box-sizing: border-box !important;
 }
 
-/* Hard reset any browser visited link color for du-new-project-btn */
-.du-new-project-btn,
-.du-new-project-btn > span:not(.du-new-project-badge) {
-  color: var(--dsw-alias-label-primary, #e5e7eb) !important;
-  text-decoration: none !important;
-}
-.du-new-project-btn:hover,
-.du-new-project-btn:hover > span:not(.du-new-project-badge) {
-  color: #ffffff !important;
-}
-
-.du-new-project-btn .du-new-project-badge,
-.du-new-project-btn:hover .du-new-project-badge {
+/* Let DeepSeek's native classes (_5a8ac7a etc) handle hover/active backgrounds naturally */
+.du-new-project-btn .du-new-project-badge {
   color: #73777D !important;
 }
