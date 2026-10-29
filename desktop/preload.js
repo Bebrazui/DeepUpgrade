@@ -31,4 +31,19 @@ window.addEventListener('DOMContentLoaded', () => {
       get: () => false
     });
   } catch (e) {}
+
+  // Inject seamless custom drag region for modern titleBarOverlay
+  const dragBar = document.createElement('div');
+  dragBar.id = 'du-desktop-drag-region';
+  dragBar.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 140px;
+    height: 35px;
+    z-index: 999999;
+    -webkit-app-region: drag;
+    pointer-events: none;
+  `;
+  document.documentElement.appendChild(dragBar);
 });

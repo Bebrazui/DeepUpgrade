@@ -95,6 +95,12 @@ function createMainWindow() {
     minHeight: 600,
     title: 'DeepSeek - DeepUpgrade Desktop',
     backgroundColor: '#131416',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#131416',
+      symbolColor: '#8b909a',
+      height: 35
+    },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
