@@ -327,7 +327,10 @@ function buildSystemDirective() {
 - JavaScript / Node-compatible async executor`;
 
   if (window.__DU_DESKTOP__ && window.__DU_DESKTOP__.isDesktop) {
-    const desktopCfg = (typeof window.__DU_DESKTOP_CONFIG__ === 'object' && window.__DU_DESKTOP_CONFIG__) || {};
+    const desktopCfg = (window.__DU_DESKTOP__ && window.__DU_DESKTOP__.config)
+      || (typeof window.__DU_DESKTOP_CONFIG__ === 'object' && window.__DU_DESKTOP_CONFIG__)
+      || (typeof getDesktopConfigDirect === 'function' ? getDesktopConfigDirect() : null)
+      || {};
     const shellInfo = desktopCfg.shell || { name: 'PowerShell / System Terminal', type: 'powershell' };
     const isPowershell = shellInfo.type === 'powershell' || shellInfo.id === 'powershell' || shellInfo.id === 'pwsh';
 
@@ -335,7 +338,14 @@ function buildSystemDirective() {
 - Current OS: Windows NT x86_64
 - Configured Native Shell: ${shellInfo.name} (${shellInfo.path || shellInfo.id})
 - Active Working Directory: Local PC Filesystem
-${isPowershell ? '- IMPORTANT FOR TERMINAL: Use native PowerShell / Windows commands (e.g. Get-ComputerInfo, dir, Get-ChildItem, systeminfo, hostname). Do NOT use Linux-specific flags like "ls -la" (use "dir" or "Get-ChildItem").' : '- IMPORTANT FOR TERMINAL: Use POSIX bash commands.'}`;
+${isPowershell ? `- IMPORTANT FOR TERMINAL & DAEMONS:
+  * You are running inside Windows PowerShell on the host PC!
+  * Use native Windows/PowerShell commands (e.g. "Get-ChildItem -Path C:\\rider", "Select-String", "Test-Path"). Never use "uname -a" or "ls -la /".
+  * LONG RUNNING SERVERS / BACKGROUND COMMANDS: If the user asks to start a server (e.g. Python server, Vite, npm, node), DO NOT run "python -m http.server" synchronously, because that will block the terminal execution!
+    Instead, launch it in the background using:
+    Start-Process python -ArgumentList "-m http.server 8000" -WindowStyle Hidden
+    (or Start-Job { python -m http.server 8000 })
+    This lets the server run continuously without hanging your response.` : '- IMPORTANT FOR TERMINAL: Use POSIX bash commands. For background servers, append " &" to detach.'}`;
   }
 
   return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]
@@ -741,31 +751,74 @@ function runInSandbox(toolObj) {
           return;
         }
 
-        if (name === 'write_file' || name === 'create_file') {
-          const path = args.path || args.filePath || '';
-          const content = args.content || args.file_text || '';
+        if (name === 'write' || name === 'write_file' || name === 'create_file') {
+          const path = args.path || toolObj.path || args.filePath || '';
+          const content = args.content ?? toolObj.content ?? args.file_text ?? args.text ?? toolObj.text ?? '';
           const res = await window.__DU_DESKTOP__.fs.writeFile(path, content);
           resolve({
             id,
             success: res.ok,
-            output: res.ok ? `File written: ${path}` : `Write error: ${res.error}`
+            output: res.ok ? `Successfully wrote ${content.length} characters to '${path}'.` : `Write error: ${res.error}`
           });
           return;
         }
 
-        if (name === 'read_file' || name === 'view_file') {
-          const path = args.path || args.filePath || '';
+        if (name === 'read' || name === 'read_file' || name === 'view_file') {
+          const path = args.path || toolObj.path || args.filePath || '';
           const res = await window.__DU_DESKTOP__.fs.readFile(path);
+          if (!res.ok) {
+            resolve({ id, success: false, output: `Read error: ${res.error}` });
+            return;
+          }
+          const raw = res.data || '';
+          const offset = Math.max(1, parseInt(args.offset || toolObj.offset || '1', 10));
+          const limit = (args.limit !== undefined || toolObj.limit !== undefined)
+            ? parseInt(args.limit || toolObj.limit, 10)
+            : 2000;
+          const allLines = raw.split('\n');
+          const totalLines = allLines.length;
+          const slice = allLines.slice(offset - 1, offset - 1 + limit);
+          let formatted = slice.map((line, idx) => {
+            const lineNum = (offset + idx).toString().padStart(5, ' ');
+            return `${lineNum} | ${line}`;
+          }).join('\n');
+          if (offset + limit <= totalLines) {
+            formatted += `\n... [${totalLines - (offset - 1 + limit)} more lines. Use offset=${offset + limit} to continue]`;
+          }
           resolve({
             id,
-            success: res.ok,
-            output: res.ok ? res.data : `Read error: ${res.error}`
+            success: true,
+            output: formatted
+          });
+          return;
+        }
+
+        if (name === 'edit' || name === 'edit_file') {
+          const path = args.path || toolObj.path || '';
+          const oldStr = args.old_str ?? toolObj.old_str ?? args.oldStr ?? '';
+          const newStr = args.new_str ?? toolObj.new_str ?? args.newStr ?? '';
+          const readRes = await window.__DU_DESKTOP__.fs.readFile(path);
+          if (!readRes.ok) {
+            resolve({ id, success: false, output: `Edit error reading file: ${readRes.error}` });
+            return;
+          }
+          const fileContent = readRes.data || '';
+          if (!fileContent.includes(oldStr)) {
+            resolve({ id, success: false, output: `Edit error: old_str was not found in '${path}'.` });
+            return;
+          }
+          const updated = fileContent.replace(oldStr, newStr);
+          const writeRes = await window.__DU_DESKTOP__.fs.writeFile(path, updated);
+          resolve({
+            id,
+            success: writeRes.ok,
+            output: writeRes.ok ? `Successfully replaced text in '${path}'.` : `Edit error writing file: ${writeRes.error}`
           });
           return;
         }
 
         if (name === 'list_files' || name === 'ls') {
-          const path = args.path || args.dirPath || '.';
+          const path = args.path || toolObj.path || args.dirPath || '.';
           const res = await window.__DU_DESKTOP__.fs.listDir(path);
           resolve({
             id,

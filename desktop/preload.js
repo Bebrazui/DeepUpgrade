@@ -2,13 +2,17 @@
 // Bridges real Node.js FS & Shell capabilities to window.__DU_DESKTOP__
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Async fetch config into global scope
-ipcRenderer.invoke('desktop:get-config').then(cfg => {
-  window.__DU_DESKTOP_CONFIG__ = cfg;
-});
+// Synchronously fetch config at preload time so it is immediately available
+let initialConfig = null;
+try {
+  initialConfig = ipcRenderer.sendSync('desktop:get-config-sync');
+} catch (e) {
+  console.warn('[DU Preload] sync config fetch failed:', e);
+}
 
 contextBridge.exposeInMainWorld('__DU_DESKTOP__', {
   isDesktop: true,
+  config: initialConfig,
   getConfig: () => ipcRenderer.invoke('desktop:get-config'),
   selectDirectory: () => ipcRenderer.invoke('desktop:select-directory'),
   

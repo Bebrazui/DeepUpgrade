@@ -175,13 +175,13 @@ function createMainWindow() {
     }
   });
 
-  // Inject content.js and injected.css automatically when pages load
+  // Inject content.js and injected.css as soon as the DOM is ready (much faster than did-finish-load)
   const extDir = path.resolve(__dirname, '..', 'extension');
   const contentJsPath = path.join(extDir, 'content.js');
   const injectedCssPath = path.join(extDir, 'ui', 'injected.css');
 
-  mainWindow.webContents.on('did-finish-load', async () => {
-    const currentUrl = mainWindow.webContents.getURL();
+  const injectExtensionAssets = async () => {
+    const currentUrl = mainWindow ? mainWindow.webContents.getURL() : '';
     if (currentUrl.includes('chat.deepseek.com')) {
       // Inject CSS
       try {
@@ -203,7 +203,10 @@ function createMainWindow() {
         console.error('Failed to inject content.js:', err);
       }
     }
-  });
+  };
+
+  mainWindow.webContents.on('dom-ready', injectExtensionAssets);
+  mainWindow.webContents.on('did-finish-load', injectExtensionAssets);
 
   // Navigate to DeepSeek
   mainWindow.loadURL('https://chat.deepseek.com/', {
@@ -242,6 +245,10 @@ ipcMain.handle('setup:launch-app', async () => {
 // -------------------------------------------------------------
 // IPC Handlers: Real Host FS & Terminal
 // -------------------------------------------------------------
+ipcMain.on('desktop:get-config-sync', (event) => {
+  event.returnValue = loadConfig();
+});
+
 ipcMain.handle('desktop:get-config', async () => {
   return loadConfig();
 });
