@@ -1,0 +1,22 @@
+{
+  "name": "deepupgrade-desktop",
+  "version": "1.0.0",
+  "description": "DeepUpgrade Desktop - Autonomous Native OpenCode Agent for DeepSeek",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [
+    "deepseek",
+    "opencode",
+    "agent",
+    "desktop",
+    "posix",
+    "terminal"
+  ],
+  "author": "Bebrazui",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}
