@@ -3537,6 +3537,7 @@ function injectNewProjectButton() {
       </svg>
     </div>
     <span style="margin-left: 8px; font-weight: 500;">New project</span>
+    <span class="du-new-project-badge">Alt + P</span>
     <div class="ds-focus-ring"></div>
   `;
 
@@ -3556,6 +3557,19 @@ function injectNewProjectButton() {
       btn.click();
     }
   });
+
+  // Global Alt+P shortcut handler
+  if (!window.__du_alt_p_bound) {
+    window.__du_alt_p_bound = true;
+    window.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.key === 'p' || e.key === 'P' || e.code === 'KeyP')) {
+        e.preventDefault();
+        e.stopPropagation();
+        const activeBtn = document.querySelector('.du-new-project-btn');
+        if (activeBtn) activeBtn.click();
+      }
+    }, true);
+  }
 
   projWrapper.appendChild(btn);
   projContainer.appendChild(projWrapper);
