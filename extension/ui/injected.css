@@ -1502,9 +1502,9 @@ html[data-du-theme] body {
   display: inline-flex !important;
   align-items: center !important;
   justify-content: center !important;
-  font-size: 12px !important;
+  font-size: 14px !important;
   font-weight: 400 !important;
-  color: #71767b !important;
+  color: #73777D !important;
   background: transparent !important;
   border: none !important;
   padding: 0 !important;
@@ -1517,6 +1517,7 @@ html[data-du-theme] body {
 
 .du-new-project-btn:hover .du-new-project-badge {
   opacity: 1 !important;
+  color: #73777D !important;
 }
 
 .du-new-project-wrapper {
@@ -1528,12 +1529,16 @@ html[data-du-theme] body {
 
 /* Hard reset any browser visited link color for du-new-project-btn */
 .du-new-project-btn,
-.du-new-project-btn *,
-.du-new-project-btn span {
+.du-new-project-btn > span:not(.du-new-project-badge) {
   color: var(--dsw-alias-label-primary, #e5e7eb) !important;
   text-decoration: none !important;
 }
 .du-new-project-btn:hover,
-.du-new-project-btn:hover * {
+.du-new-project-btn:hover > span:not(.du-new-project-badge) {
   color: #ffffff !important;
+}
+
+.du-new-project-btn .du-new-project-badge,
+.du-new-project-btn:hover .du-new-project-badge {
+  color: #73777D !important;
 }
