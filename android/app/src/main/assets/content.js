@@ -3502,13 +3502,13 @@ function injectNewProjectButton() {
 
   // Create an identical wrapper matching dc1f7bec _4bcc731
   const projWrapper = document.createElement('div');
-  projWrapper.className = newChatWrapper.className;
-  projWrapper.style.cssText = 'margin-top: 6px;';
+  projWrapper.className = (newChatWrapper.className || '') + ' du-new-project-wrapper';
+  projWrapper.style.cssText = 'margin-top: 8px !important; margin-bottom: 4px !important; width: 100% !important; box-sizing: border-box !important; position: relative !important; z-index: 10 !important;';
 
   const btn = document.createElement('div');
   btn.className = '_5a8ac7a a084f19e du-new-project-btn';
   btn.setAttribute('tabindex', '0');
-  btn.style.cssText = 'justify-content: center; cursor: pointer;';
+  btn.style.cssText = 'justify-content: center; cursor: pointer; height: 38px; min-height: 38px; box-sizing: border-box;';
 
   btn.innerHTML = `
     <div class="ds-icon _1c42ad7" style="font-size: 16px; width: 16px; height: 16px;">

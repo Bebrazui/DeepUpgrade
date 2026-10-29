@@ -1479,10 +1479,21 @@ html[data-du-theme] body {
   user-select: none !important;
   box-sizing: border-box !important;
   width: 100% !important;
+  height: 38px !important;
+  min-height: 38px !important;
+  max-height: 38px !important;
+  line-height: normal !important;
 }
 .du-new-project-btn:hover {
   background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.1)) !important;
   color: #ffffff !important;
+}
+
+.du-new-project-wrapper {
+  margin-top: 8px !important;
+  margin-bottom: 4px !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
 }
 
 /* Hard reset any browser visited link color for du-new-project-btn */
