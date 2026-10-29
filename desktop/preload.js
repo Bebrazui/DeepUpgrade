@@ -2,6 +2,11 @@
 // Bridges real Node.js FS & Shell capabilities to window.__DU_DESKTOP__
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Async fetch config into global scope
+ipcRenderer.invoke('desktop:get-config').then(cfg => {
+  window.__DU_DESKTOP_CONFIG__ = cfg;
+});
+
 contextBridge.exposeInMainWorld('__DU_DESKTOP__', {
   isDesktop: true,
   getConfig: () => ipcRenderer.invoke('desktop:get-config'),

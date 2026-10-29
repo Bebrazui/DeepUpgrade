@@ -319,13 +319,28 @@ function buildSystemDirective() {
     }).join('\n');
   }
 
-  return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]
-You are DeepUpgrade, an autonomous AI software engineer and terminal runtime environment powered by OpenCode architecture.
-You have direct access to a high-performance in-browser WebAssembly POSIX sandbox:
+  // Detect whether running in Desktop environment with real OS terminal
+  let envHeader = `You have direct access to a high-performance in-browser WebAssembly POSIX sandbox:
 - Isolated Virtual File System (VFS mounted at root '/')
 - POSIX Shell with core utilities & network access (curl, fetch)
 - Python 3.12 (Pyodide WASM runtime with standard libraries)
-- JavaScript / Node-compatible async executor
+- JavaScript / Node-compatible async executor`;
+
+  if (window.__DU_DESKTOP__ && window.__DU_DESKTOP__.isDesktop) {
+    const desktopCfg = (typeof window.__DU_DESKTOP_CONFIG__ === 'object' && window.__DU_DESKTOP_CONFIG__) || {};
+    const shellInfo = desktopCfg.shell || { name: 'PowerShell / System Terminal', type: 'powershell' };
+    const isPowershell = shellInfo.type === 'powershell' || shellInfo.id === 'powershell' || shellInfo.id === 'pwsh';
+
+    envHeader = `You have DIRECT NATIVE ACCESS to the host computer operating system:
+- Current OS: Windows NT x86_64
+- Configured Native Shell: ${shellInfo.name} (${shellInfo.path || shellInfo.id})
+- Active Working Directory: Local PC Filesystem
+${isPowershell ? '- IMPORTANT FOR TERMINAL: Use native PowerShell / Windows commands (e.g. Get-ComputerInfo, dir, Get-ChildItem, systeminfo, hostname). Do NOT use Linux-specific flags like "ls -la" (use "dir" or "Get-ChildItem").' : '- IMPORTANT FOR TERMINAL: Use POSIX bash commands.'}`;
+  }
+
+  return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]
+You are DeepUpgrade, an autonomous AI software engineer and terminal runtime environment powered by OpenCode architecture.
+${envHeader}
 
 ═══════════════════════════════════════════════════════════
 TOOL SELECTION & USAGE MATRIX (STRICT ADHERENCE REQUIRED)
@@ -705,6 +720,76 @@ window.addEventListener('pagehide', () => {
 });
 
 function runInSandbox(toolObj) {
+  // If running in DeepUpgrade Desktop, route directly to real OS terminal & FS!
+  if (window.__DU_DESKTOP__ && window.__DU_DESKTOP__.isDesktop) {
+    return new Promise(async (resolve) => {
+      const id = Math.random().toString(36).slice(2);
+      const name = toolObj.name || toolObj.tool;
+      const args = toolObj.args || {};
+
+      try {
+        if (name === 'bash' || name === 'sh' || name === 'terminal' || name === 'exec') {
+          const cmd = args.command || args.cmd || toolObj.command || '';
+          const cwd = args.cwd || localStorage.getItem('du_desktop_cwd') || undefined;
+          const res = await window.__DU_DESKTOP__.terminal.exec(cmd, cwd);
+          const out = (res.stdout || '') + (res.stderr ? (res.stdout ? '\n' : '') + res.stderr : '');
+          resolve({
+            id,
+            success: res.ok,
+            output: out || (res.ok ? '(command completed with no output)' : `Exit code: ${res.exitCode}`)
+          });
+          return;
+        }
+
+        if (name === 'write_file' || name === 'create_file') {
+          const path = args.path || args.filePath || '';
+          const content = args.content || args.file_text || '';
+          const res = await window.__DU_DESKTOP__.fs.writeFile(path, content);
+          resolve({
+            id,
+            success: res.ok,
+            output: res.ok ? `File written: ${path}` : `Write error: ${res.error}`
+          });
+          return;
+        }
+
+        if (name === 'read_file' || name === 'view_file') {
+          const path = args.path || args.filePath || '';
+          const res = await window.__DU_DESKTOP__.fs.readFile(path);
+          resolve({
+            id,
+            success: res.ok,
+            output: res.ok ? res.data : `Read error: ${res.error}`
+          });
+          return;
+        }
+
+        if (name === 'list_files' || name === 'ls') {
+          const path = args.path || args.dirPath || '.';
+          const res = await window.__DU_DESKTOP__.fs.listDir(path);
+          resolve({
+            id,
+            success: res.ok,
+            output: res.ok ? res.entries.map(e => (e.isDirectory ? '[DIR] ' : '') + e.name).join('\n') : `List error: ${res.error}`
+          });
+          return;
+        }
+
+        // Fallback to real terminal execution for any other command
+        const fallbackCmd = args.command || args.cmd || JSON.stringify(args);
+        const res = await window.__DU_DESKTOP__.terminal.exec(fallbackCmd);
+        resolve({
+          id,
+          success: res.ok,
+          output: res.stdout || res.stderr || 'Executed'
+        });
+      } catch (err) {
+        resolve({ id, success: false, output: `Desktop Bridge Error: ${err.message}` });
+      }
+    });
+  }
+
+  // Otherwise browser/sandbox iframe execution
   return new Promise((resolve) => {
     if (!sandboxIframe || !sandboxIframe.contentWindow) {
       initSandboxIframe();
