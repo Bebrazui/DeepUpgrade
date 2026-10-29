@@ -3490,7 +3490,6 @@ function injectProjectSelector() {
 function injectNewProjectButton() {
   if (document.querySelector('.du-new-project-btn')) return;
 
-  // Find "New chat" button in sidebar by text content or icon
   let newChatBtn = null;
   const allBtns = document.querySelectorAll('div[tabindex="0"], a, button');
   for (const el of allBtns) {
@@ -3502,22 +3501,29 @@ function injectNewProjectButton() {
 
   if (!newChatBtn) return;
 
-  // The wrapper or container of the new chat button
-  const newChatWrapper = newChatBtn.closest('.dc1f7bec') || newChatBtn.parentElement;
-  if (!newChatWrapper || !newChatWrapper.parentElement) return;
+  // The wrapper of the new chat button is div.dc1f7bee._4bcc731
+  // Its parent div._7b40dad is a container with fixed geometry!
+  const newChatWrapper = newChatBtn.closest('.dc1f7bee') || newChatBtn.parentElement;
+  if (!newChatWrapper) return;
 
-  const parent = newChatWrapper.parentElement;
-  if (parent.querySelector('.du-new-project-btn')) return;
+  const topSection = newChatWrapper.parentElement; // div._7b40dad
+  if (!topSection || !topSection.parentElement) return;
 
-  // Create an identical wrapper matching new chat wrapper
+  if (topSection.parentElement.querySelector('.du-new-project-container')) return;
+
+  // Create an identical top-level container to place AFTER div._7b40dad
+  const projContainer = document.createElement('div');
+  projContainer.className = (topSection.className || '_7b40dad') + ' du-new-project-container';
+  projContainer.style.cssText = 'margin-top: 6px !important; margin-bottom: 4px !important; width: 100% !important; box-sizing: border-box !important;';
+
   const projWrapper = document.createElement('div');
-  projWrapper.className = (newChatWrapper.className || '') + ' du-new-project-wrapper';
-  projWrapper.style.cssText = 'margin-top: 8px !important; margin-bottom: 6px !important; width: 100% !important; box-sizing: border-box !important; position: relative !important; z-index: 10 !important;';
+  projWrapper.className = newChatWrapper.className || 'dc1f7bee _4bcc731';
+  projWrapper.style.cssText = 'width: 100% !important; box-sizing: border-box !important;';
 
   const btn = document.createElement('div');
-  btn.className = (newChatBtn.className || '_5a8ac7a a084f19e') + ' du-new-project-btn';
+  btn.className = (newChatBtn.className || '_5a8ac7a') + ' du-new-project-btn';
   btn.setAttribute('tabindex', '0');
-  btn.style.cssText = 'justify-content: center; cursor: pointer; height: 38px; min-height: 38px; box-sizing: border-box;';
+  btn.style.cssText = 'justify-content: center; cursor: pointer; box-sizing: border-box;';
 
   btn.innerHTML = `
     <div class="ds-icon _1c42ad7" style="font-size: 16px; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;">
@@ -3548,7 +3554,8 @@ function injectNewProjectButton() {
   });
 
   projWrapper.appendChild(btn);
-  parent.insertBefore(projWrapper, newChatWrapper.nextSibling);
+  projContainer.appendChild(projWrapper);
+  topSection.parentElement.insertBefore(projContainer, topSection.nextSibling);
 }
 
 const observer = new MutationObserver(() => {
