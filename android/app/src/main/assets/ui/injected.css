@@ -1489,6 +1489,12 @@ html[data-du-theme] body {
   color: #ffffff !important;
 }
 
+.du-new-project-btn::after,
+.du-new-project-btn::before {
+  display: none !important;
+  content: none !important;
+}
+
 .du-new-project-wrapper {
   margin-top: 8px !important;
   margin-bottom: 4px !important;

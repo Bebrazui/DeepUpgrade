@@ -3521,7 +3521,11 @@ function injectNewProjectButton() {
   projWrapper.style.cssText = 'width: 100% !important; box-sizing: border-box !important;';
 
   const btn = document.createElement('div');
-  btn.className = (newChatBtn.className || '_5a8ac7a') + ' du-new-project-btn';
+  const cleanClass = (newChatBtn.className || '_5a8ac7a')
+    .split(/\s+/)
+    .filter(c => c && !c.includes('a084f19e'))
+    .join(' ');
+  btn.className = (cleanClass || '_5a8ac7a') + ' du-new-project-btn';
   btn.setAttribute('tabindex', '0');
   btn.style.cssText = 'justify-content: center; cursor: pointer; box-sizing: border-box;';
 
