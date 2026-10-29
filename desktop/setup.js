@@ -1,51 +1,46 @@
-// DeepUpgrade Setup UI Controller
+// DeepUpgrade Setup UI Controller (matching popup.js style)
 let availableShells = [];
-let selectedShell = null;
 
 async function initSetup() {
-  const countEl = document.getElementById('shell-count');
-  const container = document.getElementById('shells-container');
+  const shellSelect = document.getElementById('shellSelect');
+  const btnLaunch = document.getElementById('btnLaunch');
+  const btnClose = document.getElementById('btnClose');
+  const permExec = document.getElementById('permExec');
+  const permFs = document.getElementById('permFs');
+  const themeSelect = document.getElementById('themeSelect');
+
+  if (btnClose) {
+    btnClose.onclick = () => window.electronAPI.closeWindow();
+  }
 
   try {
     availableShells = await window.electronAPI.getAvailableShells();
-    countEl.innerText = `Найдено: ${availableShells.length}`;
-
-    container.innerHTML = '';
-    availableShells.forEach((shell, idx) => {
-      const item = document.createElement('div');
-      item.className = 'shell-item' + (shell.recommended || idx === 0 ? ' selected' : '');
-      if (shell.recommended || idx === 0) selectedShell = shell;
-
-      item.innerHTML = `
-        <div class="shell-info">
-          <div class="shell-name">
-            <span>${shell.name}</span>
-            ${shell.recommended ? '<span class="tag-rec">Рекомендуется</span>' : ''}
-          </div>
-          <div class="shell-path">${shell.path}</div>
-        </div>
-        <div class="radio-circle"></div>
-      `;
-
-      item.onclick = () => {
-        document.querySelectorAll('.shell-item').forEach(el => el.classList.remove('selected'));
-        item.classList.add('selected');
-        selectedShell = shell;
-      };
-
-      container.appendChild(item);
+    shellSelect.innerHTML = '';
+    
+    availableShells.forEach((shell) => {
+      const opt = document.createElement('option');
+      opt.value = shell.id;
+      opt.textContent = shell.name + (shell.recommended ? ' ★' : '');
+      if (shell.recommended) opt.selected = true;
+      shellSelect.appendChild(opt);
     });
+
+    if (shellSelect.selectedIndex === -1 && shellSelect.options.length > 0) {
+      shellSelect.selectedIndex = 0;
+    }
   } catch (err) {
-    countEl.innerText = 'Ошибка поиска';
     console.error(err);
   }
 
-  // Launch button
-  document.getElementById('btn-launch').onclick = async () => {
+  btnLaunch.onclick = async () => {
+    const selectedId = shellSelect.value;
+    const selectedObj = availableShells.find(s => s.id === selectedId) || availableShells[0] || null;
+
     const config = {
-      shell: selectedShell,
-      autoExec: document.getElementById('perm-auto-exec').checked,
-      fsAccess: document.getElementById('perm-fs').checked,
+      shell: selectedObj,
+      autoExec: permExec.checked,
+      fsAccess: permFs.checked,
+      theme: themeSelect.value,
       completed: true
     };
 

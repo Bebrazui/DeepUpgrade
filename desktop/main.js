@@ -63,12 +63,14 @@ function configureStealthSession(ses) {
 
 function createSetupWindow() {
   setupWindow = new BrowserWindow({
-    width: 680,
-    height: 640,
+    width: 380,
+    height: 480,
     resizable: false,
     maximizable: false,
+    frame: false,
+    transparent: false,
     title: 'DeepUpgrade Desktop Setup',
-    backgroundColor: '#131416',
+    backgroundColor: '#101114',
     webPreferences: {
       preload: path.join(__dirname, 'preload-setup.js'),
       contextIsolation: true,
@@ -152,6 +154,12 @@ ipcMain.handle('setup:get-shells', async () => {
 
 ipcMain.handle('setup:save-config', async (event, cfg) => {
   return saveConfig(cfg);
+});
+
+ipcMain.handle('setup:close-window', async () => {
+  if (setupWindow) {
+    setupWindow.close();
+  }
 });
 
 ipcMain.handle('setup:launch-app', async () => {
