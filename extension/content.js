@@ -728,8 +728,8 @@ function runInSandbox(toolObj) {
       const args = toolObj.args || {};
 
       try {
-        if (name === 'bash' || name === 'sh' || name === 'terminal' || name === 'exec') {
-          const cmd = args.command || args.cmd || toolObj.command || '';
+        if (name === 'bash' || name === 'sh' || name === 'terminal' || name === 'exec' || name === 'powershell' || name === 'cmd') {
+          const cmd = args.command || args.cmd || toolObj.command || toolObj.code || '';
           const cwd = args.cwd || localStorage.getItem('du_desktop_cwd') || undefined;
           const res = await window.__DU_DESKTOP__.terminal.exec(cmd, cwd);
           const out = (res.stdout || '') + (res.stderr ? (res.stdout ? '\n' : '') + res.stderr : '');
@@ -776,8 +776,9 @@ function runInSandbox(toolObj) {
         }
 
         // Fallback to real terminal execution for any other command
-        const fallbackCmd = args.command || args.cmd || JSON.stringify(args);
-        const res = await window.__DU_DESKTOP__.terminal.exec(fallbackCmd);
+        const fallbackCmd = args.command || args.cmd || toolObj.command || toolObj.code || JSON.stringify(args);
+        const cwd = args.cwd || localStorage.getItem('du_desktop_cwd') || undefined;
+        const res = await window.__DU_DESKTOP__.terminal.exec(fallbackCmd, cwd);
         resolve({
           id,
           success: res.ok,
@@ -2243,6 +2244,12 @@ function isToolBlockStructurallyComplete(text) {
   const value = String(text || '');
   if (extractBalancedJsonObjects(value).length > 0) return true;
 
+  // Non-JSON raw code block (e.g. bash / powershell / sh)
+  if (!text.includes('"tool"')) {
+    // If it's pure shell script or text, it is complete once it has closing fence or is not currently growing
+    if (value.trim().endsWith('```')) return true;
+  }
+
   const trimmed = value.trim().replace(/```\s*$/, '').trimEnd();
   if (!trimmed.endsWith('}')) return false;
 
@@ -2652,10 +2659,16 @@ function createToolCard() {
     </div>
   `;
   const btn = root.querySelector('.opencode-tool-header-btn');
-  btn.onclick = () => {
+  const toggle = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     const isOpen = root.getAttribute('data-open') === 'true';
     root.setAttribute('data-open', !isOpen ? 'true' : 'false');
   };
+  btn.onclick = toggle;
+  btn.addEventListener('click', toggle, { capture: true });
   return root;
 }
 

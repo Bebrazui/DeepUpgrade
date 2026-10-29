@@ -163,6 +163,18 @@ function createMainWindow() {
 
   mainWindow.setMenuBarVisibility(false);
 
+  // Enable DevTools shortcut (F12 or Ctrl+Shift+I) for debugging
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12' || (input.control && input.shift && (input.key.toLowerCase() === 'i' || input.code === 'KeyI'))) {
+      if (mainWindow.webContents.isDevToolsOpened()) {
+        mainWindow.webContents.closeDevTools();
+      } else {
+        mainWindow.webContents.openDevTools({ mode: 'detach' });
+      }
+      event.preventDefault();
+    }
+  });
+
   // Inject content.js and injected.css automatically when pages load
   const extDir = path.resolve(__dirname, '..', 'extension');
   const contentJsPath = path.join(extDir, 'content.js');
