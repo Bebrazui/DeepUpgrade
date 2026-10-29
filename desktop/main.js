@@ -54,34 +54,39 @@ let mainWindow = null;
 let setupWindow = null;
 
 // Stealth Anti-Detect configuration:
-// Replaces typical Electron fingerprints with authentic Google Chrome on Windows 10/11
-const AUTHENTIC_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+// Google explicitly blocks embedded Chromium/Electron when it detects typical Chrome UA without official Google API keys.
+// The proven universal bypass used by Discord / Slack / Teams for Google OAuth is the Firefox Windows desktop UA:
+const AUTHENTIC_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0';
 
 function configureStealthSession(ses) {
   // 1. Spoof User-Agent globally
   ses.setUserAgent(AUTHENTIC_USER_AGENT);
 
-  // 2. Full authentic Google Chrome HTTP Headers & Client Hints
   ses.webRequest.onBeforeSendHeaders((details, callback) => {
     const url = details.url || '';
     
-    // Inject full realistic Chrome 130 Headers
-    details.requestHeaders['User-Agent'] = AUTHENTIC_USER_AGENT;
-    details.requestHeaders['sec-ch-ua'] = '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"';
-    details.requestHeaders['sec-ch-ua-mobile'] = '?0';
-    details.requestHeaders['sec-ch-ua-platform'] = '"Windows"';
-    details.requestHeaders['sec-ch-ua-platform-version'] = '"15.0.0"';
-    details.requestHeaders['sec-ch-ua-full-version-list'] = '"Chromium";v="130.0.6723.70", "Google Chrome";v="130.0.6723.70", "Not?A_Brand";v="99.0.0.0"';
+    // For Google login endpoints, strictly use the Firefox/Chrome clean headers without Chromium automation leaks
+    if (url.includes('google.com') || url.includes('gstatic.com') || url.includes('googleusercontent.com')) {
+      details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0';
+      delete details.requestHeaders['sec-ch-ua'];
+      delete details.requestHeaders['sec-ch-ua-mobile'];
+      delete details.requestHeaders['sec-ch-ua-platform'];
+      delete details.requestHeaders['sec-ch-ua-platform-version'];
+      delete details.requestHeaders['sec-ch-ua-full-version-list'];
+    } else {
+      details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+      details.requestHeaders['sec-ch-ua'] = '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"';
+      details.requestHeaders['sec-ch-ua-mobile'] = '?0';
+      details.requestHeaders['sec-ch-ua-platform'] = '"Windows"';
+    }
+    
     details.requestHeaders['Accept-Language'] = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7';
-
-    // Remove any automation or leaking headers
     delete details.requestHeaders['X-Requested-With'];
     delete details.requestHeaders['Sec-Fetch-User'];
 
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 
-  // 3. Prevent CSP or site isolation from blocking auth
   ses.webRequest.onHeadersReceived((details, callback) => {
     callback({ cancel: false, responseHeaders: details.responseHeaders });
   });
