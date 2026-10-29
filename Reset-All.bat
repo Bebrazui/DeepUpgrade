@@ -1,38 +1,36 @@
 @echo off
-chcp 65001 >nul
-title DeepUpgrade - Полный сброс
+title DeepUpgrade - Full Reset
 
-echo.
 echo ========================================================
-echo       DeepUpgrade Desktop: ПОЛНЫЙ СБРОС (WIPE ALL)
+echo       DeepUpgrade Desktop: FULL WIPE (RESET ALL)
 echo ========================================================
 echo.
-echo ВНИМАНИЕ: Будут удалены все настройки, конфиги, кеш
-echo и данные авторизации (сессия аккаунта DeepSeek).
+echo WARNING: This will remove all settings, caches,
+echo and account login session data.
 echo.
-set /p CONFIRM="Вы уверены, что хотите выполнить полный сброс? (Y/N): "
+set /p CONFIRM="Are you sure you want to completely reset? (Y/N): "
 if /i not "%CONFIRM%"=="Y" (
-    echo Сброс отменён.
+    echo Reset cancelled.
     pause
     exit /b 0
 )
 
 echo.
-echo [1/2] Завершение активных процессов Electron...
+echo [1/2] Terminating Electron processes...
 taskkill /F /IM electron.exe >nul 2>&1
 
-echo [2/2] Удаление директории профиля пользователя...
+echo [2/2] Removing user profile directory...
 set "TARGET_DIR=%APPDATA%\deepupgrade-desktop"
 if exist "%TARGET_DIR%" (
     rmdir /S /Q "%TARGET_DIR%" >nul 2>&1
-    echo Данные успешно удалены: %TARGET_DIR%
+    echo User profile directory removed successfully.
 ) else (
-    echo Папка профиля уже пуста.
+    echo Profile directory is already clean.
 )
 
 echo.
-echo [OK] Полный сброс успешно завершён.
-echo При следующем запуске откроется первичная настройка.
+echo [SUCCESS] Full wipe complete.
+echo Setup will appear on the next launch.
 echo.
 pause
 exit /b 0
