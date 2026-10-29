@@ -13,6 +13,12 @@ if (!gotTheLock) {
   process.exit(0);
 }
 
+// Full stealth flags for Chromium to bypass Google OAuth & Cloudflare bot detection
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
+app.commandLine.appendSwitch('enable-features', 'NetworkService,NetworkServiceInProcess');
+app.commandLine.appendSwitch('disable-site-isolation-trials');
+
 // Config file path in user data directory
 const CONFIG_PATH = path.join(app.getPath('userData'), 'deepupgrade_config.json');
 
@@ -50,8 +56,14 @@ function configureStealthSession(ses) {
 
   // 2. Strip Electron/automation headers from all outgoing requests
   ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const url = details.url || '';
+    // Special handling for accounts.google.com to ensure clean Google OAuth flow
+    if (url.includes('accounts.google.com') || url.includes('google.com/signin')) {
+      details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    } else {
+      details.requestHeaders['User-Agent'] = AUTHENTIC_USER_AGENT;
+    }
     delete details.requestHeaders['Sec-Fetch-User'];
-    details.requestHeaders['User-Agent'] = AUTHENTIC_USER_AGENT;
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 

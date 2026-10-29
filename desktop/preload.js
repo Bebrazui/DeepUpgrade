@@ -25,11 +25,24 @@ contextBridge.exposeInMainWorld('__DU_DESKTOP__', {
 
 // Suppress automation / unsafe browser flags inside the webview DOM
 window.addEventListener('DOMContentLoaded', () => {
-  // Prevent website detecting navigator.webdriver
+  // Prevent website detecting navigator.webdriver & automation properties
   try {
     Object.defineProperty(navigator, 'webdriver', {
-      get: () => false
+      get: () => undefined
     });
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+  } catch (e) {}
+
+  // Emulate chrome runtime to satisfy Google OAuth checks
+  try {
+    if (!window.chrome) {
+      window.chrome = {};
+    }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = {};
+    }
   } catch (e) {}
 
   // Inject seamless custom drag region for modern titleBarOverlay
