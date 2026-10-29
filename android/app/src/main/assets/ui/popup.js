@@ -65,7 +65,15 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   toolToggle.addEventListener('change', () => {
+    console.log('[DeepUpgrade Popup] Setting du_tools_enabled to:', toolToggle.checked);
     chrome.storage.local.set({ du_tools_enabled: toolToggle.checked });
+    // Notify active tab
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]?.id) {
+        console.log('[DeepUpgrade Popup] Sending set_agent_enabled message to tab', tabs[0].id);
+        chrome.tabs.sendMessage(tabs[0].id, { action: 'set_agent_enabled', value: toolToggle.checked });
+      }
+    });
   });
 
   autoRunToggle.addEventListener('change', () => {

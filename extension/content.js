@@ -1,5 +1,232 @@
-// DeepUpgrade - OpenCode Authentic Core v7.0 (Skills Engine & Settings Integration)
+(function initDuThemeEngine() {
+  'use strict';
+
+  const THEMES = ['default', 'oled', 'cyberpunk', 'glass'];
+
+  function normalizeTheme(value) {
+    return THEMES.indexOf(value) === -1 ? 'default' : value;
+  }
+
+  function applyTheme(value) {
+    const theme = normalizeTheme(value);
+    const root = document.documentElement;
+    if (root) {
+      if (theme === 'default') root.removeAttribute('data-du-theme');
+      else root.setAttribute('data-du-theme', theme);
+    }
+    try {
+      localStorage.setItem('du_theme', theme);
+    } catch (e) { /* private mode / disabled storage */ }
+    return theme;
+  }
+
+  function storedTheme() {
+    try {
+      return normalizeTheme(localStorage.getItem('du_theme'));
+    } catch (e) {
+      return 'default';
+    }
+  }
+
+  function init() {
+    const current = storedTheme();
+    if (current !== 'default') applyTheme(current);
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+      chrome.storage.local.get(['du_theme'], (res) => {
+        if (res && res.du_theme && res.du_theme !== 'default') applyTheme(res.du_theme);
+      });
+      if (chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== 'local' || !changes || !changes.du_theme) return;
+          applyTheme(changes.du_theme.newValue);
+        });
+      }
+    } catch (e) { /* storage API unavailable (Android WebView) */ }
+  }
+
+  window.__DU_THEME__ = {
+    apply: applyTheme,
+    normalize: normalizeTheme,
+    current: () => (document.documentElement.getAttribute('data-du-theme') || 'default')
+  };
+  init();
+})();
+
+﻿// DeepUpgrade - OpenCode Authentic Core v7.0 (Skills Engine & Settings Integration)
 console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6; color: white; font-weight: bold; padding: 2px 6px;');
+
+// <du-vfs-store>
+// Durable VFS store (host page side).
+//
+// The tool sandbox (sandbox/runner.html) is a manifest sandbox page: Chromium
+// gives it a unique origin, where OPFS and IndexedDB are unavailable. The host
+// page does have storage access, so it owns the durable copy of the VFS and the
+// sandbox mirrors every mutation here via postMessage.
+//
+// Layout: OPFS root -> `du-vfs/` -> the same tree the tools see, e.g.
+// `/smoke/hard3.py` becomes `du-vfs/smoke/hard3.py`. Real nested files, so the
+// tree can be inspected in DevTools -> Application -> Origin Private File System.
+(function initDurableVfsStore() {
+  'use strict';
+
+  const ROOT_DIR = 'du-vfs';
+  const MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+  function splitPath(path) {
+    return String(path || '')
+      .replace(/\\/g, '/')
+      .split('/')
+      .filter((part) => part && part !== '.' && part !== '..');
+  }
+
+  class DuVfsStore {
+    constructor() {
+      this.root = null;
+      this.mode = 'memory';
+      this.memory = new Map();
+      this.ready = null;
+      this.queue = Promise.resolve();
+    }
+
+    async init() {
+      if (this.ready) return this.ready;
+      this.ready = (async () => {
+        try {
+          if (navigator.storage && typeof navigator.storage.getDirectory === 'function') {
+            const root = await navigator.storage.getDirectory();
+            this.root = await root.getDirectoryHandle(ROOT_DIR, { create: true });
+            this.mode = 'opfs';
+            return this.mode;
+          }
+        } catch (err) {
+          console.warn('[DeepUpgrade] OPFS is unavailable, VFS will live in memory only:', err && err.message);
+        }
+        this.mode = 'memory';
+        return this.mode;
+      })();
+      return this.ready;
+    }
+
+    async loadAll() {
+      await this.init();
+      if (this.mode !== 'opfs') {
+        return [...this.memory.values()].map((f) => ({ ...f }));
+      }
+      const out = [];
+      const walk = async (dirHandle, prefix) => {
+        for await (const [name, handle] of dirHandle.entries()) {
+          const path = `${prefix}/${name}`;
+          if (handle.kind === 'file') {
+            try {
+              const file = await handle.getFile();
+              out.push({ path, content: await file.text(), mtime: file.lastModified || Date.now() });
+            } catch (err) {
+              if (err && err.name !== 'NotFoundError') console.warn('[DeepUpgrade] VFS read failed:', path, err.message);
+            }
+          } else {
+            await walk(handle, path);
+          }
+        }
+      };
+      try {
+        await walk(this.root, '');
+      } catch (err) {
+        console.warn('[DeepUpgrade] VFS listing failed:', err && err.message);
+      }
+      return out;
+    }
+
+    async dirFor(path, create) {
+      const parts = splitPath(path);
+      const fileName = parts.pop();
+      let dir = this.root;
+      for (const part of parts) {
+        dir = await dir.getDirectoryHandle(part, { create: !!create });
+      }
+      return { dir, fileName };
+    }
+
+    async writeFile(path, content) {
+      const text = typeof content === 'string' ? content : String(content ?? '');
+      const bytes = new TextEncoder().encode(text);
+      if (bytes.length > MAX_FILE_BYTES) {
+        throw new Error(`file is larger than ${MAX_FILE_BYTES} bytes and was not persisted`);
+      }
+      await this.init();
+      if (this.mode !== 'opfs') {
+        this.memory.set(path, { path, content: text, mtime: Date.now() });
+        return;
+      }
+      const { dir, fileName } = await this.dirFor(path, true);
+      const handle = await dir.getFileHandle(fileName, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(text);
+      await writable.close();
+    }
+
+    async removeEntry(path) {
+      await this.init();
+      if (this.mode !== 'opfs') {
+        this.memory.delete(path);
+        return;
+      }
+      const { dir, fileName } = await this.dirFor(path, false);
+      try {
+        await dir.removeEntry(fileName, { recursive: true });
+      } catch (err) {
+        if (err && err.name !== 'NotFoundError') throw err;
+      }
+    }
+
+    async makeDir(path) {
+      await this.init();
+      if (this.mode !== 'opfs') return;
+      const parts = splitPath(path);
+      let dir = this.root;
+      for (const part of parts) {
+        dir = await dir.getDirectoryHandle(part, { create: true });
+      }
+    }
+
+    // Serialize mutations so two writes to the same file can never interleave.
+    enqueue(job) {
+      const run = this.queue.then(job, job);
+      this.queue = run.catch(() => {});
+      return run;
+    }
+
+    apply(message) {
+      const { op, path, content } = message || {};
+      if (!path) return Promise.resolve({ ok: false, error: 'missing path' });
+      const normalized = '/' + splitPath(path).join('/');
+      return this.enqueue(async () => {
+        try {
+          if (op === 'write') {
+            await this.writeFile(normalized, content);
+          } else if (op === 'mkdir') {
+            await this.makeDir(normalized);
+          } else if (op === 'remove') {
+            await this.removeEntry(normalized);
+          } else {
+            return { ok: false, error: `unknown op ${op}` };
+          }
+          return { ok: true, mode: this.mode };
+        } catch (err) {
+          console.warn('[DeepUpgrade] VFS persist failed:', op, normalized, err && err.message);
+          return { ok: false, error: (err && err.message) || String(err) };
+        }
+      });
+    }
+
+    flush() {
+      return this.queue.catch(() => {});
+    }
+  }
+
+  window.__DU_VFS_STORE = window.__DU_VFS_STORE || new DuVfsStore();
+})();
+// </du-vfs-store>
 
 // OpenCode User-Defined Skills Engine (Pure Dynamic Registry)
 let customSkills = JSON.parse(localStorage.getItem('du_custom_skills') || '[]');
@@ -143,7 +370,8 @@ You MUST choose the most specialized tool for the task. Never use general shell 
      \`\`\`
 
 6. "bash" - Shell Command Execution
-   - Usage: For directory traversal (ls, pwd), inspecting processes, git, or testing CLI tools.
+   - Usage: For directory traversal (ls, pwd), file inspection, and testing CLI tools.
+   - LIMITATION: "git" is NOT available in this sandbox. Use the "js" tool with api.github.com / raw.githubusercontent.com to import repository files one by one.
    - PROHIBITED: Do NOT use bash to create or edit files. Use "write" or "edit".
    - Schema:
      \`\`\`json:tool
@@ -391,6 +619,39 @@ function hookAttachmentElements() {
   }
 }
 
+// --- DURABLE VFS (OPFS, owned by this page) ---
+// The sandbox iframe has a unique origin and cannot reach OPFS, so the page
+// keeps the durable copy and answers hydrate/mutation requests from the runner.
+function duVfsStore() {
+  return window.__DU_VFS_STORE || null;
+}
+
+async function handleVfsBoot(ev) {
+  const store = duVfsStore();
+  const reply = (payload) => {
+    try { ev.source && ev.source.postMessage({ type: 'DU_VFS_SNAPSHOT', ...payload }, '*'); } catch (e) {}
+  };
+  try {
+    if (!store) return reply({ files: [], mode: 'memory' });
+    const mode = await store.init();
+    const files = await store.loadAll();
+    reply({ files, mode });
+  } catch (err) {
+    console.warn('[DeepUpgrade] VFS hydrate failed:', err);
+    reply({ files: [], mode: 'memory' });
+  }
+}
+
+async function handleVfsMutation(ev, data) {
+  const store = duVfsStore();
+  const reply = (payload) => {
+    try { ev.source && ev.source.postMessage({ type: 'DU_VFS_MUTATED', reqId: data.reqId, ...payload }, '*'); } catch (e) {}
+  };
+  if (!store) return reply({ ok: false, error: 'vfs store unavailable' });
+  const result = await store.apply(data);
+  reply(result);
+}
+
 function initSandboxIframe() {
   if (sandboxIframe && sandboxIframe.parentNode) return;
   sandboxIframe = document.createElement('iframe');
@@ -428,10 +689,20 @@ function initSandboxIframe() {
       const current = new Set(JSON.parse(localStorage.getItem('du_persistent_packages') || '[]'));
       for (const p of ev.data.packages) current.add(p);
       localStorage.setItem('du_persistent_packages', JSON.stringify([...current]));
+    } else if (ev.data && ev.data.type === 'DU_VFS_BOOT') {
+      handleVfsBoot(ev);
+    } else if (ev.data && ev.data.type === 'DU_VFS_MUTATE') {
+      handleVfsMutation(ev, ev.data);
     }
   });
 }
 initSandboxIframe();
+
+// Keep the durable VFS consistent if the tab is closed mid-write.
+window.addEventListener('pagehide', () => {
+  const store = duVfsStore();
+  if (store) store.flush();
+});
 
 function runInSandbox(toolObj) {
   return new Promise((resolve) => {
@@ -440,7 +711,16 @@ function runInSandbox(toolObj) {
     }
     const id = Math.random().toString(36).slice(2);
 
+    // A hung Pyodide/WASM call must never freeze the ReAct loop silently.
+    const timeout = setTimeout(() => {
+      if (pendingCalls.has(id)) {
+        pendingCalls.delete(id);
+        resolve({ id, success: false, output: 'Sandbox timeout: runner.html did not answer within 120s.' });
+      }
+    }, 120000);
+
     pendingCalls.set(id, (res) => {
+      clearTimeout(timeout);
       resolve(res);
     });
 
@@ -460,11 +740,131 @@ function runInSandbox(toolObj) {
   });
 }
 
-const executedSet = new Set(JSON.parse(sessionStorage.getItem('du_executed_blocks') || '[]'));
-function markExecuted(hash) {
-  executedSet.add(hash);
-  sessionStorage.setItem('du_executed_blocks', JSON.stringify([...executedSet]));
+// <du-tool-dedupe>
+// Dedupe is scoped to the user turn, not to the whole session. A legitimate
+// retry ("пробуй вновь") repeats the same command text and must execute again,
+// while a React re-render or a reload of the same turn must not. One tool call
+// per assistant answer is also enforced: executing several blocks from one
+// answer in parallel sends their outputs out of order, so the model receives the
+// wrong output for the wrong tool.
+const EXECUTED_KEY = 'du_executed_turns_v3';
+const EXECUTED_OUTPUT_KEY = 'du_executed_tool_outputs_v3';
+
+function readJsonStorage(key, fallback) {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(key) || '');
+    return parsed ?? fallback;
+  } catch (e) {
+    return fallback;
+  }
 }
+
+const executedTurns = new Set(readJsonStorage(EXECUTED_KEY, []));
+const executedOutputs = new Map(readJsonStorage(EXECUTED_OUTPUT_KEY, []));
+
+function hashText(str) {
+  let h = 0x811c9dc5;
+  const s = String(str || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+
+/**
+ * Identify the user turn that produced this assistant answer. Our own silent
+ * replies are user messages too, so every tool result starts its own turn and a
+ * retried command is never mistaken for the previous one.
+ */
+function getToolTurnKey(block) {
+  let scope = '';
+  for (const bubble of document.querySelectorAll('.fbb737a4')) {
+    if (bubble.contains(block)) continue;
+    if (bubble.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      // textContent (not innerText) so hidden silent replies still count.
+      scope = 'u:' + hashText((bubble.textContent || '').replace(/\s+/g, ' ').trim().slice(-300));
+    }
+  }
+
+  if (!scope) {
+    // Fallback when the user-bubble class changes: use this message's prose.
+    // Code blocks and widgets are stripped so the key survives re-renders.
+    const bubble = block.closest('.ds-message') || block.closest('[data-virtual-list-item-key]');
+    if (bubble) {
+      const clone = bubble.cloneNode(true);
+      clone.querySelectorAll('.md-code-block, pre, .opencode-tool-root').forEach((node) => node.remove());
+      scope = 'm:' + hashText((clone.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300));
+    }
+  }
+
+  return `${location.pathname}|${scope || 'root'}`;
+}
+
+function getToolBlockKey(block, blockHash) {
+  return `${getToolTurnKey(block)}|${blockHash}`;
+}
+
+/**
+ * A tool call may only run while its answer is the active turn. As soon as a
+ * newer user message exists (including our own [SANDBOX OUTPUT] reply), the call
+ * is history and must never run again.
+ */
+function isLatestAssistantBlock(block) {
+  for (const bubble of document.querySelectorAll('.fbb737a4')) {
+    if (bubble.contains(block)) continue;
+    if (block.compareDocumentPosition(bubble) & Node.DOCUMENT_POSITION_FOLLOWING) return false;
+  }
+  return true;
+}
+
+/**
+ * Blocks that already exist when the script loads belong to chat history (or to
+ * a reloaded turn). Never auto-run them: just remember their turns as done.
+ */
+function seedHistoricalExecutions() {
+  document.querySelectorAll('.md-code-block, pre').forEach((block) => {
+    const codeText = block.innerText || '';
+    if (!/"tool"\s*:/.test(codeText)) return;
+    executedTurns.add(getToolTurnKey(block));
+  });
+  try {
+    sessionStorage.setItem(EXECUTED_KEY, JSON.stringify([...executedTurns]));
+  } catch (e) { /* storage quota */ }
+}
+
+/**
+ * Look up a previously produced output for this exact block, even if the turn
+ * key has since changed (our own [SANDBOX OUTPUT] reply inserts a new user
+ * bubble, so the same block gets a new turn key on the next render).
+ */
+function findCachedOutput(blockKey) {
+  const direct = executedOutputs.get(blockKey);
+  if (typeof direct === 'string') return direct;
+  const suffix = '|' + blockKey.split('|').pop();
+  for (const [key, value] of executedOutputs) {
+    if (key.endsWith(suffix) && typeof value === 'string') return value;
+  }
+  return undefined;
+}
+
+function markExecuted(turnKey, blockKey, output) {
+  executedTurns.add(turnKey);
+  if (typeof output === 'string' && blockKey) executedOutputs.set(blockKey, output);
+
+  if (executedTurns.size > 300) {
+    [...executedTurns].slice(0, executedTurns.size - 300).forEach((oldKey) => executedTurns.delete(oldKey));
+  }
+  if (executedOutputs.size > 300) {
+    [...executedOutputs.keys()].slice(0, executedOutputs.size - 300).forEach((oldKey) => executedOutputs.delete(oldKey));
+  }
+
+  try {
+    sessionStorage.setItem(EXECUTED_KEY, JSON.stringify([...executedTurns]));
+    sessionStorage.setItem(EXECUTED_OUTPUT_KEY, JSON.stringify([...executedOutputs].slice(-300)));
+  } catch (e) { /* storage quota - dedupe still works in memory */ }
+}
+// </du-tool-dedupe>
 
 let allowExecution = false;
 
@@ -720,12 +1120,39 @@ function findTextNodeWith(element, pattern) {
   return null;
 }
 
+// <du-send-path>
 function findDeepSeekInput() {
-  return document.querySelector('textarea, div[contenteditable="true"]');
+  const nodes = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]'));
+  if (nodes.length === 0) return null;
+  if (nodes.length === 1) return nodes[0];
+
+  const visible = nodes.filter((el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled;
+  });
+  if (visible.length === 0) return nodes[0];
+
+  // The chat composer is the largest visible input. A sidebar search box is
+  // small, so this reliably picks the real composer when both exist.
+  visible.sort((a, b) => {
+    const ra = a.getBoundingClientRect();
+    const rb = b.getBoundingClientRect();
+    const areaDelta = (rb.width * rb.height) - (ra.width * ra.height);
+    if (Math.abs(areaDelta) > 100) return areaDelta;
+    return rb.top - ra.top;
+  });
+  return visible[0];
+}
+
+function readInputValue(inputEl) {
+  if (!inputEl) return '';
+  return (inputEl.value !== undefined ? inputEl.value : inputEl.textContent || '');
 }
 
 function updateReactInput(inputEl, text) {
-  if (!inputEl) return;
+  if (!inputEl) return false;
   inputEl.focus();
 
   if (inputEl.tagName && inputEl.tagName.toLowerCase() === 'textarea') {
@@ -736,18 +1163,19 @@ function updateReactInput(inputEl, text) {
     } else {
       inputEl.value = text;
     }
+    // React tracks the last value it rendered. Dispatching `input` through the
+    // native setter makes its onChange fire and commit the new state.
     inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
     inputEl.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
   } else {
-    // Contenteditable or custom input element
     inputEl.textContent = text;
     inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
   }
+  return true;
 }
 
 // Resilient, semantic detection of send button without depending on obfuscated class names
-function findSendButton() {
-  const inputEl = findDeepSeekInput();
+function findSendButton(inputEl = findDeepSeekInput()) {
   const formOrArea = inputEl?.closest('form, div:has(textarea), div:has([contenteditable])') || document.body;
 
   // 1. Try finding by accessibility role/label
@@ -797,9 +1225,8 @@ function isButtonInteractable(el) {
   return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== 'none';
 }
 
-function triggerSend() {
-  const inputEl = findDeepSeekInput();
-  const sendBtn = findSendButton();
+function triggerSend(inputEl = findDeepSeekInput()) {
+  const sendBtn = findSendButton(inputEl);
 
   // Method 1: Synthesize trusted-like mouse events sequence on send button
   if (sendBtn) {
@@ -817,7 +1244,7 @@ function triggerSend() {
       });
       sendBtn.dispatchEvent(evt);
     });
-    return true;
+    return 'click';
   }
 
   // Method 2: Fallback keyboard sequence with full Enter signatures (Enter keycode 13)
@@ -835,24 +1262,245 @@ function triggerSend() {
     inputEl.dispatchEvent(new KeyboardEvent('keydown', keyEventInit));
     inputEl.dispatchEvent(new KeyboardEvent('keypress', keyEventInit));
     inputEl.dispatchEvent(new KeyboardEvent('keyup', keyEventInit));
-    return true;
+    return 'enter';
   }
 
-  return false;
+  return 'none';
 }
 
 // Hybrid Transport: DOM vs Direct Network API (Configurable in popup, default false for stability)
 let useDirectNetworkApi = JSON.parse(localStorage.getItem('du_use_network_api') ?? 'false');
 
-chrome.runtime?.onMessage?.addListener((req) => {
-  if (req && req.action === 'set_use_network_api') {
-    useDirectNetworkApi = !!req.value;
-    localStorage.setItem('du_use_network_api', JSON.stringify(useDirectNetworkApi));
-    console.log('[DeepUpgrade] Direct Network API Transport set to:', useDirectNetworkApi);
+if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((req) => {
+    if (req && req.action === 'set_use_network_api') {
+      useDirectNetworkApi = !!req.value;
+      localStorage.setItem('du_use_network_api', JSON.stringify(useDirectNetworkApi));
+      console.log('[DeepUpgrade] Direct Network API Transport set to:', useDirectNetworkApi);
+    }
+  });
+}
+
+/* -------------------------------------------------------------------------
+ * Silent-send diagnostics
+ * -------------------------------------------------------------------------
+ * Every silent dispatch records what it intended to send, what the composer
+ * actually contained, how many clicks/Enters it made, and — most importantly —
+ * what prompt the MAIN world interceptor actually saw going to the network.
+ * Read the log from the page console:
+ *     __duSendLog()        // full JSON
+ *     __duSendLogTable()   // compact table
+ * It is persisted in sessionStorage under `du_send_log` (last 120 entries),
+ * so it survives a chat re-render and can be copied after a failure.
+ * ----------------------------------------------------------------------- */
+const SEND_LOG_KEY = 'du_send_log';
+const SEND_LOG_LIMIT = 120;
+
+function normalizeForMatch(value) {
+  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+}
+
+function duSendLog(phase, data) {
+  const entry = Object.assign({ ts: new Date().toISOString(), phase }, data || {});
+  try {
+    const log = JSON.parse(sessionStorage.getItem(SEND_LOG_KEY) || '[]');
+    log.push(entry);
+    while (log.length > SEND_LOG_LIMIT) log.shift();
+    sessionStorage.setItem(SEND_LOG_KEY, JSON.stringify(log));
+  } catch (e) { /* storage disabled or full — console log below still works */ }
+  if (phase !== 'attempt' && phase !== 'value-set') {
+    console.log('[DeepUpgrade send]', phase, entry);
   }
+  return entry;
+}
+
+window.__duSendLog = function () {
+  try { return JSON.parse(sessionStorage.getItem(SEND_LOG_KEY) || '[]'); }
+  catch (e) { return []; }
+};
+
+window.__duSendLogTable = function () {
+  const log = window.__duSendLog();
+  if (console.table) {
+    console.table(log.map((e) => ({
+      time: e.ts,
+      phase: e.phase,
+      job: e.job || '',
+      len: e.len ?? e.outLen ?? '',
+      ms: e.ms ?? '',
+      note: e.note || e.error || e.preview || ''
+    })));
+  }
+  return log;
+};
+
+window.__duSendState = function () {
+  return {
+    activeJob: duActiveSendJob ? {
+      id: duActiveSendJob.id,
+      attempts: duActiveSendJob.attempts,
+      emptySends: duActiveSendJob.emptySends,
+      done: duActiveSendJob.done
+    } : null,
+    lastOutgoingPrompt: duLastOutgoingPrompt
+  };
+};
+
+// Truth source: the MAIN-world interceptor posts the exact prompt that is
+// leaving the page. This is how we distinguish "text was never placed in the
+// composer" from "the composer submitted before React committed the value".
+let duActiveSendJob = null;
+let duLastOutgoingPrompt = null;
+
+function duFinishSendJob(job, outcome) {
+  if (!job || job.done) return;
+  job.done = true;
+  job.outcome = outcome;
+  if (job.watchdog) clearTimeout(job.watchdog);
+  duSendLog('finished', {
+    job: job.id,
+    outcome,
+    ms: Date.now() - job.startedAt,
+    attempts: job.attempts,
+    emptySends: job.emptySends,
+    mismatches: job.mismatches
+  });
+  if (job.inputEl) job.inputEl.classList.remove('du-freezing');
+  if (job.container) job.container.classList.remove('du-locked-box');
+  if (duActiveSendJob === job) duActiveSendJob = null;
+  if (typeof job.resolve === 'function') job.resolve(outcome);
+}
+
+function duCheckOutgoingPrompt(job, msg) {
+  if (!job || job.done) return;
+  const got = normalizeForMatch(msg.prompt);
+  const expected = job.expected;
+
+  if (!got) {
+    job.emptySends++;
+    duSendLog('outgoing-EMPTY', {
+      job: job.id,
+      transport: msg.transport || '',
+      expectedLen: expected.length,
+      note: 'composer submitted without text — scheduling recovery'
+    });
+    job.needsResend = true;
+    job.resendDelay = Math.min((job.resendDelay || 300) * 2, 4800);
+    job.resendNotBefore = Date.now() + job.resendDelay;
+    return;
+  }
+
+  if (got === expected || (job.snippet && got.includes(job.snippet))) {
+    job.delivered = true;
+    duSendLog('outgoing-ok', {
+      job: job.id,
+      transport: msg.transport || '',
+      outLen: got.length,
+      ms: Date.now() - job.startedAt
+    });
+    duFinishSendJob(job, 'delivered');
+    return;
+  }
+
+  job.mismatches++;
+  duSendLog('outgoing-mismatch', {
+    job: job.id,
+    transport: msg.transport || '',
+    outLen: got.length,
+    expectedLen: expected.length,
+    preview: got.slice(0, 80),
+    note: 'logged only - may be an unrelated request'
+  });
+}
+
+window.addEventListener('message', (ev) => {
+  const data = ev.data;
+  if (!data || data.type !== 'DU_OUTGOING_PROMPT') return;
+  duLastOutgoingPrompt = data;
+  duSendLog('outgoing-captured', {
+    job: duActiveSendJob ? duActiveSendJob.id : '',
+    transport: data.transport || '',
+    len: typeof data.prompt === 'string' ? data.prompt.length : -1,
+    empty: !normalizeForMatch(data.prompt),
+    preview: normalizeForMatch(data.prompt).slice(0, 60)
+  });
+  if (duActiveSendJob) duCheckOutgoingPrompt(duActiveSendJob, data);
 });
 
-async function sendSilentReply(text) {
+/** Returns true only when the composer visibly holds the full reply. */
+function setInputValueVerified(inputEl, text, job) {
+  const expected = normalizeForMatch(text);
+  for (let i = 1; i <= 5; i++) {
+    updateReactInput(inputEl, text);
+    const actual = normalizeForMatch(readInputValue(inputEl));
+    if (actual === expected) {
+      if (job) duSendLog('value-set', { job: job.id, attempt: i, len: actual.length });
+      return true;
+    }
+    if (job) duSendLog('value-set-mismatch', {
+      job: job.id,
+      attempt: i,
+      expectedLen: expected.length,
+      actualLen: actual.length
+    });
+  }
+  return false;
+}
+
+function lastUserMessageText() {
+  const bubbles = document.querySelectorAll('.fbb737a4');
+  if (bubbles.length === 0) return '';
+  const last = bubbles[bubbles.length - 1];
+  return normalizeForMatch(last.innerText || last.textContent || '');
+}
+
+function nodeIsUsable(el) {
+  return !!(el && el.isConnected && document.contains(el));
+}
+
+async function dispatchSilentReply(text) {
+  const raw = typeof text === 'string' ? text : (text == null ? '' : String(text));
+  const expected = normalizeForMatch(raw);
+
+  const job = {
+    id: 'send_' + Math.random().toString(36).slice(2, 8),
+    expected,
+    snippet: expected.slice(0, 40),
+    startedAt: Date.now(),
+    done: false,
+    delivered: false,
+    attempts: 0,
+    emptySends: 0,
+    mismatches: 0,
+    needsResend: false,
+    inputEl: null,
+    container: null,
+    resolve: null
+  };
+
+  // Guard: an empty reply must never be dispatched as an empty message.
+  if (!expected) {
+    duSendLog('abort-empty-reply', { job: job.id, len: raw.length });
+    console.warn('[DeepUpgrade] sendSilentReply("") ignored — nothing to send.');
+    return false;
+  }
+
+  duSendLog('requested', {
+    job: job.id,
+    len: raw.length,
+    prefix: expected.slice(0, 24),
+    transport: useDirectNetworkApi ? 'network' : 'dom'
+  });
+
+  // Watchdog: no matter which transport path is taken, a job must always
+  // settle. A job that hangs here used to block the serialized send chain
+  // forever, so every later [SANDBOX OUTPUT] was queued and never sent.
+  job.watchdog = setTimeout(() => {
+    if (job.done) return;
+    duSendLog('abort-watchdog', { job: job.id, ms: Date.now() - job.startedAt });
+    duFinishSendJob(job, 'watchdog');
+  }, 25000);
+
   // Option 1: Direct Network API (Zero-touch background dispatch via window postMessage bridge)
   if (useDirectNetworkApi) {
     try {
@@ -872,7 +1520,7 @@ async function sendSilentReply(text) {
         window.postMessage({
           type: 'DU_NETWORK_SEND_MESSAGE',
           reqId,
-          text
+          text: raw
         }, '*');
 
         // Fallback timer if MAIN world doesn't answer in 4s
@@ -883,58 +1531,241 @@ async function sendSilentReply(text) {
       });
 
       if (networkResult.success) {
+        duSendLog('network-ok', { job: job.id, len: raw.length });
         console.log('%c[DeepUpgrade] ✅ Запрос инструмента успешно отправлен в Network API!', 'color: #4ade80;');
-        return;
+        return true;
       } else {
+        duSendLog('network-failed', { job: job.id, error: String(networkResult.error || 'unknown') });
         console.warn('[DeepUpgrade] Network API bridge вернул ошибку, переход на DOM:', networkResult.error);
       }
     } catch(err) {
+      duSendLog('network-error', { job: job.id, error: String(err && err.message || err) });
       console.warn('[DeepUpgrade] Ошибка Network API, fallback на DOM эмуляцию:', err);
     }
   }
 
   // Option 2 (Fallback): DOM Emulation
   const inputEl = findDeepSeekInput();
-  if (!inputEl) return;
+  if (!inputEl) {
+    duSendLog('abort-no-input', { job: job.id });
+    return false;
+  }
 
   const container = inputEl.closest('form, div:has(textarea), div:has([contenteditable])') || inputEl.parentElement;
+  job.inputEl = inputEl;
+  job.container = container;
+  duActiveSendJob = job;
+
   if (container) container.classList.add('du-locked-box');
   inputEl.classList.add('du-freezing');
 
-  updateReactInput(inputEl, text);
+  if (!setInputValueVerified(inputEl, raw, job)) {
+    duSendLog('abort-value-not-set', {
+      job: job.id,
+      actualLen: normalizeForMatch(readInputValue(inputEl)).length
+    });
+    duFinishSendJob(job, 'value-not-set');
+    return false;
+  }
 
-  let attempts = 0;
-  const maxAttempts = 35;
-  const trySend = () => {
-    attempts++;
-    triggerSend();
+  const valueSetAt = Date.now();
+  const maxAttempts = 25;
+  let target = inputEl;
+  let clearedAt = 0;
+  let lastValueSetAt = valueSetAt;
+  const hardDeadline = valueSetAt + 20000;
 
-    // Check if input was consumed and cleared by the React submission handler
-    const currentVal = (inputEl.value !== undefined ? inputEl.value : inputEl.textContent || '').trim();
-    if (currentVal.length === 0 || !currentVal.includes(text.slice(0, 20))) {
-      inputEl.classList.remove('du-freezing');
-      if (container) container.classList.remove('du-locked-box');
-      return;
-    }
-
-    if (attempts < maxAttempts) {
-      setTimeout(trySend, 120);
-    } else {
-      // Final attempt: simulate direct click and clear lingering text
-      triggerSend();
-      setTimeout(() => {
-        const remaining = (inputEl.value !== undefined ? inputEl.value : inputEl.textContent || '').trim();
-        if (remaining.includes('[SANDBOX OUTPUT') || remaining.includes('[USER ANSWER]:')) {
-          updateReactInput(inputEl, '');
-        }
-        inputEl.classList.remove('du-freezing');
-        if (container) container.classList.remove('du-locked-box');
-      }, 150);
+  const attempt = () => {
+    if (job.done) return;
+    try {
+      attemptStep();
+    } catch (err) {
+      duSendLog('abort-error', { job: job.id, error: String((err && err.message) || err) });
+      console.warn('[DeepUpgrade] send attempt failed:', err);
+      duFinishSendJob(job, 'error');
     }
   };
 
-  setTimeout(trySend, 150);
+  const attemptStep = () => {
+    if (job.done) return;
+
+    if (Date.now() > hardDeadline) {
+      duSendLog('abort-deadline', {
+        job: job.id,
+        leftLen: normalizeForMatch(readInputValue(target)).length,
+        emptySends: job.emptySends,
+        mismatches: job.mismatches
+      });
+      if (nodeIsUsable(target) && normalizeForMatch(readInputValue(target)).length > 0) {
+        updateReactInput(target, '');
+      }
+      duFinishSendJob(job, 'deadline');
+      return;
+    }
+
+    // The composer can be re-rendered by React at any moment. Sending through a
+    // detached node is exactly how an "empty message" is produced, so re-find it.
+    if (!nodeIsUsable(target)) {
+      duSendLog('input-detached', { job: job.id, attempt: job.attempts });
+      target = findDeepSeekInput();
+      job.inputEl = target;
+      if (!target) {
+        duSendLog('abort-input-vanished', { job: job.id });
+        duFinishSendJob(job, 'input-vanished');
+        return;
+      }
+      if (!setInputValueVerified(target, raw, job)) {
+        duSendLog('abort-value-not-set', {
+          job: job.id,
+          actualLen: normalizeForMatch(readInputValue(target)).length
+        });
+        duFinishSendJob(job, 'value-not-set');
+        return;
+      }
+      lastValueSetAt = Date.now();
+    }
+
+    const current = normalizeForMatch(readInputValue(target));
+
+    if (job.delivered) {
+      duFinishSendJob(job, 'delivered');
+      return;
+    }
+
+    // On a failed attempt React may restore the committed value on its next
+    // render, so wait before touching the composer again.
+    if (job.resendNotBefore && Date.now() < job.resendNotBefore) {
+      setTimeout(attempt, 100);
+      return;
+    }
+
+    if (job.needsResend) {
+      job.needsResend = false;
+      if (current.length === 0) {
+        duSendLog('recover-restoring', { job: job.id, attempt: job.attempts });
+        if (!setInputValueVerified(target, raw, job)) {
+          duSendLog('abort-value-not-set', { job: job.id, actualLen: normalizeForMatch(readInputValue(target)).length });
+          duFinishSendJob(job, 'value-not-set');
+          return;
+        }
+        lastValueSetAt = Date.now();
+      } else {
+        // The composer already holds the reply again — just click it.
+        duSendLog('recover-resending', { job: job.id, attempt: job.attempts, inputLen: current.length });
+      }
+      clearedAt = 0;
+    } else if (current.length === 0) {
+      // React consumed the composer but the interceptor has not reported yet.
+      // Give the network hook time before concluding anything.
+      if (!clearedAt) clearedAt = Date.now();
+      const waited = Date.now() - clearedAt;
+      if (waited < 1500) {
+        setTimeout(attempt, 100);
+        return;
+      }
+      // No network capture at all (unknown transport) — fall back to the DOM.
+      const last = lastUserMessageText();
+      if (job.snippet && last.includes(job.snippet)) {
+        duSendLog('bubble-confirmed', { job: job.id, ms: Date.now() - job.startedAt });
+        job.delivered = true;
+        duFinishSendJob(job, 'delivered-bubble');
+        return;
+      }
+      duSendLog('input-cleared-unconfirmed', { job: job.id, note: 'no outgoing prompt captured and no bubble found; resending' });
+      job.needsResend = true;
+      job.resendDelay = Math.min((job.resendDelay || 300) * 2, 4800);
+      job.resendNotBefore = Date.now() + job.resendDelay;
+      clearedAt = 0;
+      setTimeout(attempt, 60);
+      return;
+    }
+
+    // Wait for React to commit the value before clicking. Clicking too early is
+    // what submits an empty prompt: the button is still in its empty state.
+    if (job.resendNotBefore && Date.now() < job.resendNotBefore) {
+      setTimeout(attempt, 100);
+      return;
+    }
+    if (Date.now() - lastValueSetAt < 200) {
+      setTimeout(attempt, 80);
+      return;
+    }
+
+    // Do not click a disabled send button: DeepSeek disables it while its React
+    // state is empty, and pressing Enter at that moment submits an empty prompt.
+    const sendBtn = findSendButton(target);
+    if (!sendBtn) {
+      const waited = Date.now() - lastValueSetAt;
+      if (waited < 1200) {
+        duSendLog('wait-send-button', { job: job.id, waited, inputLen: current.length });
+        setTimeout(attempt, 100);
+        return;
+      }
+      duSendLog('send-button-missing', { job: job.id, note: 'falling back to Enter after grace period' });
+    }
+
+    job.attempts++;
+    const mode = triggerSend(target);
+    duSendLog('attempt', {
+      job: job.id,
+      n: job.attempts,
+      mode,
+      inputLen: normalizeForMatch(readInputValue(target)).length
+    });
+
+    if (job.done) return;
+
+    if (job.attempts >= maxAttempts) {
+      duSendLog('abort-max-attempts', {
+        job: job.id,
+        leftLen: normalizeForMatch(readInputValue(target)).length,
+        emptySends: job.emptySends,
+        mismatches: job.mismatches
+      });
+      if (normalizeForMatch(readInputValue(target)).length > 0) {
+        updateReactInput(target, '');
+      }
+      duFinishSendJob(job, 'timeout');
+      return;
+    }
+
+    setTimeout(attempt, 150);
+  };
+
+  return new Promise((resolve) => {
+    job.resolve = resolve;
+    setTimeout(attempt, 120);
+  });
 }
+
+// Silent replies are serialized: two overlapping dispatches would fight over
+// the same composer and could submit an empty prompt.
+let duSendChain = Promise.resolve();
+let duSendChainBusy = false;
+let duSendChainStartedAt = 0;
+
+function sendSilentReply(text) {
+  const len = typeof text === 'string' ? text.length : 0;
+  duSendLog('queued', { len, busy: duSendChainBusy });
+
+  // A stuck job must never swallow the rest of the conversation.
+  if (duSendChainBusy && Date.now() - duSendChainStartedAt > 30000) {
+    duSendLog('chain-reset', { stuckMs: Date.now() - duSendChainStartedAt });
+    console.warn('[DeepUpgrade] send chain looked stuck, starting a fresh one.');
+    duSendChain = Promise.resolve();
+    duSendChainBusy = false;
+  }
+
+  const run = duSendChain.then(() => {
+    duSendChainBusy = true;
+    duSendChainStartedAt = Date.now();
+    return dispatchSilentReply(text);
+  });
+
+  duSendChain = run.catch(() => {}).then(() => { duSendChainBusy = false; });
+  return run;
+}
+// </du-send-path>
 
 // Agent Toggle State (Persisted in localStorage)
 let isAgentEnabled = JSON.parse(localStorage.getItem('du_agent_enabled') ?? 'true');
@@ -1004,7 +1835,184 @@ function hookInput() {
   }, { capture: true });
 }
 
-function extractToolCall(text) {
+const KNOWN_TOOL_NAMES = new Set([
+  'write', 'edit', 'read', 'glob', 'grep', 'bash', 'python', 'py', 'js',
+  'question', 'ask', 'todowrite', 'todo', 'install_skill', 'add_skill'
+]);
+
+/**
+ * Extract every balanced `{...}` block from a model response.
+ * Unlike a greedy regex, this survives multiple JSON objects and nested braces.
+ */
+function extractBalancedJsonObjects(text) {
+  const objects = [];
+  let index = 0;
+  while (index < text.length) {
+    const start = text.indexOf('{', index);
+    if (start === -1) break;
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let end = -1;
+
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escape) escape = false;
+        else if (ch === '\\') escape = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+
+    if (end === -1) break;
+    const candidate = text.slice(start, end + 1);
+    let foundTool = false;
+    if (candidate.includes('"tool"')) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object') {
+          objects.push(parsed);
+          foundTool = true;
+        }
+      } catch (e) { /* malformed JSON is handled by the fallback parser */ }
+    }
+    // If this object was not the tool payload, keep scanning inside it.
+    index = foundTool ? end + 1 : start + 1;
+  }
+  return objects;
+}
+
+/**
+ * Read a JSON string field even when the surrounding JSON is malformed
+ * (raw newlines, unescaped quotes, different field order).
+ */
+function extractJsonStringField(text, field) {
+  const re = new RegExp('"' + field + '"\\s*:\\s*"', 'g');
+  const match = re.exec(text);
+  if (!match) return null;
+
+  let raw = '';
+  let escaped = false;
+  for (let i = re.lastIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      raw += '\\' + ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') {
+      try { return JSON.parse('"' + raw + '"'); } catch (e) { break; }
+    }
+    raw += ch;
+  }
+  return raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+/**
+ * Decode a JSON string body the way the model most likely meant it.
+ * Valid JSON is parsed normally; otherwise only standard escapes are decoded,
+ * so unescaped quotes in Python/JS code survive instead of truncating it.
+ */
+function decodeJsonStringLike(raw) {
+  try {
+    return JSON.parse('"' + raw + '"');
+  } catch (e) { /* unescaped quotes or raw newlines */ }
+
+  return raw.replace(/\\(u[0-9a-fA-F]{4}|["\\/bfnrt])/g, (match, esc) => {
+    switch (esc[0]) {
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      case 'u': return String.fromCharCode(parseInt(esc.slice(1), 16));
+      default: return esc;
+    }
+  });
+}
+
+/**
+ * Like extractJsonStringField, but for the common malformed model output where
+ * the field value itself contains unescaped quotes. When the field is the last
+ * key of the object, take everything up to the closing quote before the final
+ * brace and decode it. Otherwise fall back to the plain scan.
+ */
+function extractJsonStringFieldRobust(text, field) {
+  const startRe = new RegExp('"' + field + '"\\s*:\\s*"');
+  const match = startRe.exec(text);
+  if (!match) return null;
+
+  // Non-global regexes do not update lastIndex; compute the value start manually.
+  const valueStart = match.index + match[0].length;
+  const objEnd = text.lastIndexOf('}');
+  if (objEnd > valueStart) {
+    const tail = text.slice(valueStart, objEnd);
+    const closeQuote = tail.lastIndexOf('"');
+    if (closeQuote !== -1) {
+      const after = tail.slice(closeQuote + 1).trim();
+      // Only trust this when no other JSON key follows the value.
+      if (after === '' || after === ',') {
+        return decodeJsonStringLike(tail.slice(0, closeQuote));
+      }
+    }
+  }
+
+  return extractJsonStringField(text, field);
+}
+
+/** Validate required fields so a broken block can never write an empty file. */
+function validateToolObject(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const tool = obj.tool;
+  const asString = (value) => {
+    if (typeof value === 'string') return value;
+    if (value === undefined || value === null) return null;
+    return String(value);
+  };
+
+  if (tool === 'write') {
+    const content = asString(obj.content) ?? asString(obj.text) ?? asString(obj.code);
+    obj.content = content === null ? '' : content;
+    if (!obj.path) {
+      obj.__parseError = 'write: missing "path"';
+    } else if (obj.content.length === 0) {
+      obj.__parseError = 'write: "content" is empty — the tool block was not parsed correctly';
+    }
+  } else if (tool === 'edit') {
+    const oldStr = asString(obj.old_str) ?? asString(obj.oldStr);
+    const newStr = asString(obj.new_str) ?? asString(obj.newStr);
+    if (!obj.path) obj.__parseError = 'edit: missing "path"';
+    else if (oldStr === null || newStr === null) obj.__parseError = 'edit: missing "old_str" or "new_str"';
+    else { obj.old_str = oldStr; obj.new_str = newStr; }
+  } else if (tool === 'read') {
+    if (!obj.path) obj.__parseError = 'read: missing "path"';
+  } else if (tool === 'glob') {
+    if (!obj.pattern) obj.__parseError = 'glob: missing "pattern"';
+  } else if (tool === 'grep') {
+    if (!obj.pattern) obj.__parseError = 'grep: missing "pattern"';
+  } else if (tool === 'question' || tool === 'ask') {
+    if (!obj.question && obj.prompt) obj.question = obj.prompt;
+    if (!obj.question) obj.__parseError = 'question: missing "question"';
+  } else if (tool === 'bash' || tool === 'python' || tool === 'py' || tool === 'js') {
+    const code = asString(obj.code) ?? asString(obj.text);
+    obj.code = code === null ? '' : code;
+    if (obj.code.trim() === '') {
+      obj.__parseError = tool + ': "code" is empty — the tool block was not parsed correctly';
+    }
+  }
+  return obj;
+}
+
+function extractToolCallFallback(text) {
   try {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
@@ -1087,50 +2095,37 @@ function extractToolCall(text) {
 
   if (toolName === 'write') {
     const pathMatch = text.match(/"path"\s*:\s*"([^"]+)"/) || text.match(/"file"\s*:\s*"([^"]+)"/);
-    const contentMatch = text.match(/"content"\s*:\s*"([\s\S]*?)"\s*\}/) || text.match(/"text"\s*:\s*"([\s\S]*?)"\s*\}/);
     if (pathMatch) {
-      let rawContent = contentMatch ? contentMatch[1] : '';
-      rawContent = rawContent.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+      let rawContent = extractJsonStringFieldRobust(text, 'content');
+      if (rawContent === null) rawContent = extractJsonStringFieldRobust(text, 'text');
+      if (rawContent === null) rawContent = extractJsonStringFieldRobust(text, 'code');
       return {
         tool: 'write',
         path: pathMatch[1],
-        content: rawContent
+        content: rawContent !== null ? rawContent : ''
       };
     }
   }
 
   if (toolName === 'edit') {
     // If strict JSON.parse worked, it was already handled above.
-    // Handle fallback regex extraction with support for multiple lines:
     const pathMatch = text.match(/"path"\s*:\s*"([^"]+)"/);
-    const oldMatch = text.match(/"old_str"\s*:\s*"([\s\S]*?)"\s*,\s*"new_str"/);
-    const newMatch = text.match(/"new_str"\s*:\s*"([\s\S]*?)"\s*\}\s*$/) || text.match(/"new_str"\s*:\s*"([\s\S]*?)"\s*\}/);
     if (pathMatch) {
-      let oldS = oldMatch ? oldMatch[1] : '';
-      let newS = newMatch ? newMatch[1] : '';
-      try {
-        oldS = JSON.parse(`"${oldS}"`);
-      } catch (e) {
-        oldS = oldS.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      }
-      try {
-        newS = JSON.parse(`"${newS}"`);
-      } catch (e) {
-        newS = newS.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      }
+      let oldS = extractJsonStringFieldRobust(text, 'old_str');
+      if (oldS === null) oldS = extractJsonStringFieldRobust(text, 'oldStr');
+      let newS = extractJsonStringFieldRobust(text, 'new_str');
+      if (newS === null) newS = extractJsonStringFieldRobust(text, 'newStr');
       return {
         tool: 'edit',
         path: pathMatch[1],
-        old_str: oldS,
-        new_str: newS
+        old_str: oldS !== null ? oldS : '',
+        new_str: newS !== null ? newS : ''
       };
     }
   }
 
-  const codeMatch = text.match(/"code"\s*:\s*"([\s\S]*?)"\s*\}/);
-  if (codeMatch) {
-    let rawCode = codeMatch[1];
-    rawCode = rawCode.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+  const rawCode = extractJsonStringFieldRobust(text, 'code') ?? extractJsonStringFieldRobust(text, 'text');
+  if (rawCode !== null) {
     return {
       tool: toolName,
       code: rawCode
@@ -1138,6 +2133,122 @@ function extractToolCall(text) {
   }
 
   return null;
+}
+
+function extractToolCall(text) {
+  // 1. Strict JSON first: balanced-brace extraction avoids the greedy-regex trap.
+  const candidates = extractBalancedJsonObjects(text);
+  for (const parsed of candidates) {
+    if (!parsed || !parsed.tool) continue;
+    if (KNOWN_TOOL_NAMES.has(parsed.tool) || typeof parsed.code === 'string') {
+      return validateToolObject(parsed);
+    }
+  }
+
+  // 2. Repair malformed JSON from the model, then validate the required fields.
+  return validateToolObject(extractToolCallFallback(text));
+}
+
+/**
+ * True when the streamed tool block is definitely finished.
+ * A strictly parseable JSON object cannot grow further. For malformed JSON
+ * (raw newlines, unescaped quotes) require a closed, brace-balanced block.
+ */
+function isToolBlockStructurallyComplete(text) {
+  const value = String(text || '');
+  if (extractBalancedJsonObjects(value).length > 0) return true;
+
+  const trimmed = value.trim().replace(/```\s*$/, '').trimEnd();
+  if (!trimmed.endsWith('}')) return false;
+
+  // Two balances are checked because malformed model output can contain braces
+  // inside the content string (with unescaped quotes, string tracking breaks).
+  let naive = 0;
+  let aware = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === '{') {
+      naive++;
+      if (!inString) aware++;
+      continue;
+    }
+    if (ch === '}') {
+      naive--;
+      if (!inString) aware--;
+      continue;
+    }
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    }
+  }
+  return naive === 0 || aware === 0;
+}
+
+function scheduleToolRecheck(block, delay) {
+  if (block.__duRecheckTimer) return;
+  block.__duRecheckTimer = setTimeout(() => {
+    block.__duRecheckTimer = null;
+    if (block.isConnected) processToolCalls();
+  }, delay);
+}
+
+/**
+ * Wait until the streamed block is definitely complete. Partial content is
+ * never executed: the old "best effort after a pause" path wrote files cut at
+ * `{` or `(` whenever the model paused for a few seconds.
+ * Returns true (execute), false (keep waiting) or 'incomplete' (give up loudly).
+ */
+function isToolBlockReady(block, codeText) {
+  const now = Date.now();
+
+  if (extractBalancedJsonObjects(codeText).length > 0) {
+    if (block.__duRecheckTimer) {
+      clearTimeout(block.__duRecheckTimer);
+      block.__duRecheckTimer = null;
+    }
+    return true;
+  }
+
+  if (block.__duLastText !== codeText) {
+    block.__duLastText = codeText;
+    block.__duTextAt = now;
+    scheduleToolRecheck(block, 900);
+    return false;
+  }
+
+  const stableFor = now - (block.__duTextAt || 0);
+
+  if (isToolBlockStructurallyComplete(codeText)) {
+    if (stableFor < 800) {
+      scheduleToolRecheck(block, 850);
+      return false;
+    }
+    if (block.__duRecheckTimer) {
+      clearTimeout(block.__duRecheckTimer);
+      block.__duRecheckTimer = null;
+    }
+    return true;
+  }
+
+  // Still open. Waiting forever would hide a broken answer, so after a long
+  // quiet period report it instead of executing truncated code.
+  if (stableFor < 20000) {
+    scheduleToolRecheck(block, 1000);
+    return false;
+  }
+
+  if (block.__duRecheckTimer) {
+    clearTimeout(block.__duRecheckTimer);
+    block.__duRecheckTimer = null;
+  }
+  console.warn('[DeepUpgrade] Tool block stayed incomplete after 20s - refusing to execute it.');
+  return 'incomplete';
 }
 
 function processToolCalls() {
@@ -1148,49 +2259,116 @@ function processToolCalls() {
   if (allBlocks.length === 0) return;
 
   allBlocks.forEach(async block => {
+   try {
     // If this is a <pre> whose parent .md-code-block is already processed, skip
     if (block.tagName.toLowerCase() === 'pre' && block.closest('.md-code-block')) {
       const parentBlock = block.closest('.md-code-block');
-      if (parentBlock.hasAttribute('data-du-rendered') || parentBlock.hasAttribute('data-du-widget-attached')) return;
+      if (parentBlock.hasAttribute('data-du-rendered')) return;
       block = parentBlock; // Process the parent wrapper directly
     }
 
-    if (block.hasAttribute('data-du-rendered') || block.hasAttribute('data-du-widget-attached')) return;
+    if (block.hasAttribute('data-du-rendered')) return;
 
     const codeText = block.innerText || '';
     const toolObj = extractToolCall(codeText);
-    if (!toolObj) return;
+    if (!toolObj) {
+      // The answer is still streaming: show the tool card (shimmering label) as
+      // soon as the tool name is readable instead of waiting for the full block.
+      const partial = extractPartialToolMeta(codeText);
+      if (partial) renderStreamingToolCard(block, partial);
+      return;
+    }
+
+    // Never execute a block that is still streaming.
+    const readiness = isToolBlockReady(block, codeText);
+    if (readiness === false) {
+      renderStreamingToolCard(block, toolObj);
+      return;
+    }
+    if (readiness === 'incomplete') {
+      block.setAttribute('data-du-rendered', 'true');
+      const stuckWidget = renderOpenCode1to1(block, toolObj);
+      setOpenCodeOutput(stuckWidget, '⚠️ Блок не дописан: выполнение отменено, чтобы не записать обрезанный файл.\nОтправьте запрос ещё раз.');
+      duSendLog('tool-incomplete', { tool: toolObj.tool, chars: codeText.length, preview: codeText.slice(-80) });
+      return;
+    }
 
     const blockHash = 'du_' + codeText.replace(/\s+/g, '').slice(0, 80);
+    const turnKey = getToolTurnKey(block);
+    const blockKey = `${turnKey}|${blockHash}`;
 
     block.setAttribute('data-du-rendered', 'true');
     const toolWidget = renderOpenCode1to1(block, toolObj);
 
-    let res = await runInSandbox(toolObj);
-    setOpenCodeOutput(toolWidget, res.output);
-
-    // Auto-execution check: allowExecution flag OR active agent mode
-    const isAutoExecutionEligible = (allowExecution || isAgentEnabled) && !executedSet.has(blockHash);
-
-    if (isAutoExecutionEligible) {
-      markExecuted(blockHash);
-
-      // If this is an interactive question tool, PAUSE loop and render interactive selection card
-      if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
-        renderInteractiveQuestionCard(toolWidget, toolObj);
-        return;
-      }
-
-      // Autonomous Multi-Turn ReAct loop:
-      // Allow the agent to call multiple tools sequentially if needed, or conclude when finished
-      const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${res.output}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
-      sendSilentReply(reply);
-    } else {
-      markExecuted(blockHash);
-      if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
-        renderInteractiveQuestionCard(toolWidget, toolObj, true);
-      }
+    // A malformed block must never reach the sandbox: writing an empty file and
+    // reporting success is worse than showing a visible parse error.
+    if (toolObj.__parseError) {
+      console.warn('[DeepUpgrade] Tool parse error:', toolObj.__parseError, '\nRaw block:\n' + codeText);
+      setOpenCodeOutput(toolWidget, `⚠️ ${toolObj.__parseError}\n\nИнструмент не выполнен, чтобы не повредить файлы.`);
+      return;
     }
+
+    // Auto-execution requires the user to have sent a message in this page
+    // session (allowExecution). Agent mode alone must not re-run tool calls that
+    // were already in chat history when the page loaded.
+    const isAutoExecutionEligible = allowExecution && isAgentEnabled;
+
+    if (!isAutoExecutionEligible) {
+      setOpenCodeOutput(toolWidget, isAgentEnabled
+        ? 'Не выполнено: вызов найден в истории чата. Отправьте сообщение, чтобы запустить агента.'
+        : 'Не выполнено: включите Agent, чтобы разрешить выполнение инструментов.');
+      return;
+    }
+
+    if (executedTurns.has(turnKey) || !isLatestAssistantBlock(block)) {
+      // React re-render, reload, an old message, or a second tool block in the
+      // same answer: replay this block's cached result but never execute or send
+      // again.
+      const cached = findCachedOutput(blockKey);
+      setOpenCodeOutput(toolWidget, typeof cached === 'string'
+        ? cached
+        : (executedTurns.has(turnKey)
+          ? 'В этом сообщении уже выполнен другой инструмент — вызов пропущен.'
+          : 'Исторический вызов: повторно не выполняется.'));
+      duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey, latest: isLatestAssistantBlock(block) });
+      return;
+    }
+
+    markExecuted(turnKey);
+    duSendLog('tool-execute', { tool: toolObj.tool, turn: turnKey, chars: (toolObj.code || toolObj.content || '').length });
+
+    // If this is an interactive question tool, PAUSE loop and render interactive selection card
+    if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
+      renderInteractiveQuestionCard(toolWidget, toolObj);
+      return;
+    }
+
+    const res = await runInSandbox(toolObj);
+    const outputStr = typeof res.output === 'string' ? res.output : '';
+    setOpenCodeOutput(toolWidget, outputStr || '(no output)');
+
+    // Record what the sandbox actually returned. If this length is 0 the model
+    // text was extracted fine but the tool produced no output; the send log
+    // then shows whether the empty part is on the sandbox or on the send side.
+    markExecuted(turnKey, blockKey, outputStr);
+    duSendLog('tool-output', {
+      tool: toolObj.tool,
+      success: res.success !== false,
+      outLen: outputStr.length,
+      preview: outputStr.slice(0, 60)
+    });
+    if (outputStr.trim() === '') {
+      duSendLog('tool-output-EMPTY', { tool: toolObj.tool, note: 'sandbox returned no output' });
+    }
+
+    // Autonomous Multi-Turn ReAct loop:
+    // Allow the agent to call multiple tools sequentially if needed, or conclude when finished
+    const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${outputStr}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
+    sendSilentReply(reply);
+   } catch (err) {
+    console.error('[DeepUpgrade] tool block processing failed:', err);
+    duSendLog('tool-error', { error: String((err && err.message) || err) });
+   }
   });
 }
 
@@ -1261,16 +2439,39 @@ function updateSidebarTodoList(todos) {
   `;
 }
 
-function renderOpenCode1to1(originalPre, toolObj) {
-  const targetToReplace = originalPre.closest('.md-code-block') || originalPre;
-  targetToReplace.setAttribute('data-du-widget-attached', 'true');
+// <du-tool-card>
+function toolCardFileName(path) {
+  return (path || 'file').split('/').filter(Boolean).pop() || path || 'file';
+}
 
-  const root = document.createElement('div');
-  root.className = 'opencode-tool-root';
-  root.setAttribute('data-open', 'false');
-  root.setAttribute('data-running', 'true');
+function toolCardCode(text) {
+  return `<pre class="du-code-view">${escapeHtml(text || '')}</pre>`;
+}
 
-  let label = 'Оболочка';
+function toolCardPending(text) {
+  return `<div class="du-code-streaming">${escapeHtml(text)}</div>`;
+}
+
+// While the model is still streaming a tool block the card is shown early so
+// the shimmering label is visible; only the header is meaningful at that point.
+function toolCardStreamingContent(toolObj) {
+  const tool = (toolObj && toolObj.tool) || '';
+  const path = (toolObj && toolObj.path) || '';
+  if (tool === 'write') return { label: `Запись: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём содержимого файла…')}` };
+  if (tool === 'edit') return { label: `Правка: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём правки…')}` };
+  if (tool === 'read') return { label: `Чтение: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Чтение файла…')}` };
+  if (tool === 'python' || tool === 'py') return { label: 'Python', inputHtml: toolCardPending('Приём кода…') };
+  if (tool === 'js') return { label: 'JavaScript', inputHtml: toolCardPending('Приём кода…') };
+  if (tool === 'glob') return { label: `Поиск файлов: ${(toolObj && toolObj.pattern) || '*'}`, inputHtml: toolCardPending('Приём шаблона…') };
+  if (tool === 'grep') return { label: `Поиск в коде: ${(toolObj && toolObj.pattern) || ''}`, inputHtml: toolCardPending('Приём шаблона…') };
+  if (tool === 'todowrite' || tool === 'todo') return { label: 'План выполнения', inputHtml: toolCardPending('Обновление плана…') };
+  return { label: 'Терминал', inputHtml: toolCardPending('Приём команды…') };
+}
+
+function toolCardContent(toolObj, streaming) {
+  if (streaming) return toolCardStreamingContent(toolObj);
+
+  let label = 'Терминал';
   let inputContent = '';
 
   if (toolObj.tool === 'todowrite' || toolObj.tool === 'todo') {
@@ -1298,61 +2499,152 @@ function renderOpenCode1to1(originalPre, toolObj) {
   } else if (toolObj.tool === 'write') {
     const filename = (toolObj.path || 'file').split('/').filter(Boolean).pop() || toolObj.path;
     label = `Запись: ${filename}`;
-    const preview = (toolObj.content || '').split('\n').slice(0, 15).map(l => `<div class="du-diff-add">+ ${escapeHtml(l)}</div>`).join('');
-    inputContent = `<div class="du-diff-file-tag">${escapeHtml(toolObj.path || '')}</div>${preview}`;
+    const content = toolObj.content || '';
+    const lines = content.split('\n');
+    const MAX_CODE_LINES = 800;
+    const shown = lines.length > MAX_CODE_LINES ? lines.slice(0, MAX_CODE_LINES).join('\n') : content;
+    const more = lines.length > MAX_CODE_LINES
+      ? `<div class="du-code-more">… ещё ${lines.length - MAX_CODE_LINES} строк. Откройте файл через read, чтобы увидеть остальное.</div>`
+      : '';
+    const size = typeof Blob !== 'undefined' ? new Blob([content]).size : content.length;
+    inputContent = `<div class="du-diff-file-tag">${escapeHtml(toolObj.path || '')} · ${lines.length} стр. · ${formatBytes(size)}</div>`
+      + toolCardCode(shown) + more;
   } else if (toolObj.tool === 'edit') {
-    const filename = (toolObj.path || 'file').split('/').filter(Boolean).pop() || toolObj.path;
+    const filename = toolCardFileName(toolObj.path);
     label = `Правка: ${filename}`;
     const oldLines = (toolObj.old_str || '').split('\n').map(l => `<div class="du-diff-del">- ${escapeHtml(l)}</div>`).join('');
     const newLines = (toolObj.new_str || '').split('\n').map(l => `<div class="du-diff-add">+ ${escapeHtml(l)}</div>`).join('');
-    inputContent = `<div class="du-diff-file-tag">${escapeHtml(toolObj.path || '')}</div>${oldLines}${newLines}`;
+    inputContent = `<div class="du-diff-file-tag">${escapeHtml(toolObj.path || '')}</div><div class="du-diff-scroll">${oldLines}${newLines}</div>`;
   } else if (toolObj.tool === 'install_skill' || toolObj.tool === 'add_skill') {
     label = `Установка скилла: ${toolObj.name || 'Custom Skill'}`;
     inputContent = `<div class="du-diff-file-tag">SKILL REGISTRY</div><div class="du-diff-add">+ ${escapeHtml(toolObj.desc || '')}</div>`;
   } else if (toolObj.tool === 'python' || toolObj.tool === 'py') {
     label = 'Python';
-    inputContent = escapeHtml(toolObj.code || '');
+    inputContent = toolCardCode(toolObj.code);
   } else if (toolObj.tool === 'js') {
     label = 'JavaScript';
-    inputContent = escapeHtml(toolObj.code || '');
+    inputContent = toolCardCode(toolObj.code);
   } else {
-    label = 'Оболочка';
-    inputContent = escapeHtml(toolObj.code || '');
+    label = 'Терминал';
+    inputContent = toolCardCode(toolObj.code);
   }
 
+  return { label, inputHtml: inputContent };
+}
+
+function toolCardKey(toolObj) {
+  const body = toolObj.content || toolObj.code || toolObj.new_str || '';
+  return [toolObj.tool, toolObj.path || '', body.length].join('|');
+}
+
+function applyToolCardContent(root, toolObj, streaming) {
+  const { label, inputHtml } = toolCardContent(toolObj || {}, streaming);
+  const textEl = root.querySelector('.opencode-tool-text');
+  if (textEl && textEl.textContent !== label) textEl.textContent = label;
+  const inputEl = root.querySelector('.opencode-terminal-input');
+  if (!inputEl) return;
+  const key = (streaming ? 'stream:' : 'final:') + label + (streaming ? '' : '|' + toolCardKey(toolObj));
+  if (inputEl.__duKey === key) return;
+  inputEl.__duKey = key;
+  inputEl.innerHTML = inputHtml;
+}
+
+function createToolCard() {
+  const root = document.createElement('div');
+  root.className = 'opencode-tool-root';
+  root.setAttribute('data-open', 'false');
+  root.setAttribute('data-running', 'true');
   root.innerHTML = `
     <button class="opencode-tool-header-btn" type="button">
-      <span class="opencode-tool-text">${label}</span>
+      <span class="opencode-tool-text"></span>
       <svg class="opencode-tool-caret" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
     </button>
     <div class="opencode-terminal-box">
-      <div class="opencode-terminal-input">${inputContent}</div>
+      <div class="opencode-terminal-input"></div>
       <div class="opencode-terminal-output">Вычисление...</div>
     </div>
   `;
-
-  // Safely mount widget inside without breaking React's parent-child sibling hierarchy
-  targetToReplace.style.setProperty('display', 'none', 'important');
-  if (targetToReplace.parentNode) {
-    targetToReplace.parentNode.appendChild(root);
-  }
-
   const btn = root.querySelector('.opencode-tool-header-btn');
   btn.onclick = () => {
     const isOpen = root.getAttribute('data-open') === 'true';
     root.setAttribute('data-open', !isOpen ? 'true' : 'false');
   };
+  return root;
+}
 
+function hideNativeToolActions(root) {
   const parentVirtualRow = root.closest('div._9663006') || root.closest('div[data-virtual-list-item-key]');
-  if (parentVirtualRow) {
-    const act = parentVirtualRow.querySelector('div.ds-flex._0a3d93b');
-    if (act) act.style.setProperty('display', 'none', 'important');
+  if (!parentVirtualRow) return;
+  const act = parentVirtualRow.querySelector('div.ds-flex._0a3d93b');
+  if (act) act.style.setProperty('display', 'none', 'important');
+}
+
+function findStreamingToolCard(block) {
+  if (block.__duStreamWidget && block.__duStreamWidget.isConnected) return block.__duStreamWidget;
+  const scope = block.closest('.ds-message') || block.closest('[data-virtual-list-item-key]') || block.parentElement;
+  if (!scope) return null;
+  return scope.querySelector('.opencode-tool-root[data-du-streaming="true"]');
+}
+
+// Shown while the answer is still streaming: the shimmering label appears at once
+// instead of only after the whole file content has been written out.
+function renderStreamingToolCard(block, toolObj) {
+  if (!toolObj || !toolObj.tool) return;
+  let root = findStreamingToolCard(block);
+  if (!root) {
+    const host = block.parentNode;
+    if (!host) return;
+    root = createToolCard();
+    root.setAttribute('data-du-streaming', 'true');
+    host.insertBefore(root, block.nextSibling);
   }
+  applyToolCardContent(root, toolObj, true);
+  block.__duStreamWidget = root;
+}
+
+function extractPartialToolMeta(codeText) {
+  if (!codeText) return null;
+  const toolMatch = codeText.match(/"tool"\s*:\s*"([a-zA-Z_]+)"/);
+  if (!toolMatch) return null;
+  const pathMatch = codeText.match(/"path"\s*:\s*"([^"]*)"/);
+  const patternMatch = codeText.match(/"pattern"\s*:\s*"([^"]*)"/);
+  return {
+    tool: toolMatch[1].toLowerCase(),
+    path: pathMatch ? pathMatch[1] : '',
+    pattern: patternMatch ? patternMatch[1] : '',
+    __partial: true
+  };
+}
+
+function renderOpenCode1to1(originalPre, toolObj) {
+  const targetToReplace = originalPre.closest('.md-code-block') || originalPre;
+  targetToReplace.setAttribute('data-du-widget-attached', 'true');
+
+  let root = originalPre.__duStreamWidget || targetToReplace.__duStreamWidget;
+  if (root && !root.isConnected) root = null;
+
+  if (root) {
+    // Reuse the card that already appeared while the block was streaming.
+    root.removeAttribute('data-du-streaming');
+  } else {
+    root = createToolCard();
+    if (targetToReplace.parentNode) targetToReplace.parentNode.appendChild(root);
+  }
+
+  applyToolCardContent(root, toolObj, false);
+
+  // The finished card replaces the raw JSON block.
+  targetToReplace.style.setProperty('display', 'none', 'important');
+  root.__duBlock = targetToReplace;
+  targetToReplace.__duWidget = root;
+  hideNativeToolActions(root);
 
   return root;
 }
+// </du-tool-card>
+
 
 function setOpenCodeOutput(widget, output) {
   if (!widget) return;
@@ -1802,6 +3094,49 @@ function injectAgentToggleButton() {
     <div class="ds-focus-ring" style="--dsl-focus-ring-offset: -1px;"></div>
   `;
 
+  let currentTooltipWrapper = null;
+
+  btn.onmouseenter = () => {
+    let container = document.querySelector('div.ds-floating-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.className = 'ds-floating-container';
+      container.style.zIndex = '1024';
+      document.body.appendChild(container);
+    }
+
+    const rect = btn.getBoundingClientRect();
+    const wrapper = document.createElement('div');
+    wrapper.className = 'ds-floating-position-wrapper ds-theme';
+    wrapper.setAttribute('data-transform-origin', 'bottom');
+    wrapper.style.position = 'fixed';
+    wrapper.style.zIndex = '1024';
+    wrapper.style.pointerEvents = 'none';
+
+    wrapper.innerHTML = `
+      <div class="du-native-tooltip">
+        Autonomous tools, sandbox &amp; skills execution
+      </div>
+    `;
+
+    container.appendChild(wrapper);
+    currentTooltipWrapper = wrapper;
+
+    const tipRect = wrapper.getBoundingClientRect();
+    const left = rect.left + rect.width / 2 - tipRect.width / 2;
+    const top = rect.top - tipRect.height - 6;
+
+    wrapper.style.left = `${Math.round(left)}px`;
+    wrapper.style.top = `${Math.round(top)}px`;
+  };
+
+  btn.onmouseleave = () => {
+    if (currentTooltipWrapper) {
+      currentTooltipWrapper.remove();
+      currentTooltipWrapper = null;
+    }
+  };
+
   btn.onclick = () => {
     isAgentEnabled = !isAgentEnabled;
     localStorage.setItem('du_agent_enabled', JSON.stringify(isAgentEnabled));
@@ -1819,80 +3154,392 @@ function injectAgentToggleButton() {
 // -------------------------------------------------------------
 // OpenCode Project Workspace Selector & Native Folder Importer
 // -------------------------------------------------------------
-let currentProjectName = localStorage.getItem('du_active_project') || 'DeepUpgrade';
+let currentProjectName = localStorage.getItem('du_active_project') || null;
+let knownProjects = JSON.parse(localStorage.getItem('du_known_projects') || '[]');
+
+function openProjectDropdown(anchorBtn) {
+  let existing = document.querySelector('.du-project-menu');
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  const menu = document.createElement('div');
+  menu.className = 'du-project-menu';
+
+  const renderItems = (filterText = '') => {
+    const filtered = knownProjects.filter(p => p.toLowerCase().includes(filterText.toLowerCase()));
+
+    let projectsHtml = filtered.map(name => {
+      const isCur = name === currentProjectName;
+      return `
+        <button class="du-menu-item ${isCur ? 'active' : ''}" type="button" data-project="${escapeHtml(name)}">
+          <svg class="du-menu-item-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke-linejoin="round"/>
+          </svg>
+          <span class="du-menu-item-label">${escapeHtml(name)}</span>
+          ${isCur ? `
+            <svg class="du-menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3.5 8.5L6.5 11.5L12.5 4.5"/>
+            </svg>
+          ` : ''}
+        </button>
+      `;
+    }).join('');
+
+    if (filtered.length === 0) {
+      projectsHtml = `<div style="padding: 8px 10px; font-size: 12px; color: #6B7280;">Ничего не найдено</div>`;
+    }
+
+    return `
+      <div class="du-menu-search-wrapper">
+        <svg class="du-menu-search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="7" cy="7" r="4.5"/>
+          <path d="M10.5 10.5L14 14" stroke-linecap="round"/>
+        </svg>
+        <input class="du-menu-search-input" placeholder="Search projects or devices" value="${escapeHtml(filterText)}" />
+      </div>
+      <div class="du-menu-projects-list">
+        ${projectsHtml}
+      </div>
+      <div class="du-menu-divider"></div>
+      <button class="du-menu-item du-action-create" type="button">
+        <svg class="du-menu-item-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke-linejoin="round"/>
+          <path d="M8 7v4M6 9h4" stroke-linecap="round"/>
+        </svg>
+        <span class="du-menu-item-label">Create project</span>
+      </button>
+      <button class="du-menu-item du-action-outside" type="button">
+        <svg class="du-menu-item-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <circle cx="8" cy="8" r="6"/>
+          <path d="M5 8h6" stroke-linecap="round"/>
+        </svg>
+        <span class="du-menu-item-label">Work outside a project</span>
+      </button>
+    `;
+  };
+
+  menu.innerHTML = renderItems();
+
+  const bindEvents = () => {
+    const searchInput = menu.querySelector('.du-menu-search-input');
+    searchInput?.focus();
+    searchInput?.addEventListener('input', (e) => {
+      const listEl = menu.querySelector('.du-menu-projects-list');
+      const val = e.target.value;
+      const filtered = knownProjects.filter(p => p.toLowerCase().includes(val.toLowerCase()));
+      if (listEl) {
+        if (filtered.length === 0) {
+          listEl.innerHTML = `<div style="padding: 8px 10px; font-size: 12px; color: #6B7280;">Ничего не найдено</div>`;
+        } else {
+          listEl.innerHTML = filtered.map(name => {
+            const isCur = name === currentProjectName;
+            return `
+              <button class="du-menu-item ${isCur ? 'active' : ''}" type="button" data-project="${escapeHtml(name)}">
+                <svg class="du-menu-item-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+                  <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke-linejoin="round"/>
+                </svg>
+                <span class="du-menu-item-label">${escapeHtml(name)}</span>
+                ${isCur ? `
+                  <svg class="du-menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3.5 8.5L6.5 11.5L12.5 4.5"/>
+                  </svg>
+                ` : ''}
+              </button>
+            `;
+          }).join('');
+        }
+      }
+    });
+
+    menu.addEventListener('click', (e) => {
+      const projBtn = e.target.closest('[data-project]');
+      if (projBtn) {
+        const chosen = projBtn.getAttribute('data-project');
+        currentProjectName = chosen;
+        localStorage.setItem('du_active_project', currentProjectName);
+        const nameEl = document.querySelector('.du-project-name');
+        if (nameEl) nameEl.innerText = currentProjectName;
+        menu.remove();
+        return;
+      }
+
+      if (e.target.closest('.du-action-create')) {
+        menu.remove();
+        const fileInput = document.querySelector('.du-project-folder-input');
+        fileInput?.click();
+        return;
+      }
+
+      if (e.target.closest('.du-action-outside')) {
+        currentProjectName = null;
+        localStorage.removeItem('du_active_project');
+        const nameEl = document.querySelector('.du-project-name');
+        if (nameEl) nameEl.innerText = 'No Project';
+        menu.remove();
+        return;
+      }
+    });
+  };
+
+  bindEvents();
+
+  const closeHandler = (e) => {
+    if (!menu.contains(e.target) && !anchorBtn.contains(e.target)) {
+      menu.remove();
+      document.removeEventListener('pointerdown', closeHandler);
+    }
+  };
+  setTimeout(() => document.addEventListener('pointerdown', closeHandler), 10);
+
+  anchorBtn.parentElement.appendChild(menu);
+}
+
+// <du-project-plate>
+// Resolve the outer composer card: the element that actually paints the rounded
+// input surface, not the transparent wrappers inside it.
+//
+// Empty chats match `div._77cefa5._9996a53`. As soon as the chat has messages
+// DeepSeek swaps the modifier class (e.g. `_3d616d3`), the old selector stops
+// matching and the previous fallback `closest('div:has(textarea)')` returned an
+// inner transparent wrapper *inside* the card. The plate was then injected
+// inside the rounded card, so the card painted its own border and corners
+// around it and the plate looked like a second, crooked pill.
+function findComposerCard(input) {
+  let start = input;
+  if (!start) {
+    start = typeof findDeepSeekInput === 'function' ? findDeepSeekInput() : null;
+  }
+  if (!start) return null;
+  if (!start.matches || !start.matches('textarea, input, [contenteditable="true"]')) {
+    start = start.querySelector('textarea, input, [contenteditable="true"]') || start;
+  }
+
+  const known = start.closest('div._77cefa5._9996a53') || start.closest('div._77cefa5');
+  if (known) return known;
+
+  // Class names are obfuscated and can change: fall back to the nearest ancestor
+  // that looks like a card (rounded + painted), then to a rounded wrapper.
+  let el = start.parentElement;
+  let roundedOnly = null;
+  for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+    const cs = window.getComputedStyle(el);
+    const radius = parseFloat(cs.borderTopLeftRadius) || 0;
+    if (radius < 12) continue;
+    const bg = cs.backgroundColor;
+    const painted = bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)';
+    if (painted) return el;
+    if (!roundedOnly) roundedOnly = el;
+  }
+  return roundedOnly || start.closest('div:has(textarea)');
+}
+
+function syncProjectBarGeometry(bar, card) {
+  if (!bar || !card || !bar.isConnected || !card.isConnected) return;
+
+  const apply = () => {
+    if (!bar.isConnected || !card.isConnected) return;
+    if (bar.__duSyncScheduled) return;
+    bar.__duSyncScheduled = true;
+
+    // Coalesce bursts of DOM mutations (streaming answers trigger many).
+    requestAnimationFrame(() => {
+      bar.__duSyncScheduled = false;
+      if (!bar.isConnected || !card.isConnected) return;
+
+      const cardRect = card.getBoundingClientRect();
+      if (cardRect.width <= 0) return;
+
+      // The plate must be exactly as wide as the native card. A wider plate is
+      // what turned the top bar into a flat dark strip in populated chats.
+      const nextWidth = Math.round(cardRect.width) + 'px';
+      if (bar.style.width !== nextWidth) {
+        bar.style.setProperty('width', nextWidth, 'important');
+      }
+
+      const barRect = bar.getBoundingClientRect();
+      const currentLeft = parseFloat(bar.style.left) || 0;
+      // barRect already includes the current relative offset, so add the delta.
+      const nextLeft = Math.round(currentLeft + (cardRect.left - barRect.left)) + 'px';
+      if (bar.style.left !== nextLeft) {
+        bar.style.setProperty('left', nextLeft, 'important');
+      }
+
+      const cs = window.getComputedStyle(card);
+      const radius = parseFloat(cs.borderTopLeftRadius);
+      const nextRadius = (Number.isFinite(radius) && radius > 0 ? radius : 20) + 'px';
+      if (bar.style.getPropertyValue('--du-plate-radius') !== nextRadius) {
+        bar.style.setProperty('--du-plate-radius', nextRadius);
+      }
+
+      // Do NOT copy the card's border color: when the composer is focused
+      // DeepSeek paints its border violet, and copying it turned the whole
+      // project plate into a bright purple outline in existing chats.
+    });
+  };
+
+  apply();
+
+  if (window.ResizeObserver) {
+    if (bar.__duPlateObserver && bar.__duPlateCard === card) return;
+    if (bar.__duPlateObserver) bar.__duPlateObserver.disconnect();
+    const observer = new ResizeObserver(apply);
+    observer.observe(card);
+    bar.__duPlateObserver = observer;
+    bar.__duPlateCard = card;
+  }
+}
+// </du-project-plate>
 
 function injectProjectSelector() {
-  // Target the exact DeepSeek input card container from DOM
-  const card = document.querySelector('div._77cefa5._9996a53') || 
-               document.querySelector('div._020ab5b')?.parentElement ||
-               findDeepSeekInput()?.closest('div:has(textarea)');
+  const card = findComposerCard();
   if (!card) return;
 
   const parent = card.parentElement;
   if (!parent) return;
 
-  let outerPlate = card.previousElementSibling?.classList.contains('du-project-plate') ? card.previousElementSibling : null;
-  
-  if (!outerPlate) {
-    // If not yet injected, create the outer card wrapper behind the input card
-    if (!parent.classList.contains('du-project-outer-wrapper')) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'du-project-outer-wrapper';
-      parent.insertBefore(wrapper, card);
-      
-      const bar = document.createElement('div');
-      bar.className = 'du-project-top-bar';
-      bar.innerHTML = `
-        <button class="du-project-select-btn" type="button" title="Выбрать активный проект">
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-          </svg>
-          <span class="du-project-name">${escapeHtml(currentProjectName)}</span>
-          <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
-            <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          </svg>
-        </button>
-        <button class="du-project-add-btn" type="button" title="Открыть папку с диска в VFS">+</button>
-        <input type="file" class="du-project-folder-input" webkitdirectory directory multiple style="display: none;">
-      `;
+  // Drop plates left behind in another container (an older build injected the
+  // plate inside the composer card, which is what produced the seam).
+  document.querySelectorAll('.du-project-top-bar').forEach((node) => {
+    if (node.parentElement !== parent) node.remove();
+  });
 
-      const addBtn = bar.querySelector('.du-project-add-btn');
-      const fileInput = bar.querySelector('.du-project-folder-input');
-      addBtn.onclick = () => fileInput.click();
-      fileInput.onchange = async (e) => {
-        const files = e.target.files;
-        if (!files || files.length === 0) return;
-        const firstRel = files[0].webkitRelativePath || '';
-        const folderName = firstRel.split('/')[0] || 'Project';
-        currentProjectName = folderName;
-        localStorage.setItem('du_active_project', currentProjectName);
-        bar.querySelector('.du-project-name').innerText = currentProjectName;
-
-        for (let i = 0; i < files.length; i++) {
-          const file = files[i];
-          if (file.webkitRelativePath.includes('/.git/') || file.webkitRelativePath.includes('/node_modules/')) continue;
-          const vfsPath = '/' + file.webkitRelativePath;
-          try {
-            const text = await file.text();
-            if (sandboxIframe && sandboxIframe.contentWindow) {
-              sandboxIframe.contentWindow.postMessage({
-                type: 'DU_STORE_ATTACHMENT',
-                path: vfsPath,
-                data: text,
-                isBinary: false,
-                mtime: file.lastModified
-              }, '*');
-            }
-          } catch (err) {
-            console.warn('[DeepUpgrade Project] Не удалось прочитать файл:', file.name, err);
-          }
-        }
-      };
-
-      wrapper.appendChild(bar);
-      wrapper.appendChild(card);
-    }
+  // Check if project plate already exists inside this container
+  let bar = parent.querySelector(':scope > .du-project-top-bar');
+  if (bar) {
+    // React can reorder the composer; keep the plate glued right above it.
+    if (bar.nextElementSibling !== card) parent.insertBefore(bar, card);
+    syncProjectBarGeometry(bar, card);
+    return;
   }
+
+  bar = document.createElement('div');
+  bar.className = 'du-project-top-bar';
+  bar.innerHTML = `
+    <button class="du-project-select-btn" type="button" title="Выбрать активный проект">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+      </svg>
+      <span class="du-project-name">${escapeHtml(currentProjectName || 'Select project...')}</span>
+      <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
+        <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <button class="du-project-add-btn" type="button" title="Открыть папку с диска в VFS">+</button>
+    <input type="file" class="du-project-folder-input" webkitdirectory directory multiple style="display: none;">
+  `;
+
+  const selectBtn = bar.querySelector('.du-project-select-btn');
+  selectBtn.onclick = (e) => {
+    e.stopPropagation();
+    openProjectDropdown(selectBtn);
+  };
+
+  const addBtn = bar.querySelector('.du-project-add-btn');
+  const fileInput = bar.querySelector('.du-project-folder-input');
+  addBtn.onclick = () => fileInput.click();
+  fileInput.onchange = async (e) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const firstRel = files[0].webkitRelativePath || '';
+    const folderName = firstRel.split('/')[0] || 'Project';
+    currentProjectName = folderName;
+    if (!knownProjects.includes(folderName)) {
+      knownProjects.push(folderName);
+      localStorage.setItem('du_known_projects', JSON.stringify(knownProjects));
+    }
+    localStorage.setItem('du_active_project', currentProjectName);
+    bar.querySelector('.du-project-name').innerText = currentProjectName;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.webkitRelativePath.includes('/.git/') || file.webkitRelativePath.includes('/node_modules/')) continue;
+      const vfsPath = '/' + file.webkitRelativePath;
+      try {
+        const text = await file.text();
+        if (sandboxIframe && sandboxIframe.contentWindow) {
+          sandboxIframe.contentWindow.postMessage({
+            type: 'DU_STORE_ATTACHMENT',
+            path: vfsPath,
+            data: text,
+            isBinary: false,
+            mtime: file.lastModified
+          }, '*');
+        }
+      } catch (err) {
+        console.warn('[DeepUpgrade Project] Не удалось прочитать файл:', file.name, err);
+      }
+    }
+  };
+
+  // Safe DOM placement: insert directly before card without reparenting or stealing nodes from React!
+  // Set the width before insertion so the plate never flashes at content width.
+  const initialRect = card.getBoundingClientRect();
+  if (initialRect.width > 0) {
+    bar.style.setProperty('width', Math.round(initialRect.width) + 'px', 'important');
+  }
+  parent.insertBefore(bar, card);
+  syncProjectBarGeometry(bar, card);
+}
+
+
+// -------------------------------------------------------------
+// Sidebar "New Project" Button
+// -------------------------------------------------------------
+function injectNewProjectButton() {
+  if (document.querySelector('.du-new-project-btn')) return;
+
+  // Exact target from DevTools tree:
+  // div._7b40dad > div.dc1f7bec._4bcc731
+  const newChatWrapper = document.querySelector('div.dc1f7bec._4bcc731') || 
+                         document.querySelector('div._5a8ac7a.a084f19e')?.parentElement;
+
+  if (!newChatWrapper || !newChatWrapper.parentElement) return;
+
+  const parent = newChatWrapper.parentElement; // div._7b40dad
+  if (parent.querySelector('.du-new-project-btn')) return;
+
+  // Create an identical wrapper matching dc1f7bec _4bcc731
+  const projWrapper = document.createElement('div');
+  projWrapper.className = newChatWrapper.className;
+  projWrapper.style.cssText = 'margin-top: 6px;';
+
+  const btn = document.createElement('div');
+  btn.className = '_5a8ac7a a084f19e du-new-project-btn';
+  btn.setAttribute('tabindex', '0');
+  btn.style.cssText = 'justify-content: center; cursor: pointer;';
+
+  btn.innerHTML = `
+    <div class="ds-icon _1c42ad7" style="font-size: 16px; width: 16px; height: 16px;">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <path d="M2 3.5C2 2.67157 2.67157 2 3.5 2H6.5L8 4H12.5C13.3284 4 14 4.67157 14 5.5V12.5C14 13.3284 13.3284 14 12.5 14H3.5C2.67157 14 2 13.3284 2 12.5V3.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+        <path d="M8 7V11M6 9H10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <span>New project</span>
+    <div class="ds-focus-ring"></div>
+  `;
+
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const folderInput = document.querySelector('.du-project-folder-input');
+    if (folderInput) {
+      folderInput.click();
+    } else {
+      const projBtn = document.querySelector('.du-project-select-btn');
+      if (projBtn) projBtn.click();
+    }
+  };
+
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      btn.click();
+    }
+  });
+
+  projWrapper.appendChild(btn);
+  parent.insertBefore(projWrapper, newChatWrapper.nextSibling);
 }
 
 const observer = new MutationObserver(() => {
@@ -1904,13 +3551,18 @@ const observer = new MutationObserver(() => {
   injectSkillsSettingsButton();
   injectAgentToggleButton();
   injectProjectSelector();
+  injectNewProjectButton();
 });
 
 observer.observe(document.documentElement, { childList: true, subtree: true });
+
+// History must never be re-executed just because the page was reloaded.
+seedHistoricalExecutions();
 cleanAndUnifyChat();
 hookInput();
 hookAttachmentElements();
 processToolCalls();
 injectSkillsSettingsButton();
 injectAgentToggleButton();
+injectNewProjectButton();
 runAttachmentCleanup();

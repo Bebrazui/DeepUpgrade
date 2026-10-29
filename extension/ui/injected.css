@@ -170,6 +170,59 @@
   border-radius: 2px;
 }
 
+/* Scrollable code view (write / python / js / terminal) */
+.du-code-view {
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #e4e4e7;
+  background: transparent;
+}
+
+.du-code-view::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.du-code-view::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+}
+
+.du-code-view::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.du-code-view::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Scrollable diff for edit */
+.du-diff-scroll {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.du-code-more {
+  margin-top: 6px;
+  color: #94a3b8;
+  font-size: 11.5px;
+  opacity: 0.9;
+}
+
+.du-code-streaming {
+  color: #94a3b8;
+  font-size: 11.5px;
+  opacity: 0.85;
+  font-style: italic;
+}
+
 /* Bottom section: Output */
 .opencode-terminal-output {
   padding: 10px 14px;
@@ -188,9 +241,11 @@ div._11d6b3a[data-du-silent="true"] {
   display: none !important;
 }
 
-/* Textarea & container anti-flicker: Lock container dimensions during silent operations */
-div._24fad49.du-locked-box,
-div._24fad49:has(textarea.du-freezing) {
+/* Textarea & container anti-flicker: Lock container dimensions during silent operations.
+   Containers that host the project plate are excluded: forcing them to 40px
+   clipped the plate and the input card in chats that already have messages. */
+div._24fad49.du-locked-box:not(:has(> .du-project-top-bar)),
+div._24fad49:has(textarea.du-freezing):not(:has(> .du-project-top-bar)) {
   max-height: 40px !important;
   height: 40px !important;
   min-height: 40px !important;
@@ -962,7 +1017,20 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   color: #FFFFFF;
 }
 
-/* 1:1 Figma Outer Container Behind DeepSeek Input Card */
+/* DeepSeek Native Floating Tooltip (Exact Figma: #43454A, border-radius 9.47px) */
+.du-native-tooltip {
+  display: inline-block;
+  padding: 5px 11px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #FFFFFF;
+  background: #43454A !important;
+  border-radius: 9.47px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+  white-space: nowrap;
+}
 .du-project-outer-wrapper {
   background: transparent !important;
   border: none !important;
@@ -974,25 +1042,159 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
 }
 
 .du-project-top-bar {
-  background: #1c1d21 !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
-  border-left: 1px solid rgba(255, 255, 255, 0.08) !important;
-  border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
+  background: var(--du-plate-bg, #1c1d21) !important;
+  border-top: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
+  border-left: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
+  border-right: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
   border-bottom: none !important;
-  border-top-left-radius: 20px !important;
-  border-top-right-radius: 20px !important;
+  border-top-left-radius: var(--du-plate-radius, 20px) !important;
+  border-top-right-radius: var(--du-plate-radius, 20px) !important;
   border-bottom-left-radius: 0 !important;
   border-bottom-right-radius: 0 !important;
   padding: 8px 14px 28px 14px !important;
-  margin-bottom: -22px !important;
+  margin-bottom: -20px !important;
   display: flex;
   align-items: center;
   gap: 8px;
   user-select: none;
   box-sizing: border-box !important;
-  width: 100% !important;
+  width: auto !important;
+  max-width: none !important;
+  flex: 0 0 auto !important;
+  position: relative !important;
+  z-index: 0 !important;
+}
+
+/* The host must never clip the rounded plate or the native input card.
+   Populated chats put the composer in a footer that sometimes has
+   overflow:hidden, which turned the plate into a flat strip. */
+div:has(> .du-project-top-bar) {
+  overflow: visible !important;
+}
+
+/* DeepSeek native card on top with its original rounded corners */
+div:has(> .du-project-top-bar) > div._77cefa5._9996a53,
+div:has(> .du-project-top-bar) > div:has(textarea),
+.du-project-top-bar + div._77cefa5._9996a53,
+.du-project-top-bar + div:has(textarea) {
   position: relative !important;
   z-index: 1 !important;
+  margin-top: 0 !important;
+}
+
+/* 1:1 Figma Project Dropdown Menu */
+.du-project-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 14px;
+  width: 250px;
+  background: #25262b;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  padding: 6px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: du-menu-pop 0.15s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+  user-select: none;
+}
+
+@keyframes du-menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.du-menu-search-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  margin-bottom: 4px;
+}
+
+.du-menu-search-icon {
+  width: 14px;
+  height: 14px;
+  color: #7E7E82;
+  flex-shrink: 0;
+}
+
+.du-menu-search-input {
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  color: #FFFFFF !important;
+  font-size: 13px !important;
+  width: 100% !important;
+  padding: 0 !important;
+  font-family: inherit !important;
+}
+
+.du-menu-search-input::placeholder {
+  color: #6B7280;
+}
+
+.du-menu-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.06);
+  margin: 4px 0;
+}
+
+.du-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  color: #D1D5DB;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+}
+
+.du-menu-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+.du-menu-item.active {
+  color: #FFFFFF;
+}
+
+.du-menu-item-icon {
+  width: 15px;
+  height: 15px;
+  color: #9CA3AF;
+  flex-shrink: 0;
+}
+
+.du-menu-item-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.du-menu-check {
+  width: 14px;
+  height: 14px;
+  color: #9CA3AF;
+  margin-left: auto;
 }
 
 /* DeepSeek native card sits on top with its original rounded corners intact */
@@ -1107,8 +1309,190 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
 .du-todo-item.completed .du-todo-title {
   color: #7E7E82;
 }
+
+/* ==========================================================================
+   THEMES
+   --------------------------------------------------------------------------
+   DeepSeek paints the UI through CSS custom properties: the static palette
+   (--dsw-static-*) lives on `body`, the dark aliases (--dsw-alias-*) on
+   `body[data-ds-dark-theme]`. Every surface, border and label reads those
+   variables, so a theme only needs to remap the palette. No hashed class names
+   and no per-component overrides.
+
+   `default` applies no rules at all: the attribute is removed from <html>.
+   ========================================================================== */
+
+/* ---------- Pure OLED Black ---------- */
+html[data-du-theme="oled"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #f1f2f4;
+  --dsw-static-neutral-bluish-300: #cfd3d6;
+  --dsw-static-neutral-bluish-400: #a9aeb4;
+  --dsw-static-neutral-bluish-600: #7c8087;
+  --dsw-static-neutral-bluish-750: #2e2f31;
+  --dsw-static-neutral-bluish-800: #1c1c1e;
+  --dsw-static-neutral-bluish-850: #111113;
+  --dsw-static-neutral-bluish-875: #09090a;
+  --dsw-static-neutral-bluish-900: #050506;
+  --dsw-static-neutral-bluish-950: #000000;
+  --dsw-static-neutral-850: #0d0d0e;
+  --dsw-static-neutral-700: #262628;
+  --dsw-static-neutral-600: #4a4a4d;
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.06);
+  --dsw-alias-border-inverted2: rgba(255, 255, 255, 0.1);
+  --dsw-alias-border-inverted: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.18);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.24);
+  --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.1);
+  --dsw-alias-interactive-bg-active: rgba(255, 255, 255, 0.16);
+  --dsw-alias-interactive-bg-hover-accent: rgba(255, 255, 255, 0.26);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(0, 0, 0, 0.4);
+  --dsw-alias-button-tool-bar-fill: rgba(38, 38, 40, 0.62);
+  --dsw-alias-button-tool-bar-hover: rgba(52, 52, 55, 0.72);
+  background-color: #000000;
+}
+
+/* ---------- Cyberpunk Neon ---------- */
+html[data-du-theme="cyberpunk"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #f4e9ff;
+  --dsw-static-neutral-bluish-300: #dcc6f2;
+  --dsw-static-neutral-bluish-400: #bda1d9;
+  --dsw-static-neutral-bluish-600: #9573b3;
+  --dsw-static-neutral-bluish-750: #3d1c5e;
+  --dsw-static-neutral-bluish-800: #2a1042;
+  --dsw-static-neutral-bluish-850: #1d0a30;
+  --dsw-static-neutral-bluish-875: #150722;
+  --dsw-static-neutral-bluish-900: #0d0418;
+  --dsw-static-neutral-bluish-950: #07020f;
+  --dsw-static-neutral-850: #12051f;
+  --dsw-static-neutral-700: #33124f;
+  --dsw-static-neutral-600: #57207d;
+  --dsw-static-deepseek-400: #22e6ff;
+  --dsw-static-deepseek-450: #ff2bd6;
+  --dsw-static-deepseek-500: #ff5ce0;
+  --dsw-static-deepseek-600: #ff2bd6;
+  --dsw-static-deepseek-800: #4a0c5c;
+  --dsw-static-deepseek-900: #2a0436;
+  --dsw-alias-bg-skeleton: rgba(255, 43, 214, 0.12);
+  --dsw-alias-border-inverted2: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-inverted: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-l1: rgba(255, 43, 214, 0.18);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-l2: rgba(255, 43, 214, 0.32);
+  --dsw-alias-border-l3: rgba(34, 230, 255, 0.36);
+  --dsw-alias-border-l4: rgba(34, 230, 255, 0.5);
+  --dsw-alias-interactive-bg-hover: rgba(255, 43, 214, 0.14);
+  --dsw-alias-interactive-bg-active: rgba(255, 43, 214, 0.22);
+  --dsw-alias-interactive-bg-hover-accent: rgba(34, 230, 255, 0.26);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(13, 4, 24, 0.5);
+  --dsw-alias-button-tool-bar-fill: rgba(61, 28, 94, 0.55);
+  --dsw-alias-button-tool-bar-hover: rgba(87, 32, 125, 0.65);
+  background-color: #07020f;
+  background-image:
+    radial-gradient(900px 540px at 10% -12%, rgba(255, 43, 214, 0.18), transparent 62%),
+    radial-gradient(820px 520px at 94% 2%, rgba(34, 230, 255, 0.14), transparent 64%);
+  background-attachment: fixed;
+}
+
+/* Neon brand text and focus rings, still using the site's own variables. */
+html[data-du-theme="cyberpunk"] body[data-ds-dark-theme] ::selection {
+  background: rgba(255, 43, 214, 0.35);
+  color: #ffffff;
+}
+
+/* ---------- Liquid Glass ---------- */
+html[data-du-theme="glass"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #eef4ff;
+  --dsw-static-neutral-bluish-300: #d2ddec;
+  --dsw-static-neutral-bluish-400: #aebdd4;
+  --dsw-static-neutral-bluish-600: #8fa2bd;
+  --dsw-static-neutral-bluish-750: rgba(44, 62, 92, 0.62);
+  --dsw-static-neutral-bluish-800: rgba(30, 44, 70, 0.6);
+  --dsw-static-neutral-bluish-850: rgba(21, 32, 54, 0.62);
+  --dsw-static-neutral-bluish-875: rgba(14, 23, 40, 0.66);
+  --dsw-static-neutral-bluish-900: rgba(10, 17, 30, 0.7);
+  --dsw-static-neutral-bluish-950: #060b14;
+  --dsw-static-neutral-850: rgba(16, 26, 44, 0.66);
+  --dsw-static-neutral-700: rgba(60, 82, 116, 0.55);
+  --dsw-static-neutral-600: rgba(96, 122, 158, 0.6);
+  --dsw-static-deepseek-400: #9cc7ff;
+  --dsw-static-deepseek-450: #6ea8ff;
+  --dsw-static-deepseek-500: #8dbcff;
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-inverted2: rgba(255, 255, 255, 0.18);
+  --dsw-alias-border-inverted: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.12);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.2);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.26);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.32);
+  --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.1);
+  --dsw-alias-interactive-bg-active: rgba(255, 255, 255, 0.16);
+  --dsw-alias-interactive-bg-hover-accent: rgba(255, 255, 255, 0.24);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(6, 11, 20, 0.35);
+  --dsw-alias-button-tool-bar-fill: rgba(60, 84, 120, 0.45);
+  --dsw-alias-button-tool-bar-hover: rgba(76, 104, 146, 0.55);
+  background-color: #060b14;
+  background-image: linear-gradient(135deg, #060b14 0%, #0c1a2e 38%, #16324c 68%, #081222 100%);
+  background-attachment: fixed;
+}
+
+/* Frosted overlays: menus, dialogs and notifications are the surfaces that sit
+   above arbitrary content, so those are the ones worth blurring. */
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-modal-content,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-dropdown-menu,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-select__select,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-notification,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-toast {
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+/* Theme switches are instant by default; soften only the page background. */
+html[data-du-theme] body {
+  transition: background-color 0.2s ease, background-image 0.2s ease;
+}
+
   transform: scale(0.98);
 }
 
 
 
+
+/* Sidebar New Project button: exact 1:1 match with New chat button */
+.du-new-project-btn {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 8px !important;
+  font-size: 14px !important;
+  font-weight: 500 !important;
+  color: var(--dsw-alias-label-primary, #e5e7eb) !important;
+  background: var(--dsw-alias-bg-layer-1, rgba(255, 255, 255, 0.05)) !important;
+  border-radius: 12px !important;
+  padding: 8px 12px !important;
+  border: 1px solid var(--dsw-alias-border-inverted2, rgba(255, 255, 255, 0.08)) !important;
+  transition: background 0.15s ease, border-color 0.15s ease !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  box-sizing: border-box !important;
+  width: 100% !important;
+}
+.du-new-project-btn:hover {
+  background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.1)) !important;
+  color: #ffffff !important;
+}
+
+/* Hard reset any browser visited link color for du-new-project-btn */
+.du-new-project-btn,
+.du-new-project-btn *,
+.du-new-project-btn span {
+  color: var(--dsw-alias-label-primary, #e5e7eb) !important;
+  text-decoration: none !important;
+}
+.du-new-project-btn:hover,
+.du-new-project-btn:hover * {
+  color: #ffffff !important;
+}

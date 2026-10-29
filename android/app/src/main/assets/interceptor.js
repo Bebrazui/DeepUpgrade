@@ -1,5 +1,6 @@
 // DeepUpgrade Network Guardian, Autonomous PoW Solver & Direct API Engine
 (function() {
+  console.log('!!! INTERCEPTOR.JS IS RUNNING !!!');
   const isTelemetryBlocked = () => {
     return localStorage.getItem('du_block_telemetry') !== 'false';
   };
@@ -292,8 +293,10 @@
   // 1. Hook window.fetch
   const origFetch = window.fetch;
   window.fetch = async function(resource, init) {
+    const urlStr = resource instanceof Request ? resource.url : resource;
+    console.log('[DeepUpgrade Debug] Outgoing request:', urlStr);
     try {
-      let url = '';
+      let url = urlStr;
       let method = 'GET';
       let reqBody = init && init.body;
       let rawHeaders = (init && init.headers) || {};
@@ -329,6 +332,9 @@
 
       // Check if this is chat completion, create message, or session call
       const isChatCandidate = url.includes('/chat') || url.includes('/completion') || url.includes('/message') || url.includes('/conversation');
+      
+      if (isChatCandidate) console.log('[DeepUpgrade] Chat request detected:', url);
+
       if (isChatCandidate && !url.includes('/telemetry')) {
         try {
           let parsedBody = null;
@@ -349,7 +355,9 @@
           // If this is a user message being sent and Agent mode is active
           if (parsedBody && typeof parsedBody.prompt === 'string') {
             const rawPrompt = parsedBody.prompt.trim();
-            const isAgentActive = localStorage.getItem('du_agent_enabled') !== 'false';
+            const rawSetting = localStorage.getItem('du_tools_enabled');
+            const isAgentActive = rawSetting !== 'false';
+            console.log(`[DeepUpgrade Sniffer] Agent Check: du_tools_enabled='${rawSetting}', Active=${isAgentActive}`);
             
             // Check if prompt already has system directive or is a sandbox output
             const hasDirectiveAlready = rawPrompt.includes('[SYSTEM CAPABILITY:') || rawPrompt.includes('[SYSTEM INSTRUCTION:');
@@ -450,6 +458,7 @@
 
   const origSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function(body) {
+    console.log('[DeepUpgrade Debug] XHR send called');
     if (this.__url && (this.__url.includes('/api/v0/telemetry') || this.__url.includes('/telemetry'))) {
       if (isTelemetryBlocked()) {
         Object.defineProperty(this, 'status', { value: 200, writable: false });

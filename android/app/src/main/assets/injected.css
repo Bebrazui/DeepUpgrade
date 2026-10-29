@@ -1,6 +1,16 @@
-/* OpenCode Exact 1:1 Pixel Match - Pure Seamless Integration */
+/* Prevent DeepSeek action bar (copy, regenerate, thumbs up, etc.) from overlaying while tool is running */
+.opencode-tool-root[data-running="true"] ~ div:has(button[aria-label]),
+.opencode-tool-root[data-running="true"] ~ div:has(.ds-button),
+.opencode-tool-root[data-running="true"] ~ .ds-flex._0a3d93b {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: opacity 0.2s ease;
+}
 
-/* Outer container with smooth fade-in */
+/* Also ensure tool widget itself isolates hover from parent bubble triggers */
+.opencode-tool-root {
+  pointer-events: auto;
+}
 .opencode-tool-root {
   margin: 12px 0 14px 0;
   width: 100%;
@@ -178,9 +188,11 @@ div._11d6b3a[data-du-silent="true"] {
   display: none !important;
 }
 
-/* Textarea & container anti-flicker: Lock container dimensions during silent operations */
-div._24fad49.du-locked-box,
-div._24fad49:has(textarea.du-freezing) {
+/* Textarea & container anti-flicker: Lock container dimensions during silent operations.
+   Containers that host the project plate are excluded: forcing them to 40px
+   clipped the plate and the input card in chats that already have messages. */
+div._24fad49.du-locked-box:not(:has(> .du-project-top-bar)),
+div._24fad49:has(textarea.du-freezing):not(:has(> .du-project-top-bar)) {
   max-height: 40px !important;
   height: 40px !important;
   min-height: 40px !important;
@@ -195,6 +207,11 @@ textarea[style*="height"].du-freezing {
   overflow: hidden !important;
   color: transparent !important;
   caret-color: transparent !important;
+}
+
+textarea.du-freezing::placeholder {
+  color: inherit !important;
+  opacity: 0.5 !important;
 }
 
 /* Hide action bar under any tool card message */
@@ -888,11 +905,357 @@ div:has(> .opencode-tool-root) div._0a3d93b._965abe9 {
   transform: scale(0.98);
 }
 
-.du-question-submit-btn:hover {
-  background: #0369a1;
+/* =========================================================================
+   Project Selector & Nested Inner Input Card (Exact 1:1 Figma Match)
+   ========================================================================= */
+/* The outer container gets the top project bar */
+.du-project-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px 8px 16px;
+  user-select: none;
 }
 
-.du-question-submit-btn:active {
+.du-project-select-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: transparent;
+  border: none;
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: #D5D5D5;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.du-project-select-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+.du-project-select-btn svg {
+  color: #94A3B8;
+  flex-shrink: 0;
+}
+
+.du-project-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #94A3B8;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.du-project-add-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+/* DeepSeek Native Floating Tooltip (Exact Figma: #43454A, border-radius 9.47px) */
+.du-native-tooltip {
+  display: inline-block;
+  padding: 5px 11px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #FFFFFF;
+  background: #43454A !important;
+  border-radius: 9.47px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+  white-space: nowrap;
+}
+.du-project-outer-wrapper {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  box-sizing: border-box !important;
+  width: 100% !important;
+}
+
+.du-project-top-bar {
+  background: var(--du-plate-bg, #1c1d21) !important;
+  border-top: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
+  border-left: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
+  border-right: 1px solid var(--du-plate-border, rgba(255, 255, 255, 0.08)) !important;
+  border-bottom: none !important;
+  border-top-left-radius: var(--du-plate-radius, 20px) !important;
+  border-top-right-radius: var(--du-plate-radius, 20px) !important;
+  border-bottom-left-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+  padding: 8px 14px 28px 14px !important;
+  margin-bottom: -20px !important;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  box-sizing: border-box !important;
+  width: auto !important;
+  max-width: none !important;
+  flex: 0 0 auto !important;
+  position: relative !important;
+  z-index: 0 !important;
+}
+
+/* The host must never clip the rounded plate or the native input card.
+   Populated chats put the composer in a footer that sometimes has
+   overflow:hidden, which turned the plate into a flat strip. */
+div:has(> .du-project-top-bar) {
+  overflow: visible !important;
+}
+
+/* DeepSeek native card on top with its original rounded corners */
+div:has(> .du-project-top-bar) > div._77cefa5._9996a53,
+div:has(> .du-project-top-bar) > div:has(textarea),
+.du-project-top-bar + div._77cefa5._9996a53,
+.du-project-top-bar + div:has(textarea) {
+  position: relative !important;
+  z-index: 1 !important;
+  margin-top: 0 !important;
+}
+
+/* 1:1 Figma Project Dropdown Menu */
+.du-project-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 14px;
+  width: 250px;
+  background: #25262b;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  padding: 6px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: du-menu-pop 0.15s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+  user-select: none;
+}
+
+@keyframes du-menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.du-menu-search-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  margin-bottom: 4px;
+}
+
+.du-menu-search-icon {
+  width: 14px;
+  height: 14px;
+  color: #7E7E82;
+  flex-shrink: 0;
+}
+
+.du-menu-search-input {
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  color: #FFFFFF !important;
+  font-size: 13px !important;
+  width: 100% !important;
+  padding: 0 !important;
+  font-family: inherit !important;
+}
+
+.du-menu-search-input::placeholder {
+  color: #6B7280;
+}
+
+.du-menu-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.06);
+  margin: 4px 0;
+}
+
+.du-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  color: #D1D5DB;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+}
+
+.du-menu-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+.du-menu-item.active {
+  color: #FFFFFF;
+}
+
+.du-menu-item-icon {
+  width: 15px;
+  height: 15px;
+  color: #9CA3AF;
+  flex-shrink: 0;
+}
+
+.du-menu-item-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.du-menu-check {
+  width: 14px;
+  height: 14px;
+  color: #9CA3AF;
+  margin-left: auto;
+}
+
+/* DeepSeek native card sits on top with its original rounded corners intact */
+.du-project-outer-wrapper > div._77cefa5._9996a53,
+.du-project-outer-wrapper > div:has(textarea) {
+  margin: 0 !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+  position: relative !important;
+  z-index: 2 !important;
+}
+.du-todo-float-panel {
+  position: fixed;
+  right: 24px;
+  top: 72px;
+  width: 280px;
+  background: #363638;
+  border-radius: 14px;
+  padding: 16px 18px;
+  box-shadow: none !important;
+  border: none !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "SF Pro Text", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: du-todo-appear 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  user-select: none;
+}
+
+@keyframes du-todo-appear {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.du-todo-badge {
+  font-size: 13px;
+  font-weight: 400;
+  color: #D5D5D5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1;
+  letter-spacing: -0.01em;
+}
+
+.du-todo-badge-icon {
+  width: 13px;
+  height: 13px;
+  color: #D5D5D5;
+}
+
+.du-todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.du-todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  word-break: break-word;
+}
+
+.du-todo-marker {
+  width: 14px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.du-todo-marker svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Status colors exact matching Figma */
+.du-todo-item.in-progress .du-todo-marker svg {
+  color: #FF8A00;
+}
+.du-todo-item.in-progress .du-todo-title {
+  color: #FFFFFF;
+  font-weight: 400;
+}
+
+.du-todo-item.pending .du-todo-marker svg {
+  color: #D5D5D5;
+}
+.du-todo-item.pending .du-todo-title {
+  color: #FFFFFF;
+}
+
+.du-todo-item.completed .du-todo-marker svg {
+  color: #555558;
+}
+.du-todo-item.completed .du-todo-title {
+  color: #7E7E82;
+}
   transform: scale(0.98);
 }
 

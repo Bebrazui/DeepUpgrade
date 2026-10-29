@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
@@ -235,6 +235,8 @@
         }
 
         console.log('[DeepUpgrade Sandbox] Local Pyodide WASM & Python 3 loaded 100% offline successfully!');
+        // Mount everything that was written before Pyodide finished loading (skills, attachments, files)
+        syncVfsToPyodide();
         return pyodideInstance;
       })();
 
@@ -273,7 +275,7 @@
 
         // Also synchronize into Pyodide virtual filesystem if Pyodide is active
         try {
-          if (pyodideInstance && pyodideInstance.FS) {
+          if (isPyodideFsReady() && !isReservedPath(norm)) {
             const parts = norm.split('/').filter(Boolean);
             let dirPath = '';
             for (let i = 0; i < parts.length - 1; i++) {
@@ -283,6 +285,8 @@
             pyodideInstance.FS.writeFile(norm, content);
           }
         } catch (e) {}
+
+        if (typeof content === 'string') queueVfsPersist('write', norm, content);
 
         return `File '${norm}' written (${size} bytes)`;
       }
@@ -324,6 +328,8 @@
           }
         } catch (e) {}
 
+        queueVfsPersist('mkdir', norm, null);
+
         return `Created directory '${norm}'`;
       }
 
@@ -350,6 +356,32 @@
           }
         }
 
+        // Merge files/directories created directly by Python inside the Pyodide FS.
+        if (isPyodideFsReady()) {
+          try {
+            const entries = pyodideInstance.FS.readdir(norm);
+            for (const name of entries) {
+              if (name === '.' || name === '..' || name === '__pycache__') continue;
+              if (seen.has(name)) continue;
+              const full = norm === '/' ? '/' + name : norm + '/' + name;
+              if (isReservedPath(full)) continue;
+              // At the root, hide Pyodide's own system directories.
+              if (norm === '/' && !['home', 'tmp', 'skills', 'added'].includes(name)) continue;
+              let st;
+              try { st = pyodideInstance.FS.stat(full); } catch (e) { continue; }
+              const isDir = pyodideInstance.FS.isDir(st.mode);
+              const mtime = st.mtime ? st.mtime.getTime() : Date.now();
+              const dateStr = new Date(mtime).toISOString().slice(0, 16).replace('T', ' ');
+              if (isDir) {
+                results.push(`drwxr-xr-x  alex  alex  4096  ${dateStr}  ${name}/`);
+              } else {
+                results.push(`-rw-r--r--  alex  alex  ${String(st.size).padStart(5, ' ')}  ${dateStr}  ${name}`);
+              }
+              seen.add(name);
+            }
+          } catch (e) { /* Pyodide FS has no such directory */ }
+        }
+
         return results.length > 0 ? results.join('\n') : '(empty directory)';
       }
 
@@ -367,11 +399,218 @@
             count++;
           }
         }
+        if (count > 0) queueVfsPersist('remove', norm, null);
         return `Removed ${count} item(s)`;
       }
     }
 
     const opfs = new VirtualFileSystem();
+
+    // 1.1 DURABLE VFS (owned by the host page)
+    // This iframe is a manifest sandbox page: it runs in a unique origin, so
+    // OPFS/IndexedDB are unavailable here. The host page (content script) keeps
+    // one durable store and receives every mutation; the Map above stays the
+    // fast working copy so all tools keep working synchronously.
+    const VFS_PERSIST = {
+      booted: false,
+      bootPromise: null,
+      bootResolve: null,
+      pending: new Map(),
+      seq: 0,
+      queue: Promise.resolve(),
+      mode: 'memory'
+    };
+
+    function vfsCanPersist() {
+      return !!(window.parent && window.parent !== window);
+    }
+
+    function vfsPersistRequest(op, path, content) {
+      if (!vfsCanPersist()) return Promise.resolve();
+      const reqId = 'vfs_' + (++VFS_PERSIST.seq);
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          VFS_PERSIST.pending.delete(reqId);
+          resolve({ ok: false, timeout: true });
+        }, 5000);
+        VFS_PERSIST.pending.set(reqId, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+        try {
+          window.parent.postMessage({ type: 'DU_VFS_MUTATE', reqId, op, path, content }, '*');
+        } catch (e) {
+          clearTimeout(timer);
+          VFS_PERSIST.pending.delete(reqId);
+          resolve({ ok: false });
+        }
+      });
+    }
+
+    function queueVfsPersist(op, path, content) {
+      const run = VFS_PERSIST.queue.then(
+        () => vfsPersistRequest(op, path, content),
+        () => vfsPersistRequest(op, path, content)
+      );
+      VFS_PERSIST.queue = run.catch(() => {});
+      return run;
+    }
+
+    function flushVfsPersistence() {
+      return VFS_PERSIST.queue.catch(() => {});
+    }
+
+    function waitForVfsBoot(timeoutMs = 4000) {
+      if (VFS_PERSIST.booted) return Promise.resolve();
+      if (!VFS_PERSIST.bootPromise) {
+        VFS_PERSIST.bootPromise = new Promise((resolve) => {
+          VFS_PERSIST.bootResolve = resolve;
+          setTimeout(resolve, timeoutMs);
+        });
+      }
+      return VFS_PERSIST.bootPromise;
+    }
+
+    function requestVfsBoot() {
+      if (!vfsCanPersist()) return;
+      window.parent.postMessage({ type: 'DU_VFS_BOOT' }, '*');
+    }
+
+    window.addEventListener('message', (ev) => {
+      const data = ev.data;
+      if (!data || !data.type) return;
+
+      if (data.type === 'DU_VFS_MUTATED') {
+        const resolve = VFS_PERSIST.pending.get(data.reqId);
+        if (resolve) {
+          VFS_PERSIST.pending.delete(data.reqId);
+          resolve(data);
+        }
+        return;
+      }
+
+      if (data.type === 'DU_VFS_SNAPSHOT' && !VFS_PERSIST.booted) {
+        VFS_PERSIST.mode = data.mode || 'memory';
+        const files = Array.isArray(data.files) ? data.files : [];
+        for (const f of files) {
+          if (!f || !f.path || typeof f.content !== 'string') continue;
+          const norm = opfs.normalizePath(f.path);
+          if (isReservedPath(norm)) continue;
+          opfs.files.set(norm, {
+            path: norm,
+            content: f.content,
+            size: f.content.length,
+            mtime: f.mtime || Date.now(),
+            isDir: false
+          });
+        }
+        try { syncVfsToPyodide(); } catch (e) {}
+        VFS_PERSIST.booted = true;
+        if (VFS_PERSIST.bootResolve) VFS_PERSIST.bootResolve();
+        console.log(`[DeepUpgrade VFS] hydrated ${files.length} file(s), mode=${VFS_PERSIST.mode}`);
+      }
+    });
+
+
+    // 2.1 VFS ↔ PYODIDE FS BRIDGE
+    // The in-memory Map is the canonical VFS (works even before Pyodide is loaded).
+    // These helpers keep the Pyodide filesystem in sync so `write` → `python open()`
+    // and `python open(..., 'w')` → `ls`/`grep`/`find` actually see each other.
+    const PYODIDE_SYNC_ROOTS = ['/home/pyodide', '/tmp', '/skills', '/added'];
+    const PYODIDE_RESERVED = ['/lib', '/dev', '/proc', '/bin', '/usr', '/etc', '/opt', '/var', '/sbin', '/home/pyodide/.cache'];
+
+    function isPyodideFsReady() {
+      return !!(pyodideInstance && pyodideInstance.FS);
+    }
+
+    function isReservedPath(path) {
+      return PYODIDE_RESERVED.some(r => path === r || path.startsWith(r + '/'));
+    }
+
+    function ensurePyodideDir(dirPath) {
+      if (!isPyodideFsReady() || !dirPath || dirPath === '/') return;
+      const parts = dirPath.split('/').filter(Boolean);
+      let cur = '';
+      for (const part of parts) {
+        cur += '/' + part;
+        try { pyodideInstance.FS.mkdir(cur); } catch (e) { /* already exists */ }
+      }
+    }
+
+    /** Copy the canonical in-memory VFS into the Pyodide FS. */
+    function syncVfsToPyodide() {
+      if (!isPyodideFsReady()) return;
+      for (const [p, item] of opfs.files.entries()) {
+        if (item.isDir || item.content === null || item.content === undefined) continue;
+        if (isReservedPath(p)) continue;
+        try {
+          const parent = p.split('/').slice(0, -1).join('/') || '/';
+          ensurePyodideDir(parent);
+          pyodideInstance.FS.writeFile(p, item.content);
+        } catch (e) {
+          console.warn('[DeepUpgrade Sandbox] VFS→Pyodide sync failed for', p, e);
+        }
+      }
+    }
+
+    function collectPyodideFiles(root = '/') {
+      const out = [];
+      if (!isPyodideFsReady()) return out;
+      const walk = (dir) => {
+        let entries;
+        try { entries = pyodideInstance.FS.readdir(dir); } catch (e) { return; }
+        for (const name of entries) {
+          if (name === '.' || name === '..' || name === '__pycache__') continue;
+          const full = (dir === '/' ? '' : dir) + '/' + name;
+          if (isReservedPath(full)) continue;
+          let st;
+          try { st = pyodideInstance.FS.stat(full); } catch (e) { continue; }
+          if (pyodideInstance.FS.isDir(st.mode)) {
+            walk(full);
+          } else {
+            out.push({
+              path: full,
+              size: st.size,
+              mtime: st.mtime ? st.mtime.getTime() : Date.now()
+            });
+          }
+        }
+      };
+      const norm = opfs.normalizePath(root);
+      if (norm === '/') {
+        for (const r of PYODIDE_SYNC_ROOTS) walk(r);
+      } else {
+        walk(norm);
+      }
+      return out;
+    }
+
+    function readPyodideText(path) {
+      if (!isPyodideFsReady()) return null;
+      try {
+        const bytes = pyodideInstance.FS.readFile(path);
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    /** Import text files created by Python back into the canonical VFS. */
+    function syncPyodideToVfs() {
+      for (const f of collectPyodideFiles('/')) {
+        const text = readPyodideText(f.path);
+        if (text === null) continue;
+        const existing = opfs.files.get(f.path);
+        if (existing && existing.content === text) continue;
+        opfs.files.set(f.path, {
+          path: f.path,
+          content: text,
+          size: text.length,
+          mtime: f.mtime,
+          isDir: false
+        });
+      }
+    }
 
     // 3. BIGINT MATH EVALUATOR
     function safeBigIntEval(expr) {
@@ -388,276 +627,1545 @@
       }
     }
 
-    // 4. POSIX SHELL WITH OPFS INTEGRATION
-    function splitShellChain(cmdLine) {
-      const parts = [];
-      let curr = '';
-      let inQuote = null;
-      for (let i = 0; i < cmdLine.length; i++) {
-        const ch = cmdLine[i];
-        if ((ch === '"' || ch === "'") && !inQuote) {
-          inQuote = ch;
-          curr += ch;
-        } else if (ch === inQuote) {
-          inQuote = null;
-          curr += ch;
-        } else if (!inQuote && (ch === ';' || (ch === '&' && cmdLine[i+1] === '&'))) {
-          if (curr.trim()) parts.push(curr.trim());
-          curr = '';
-          if (ch === '&') i++; // Skip second &
-        } else {
-          curr += ch;
-        }
+    // 4. POSIX-COMPATIBLE SHELL OVER THE VFS
+    //
+    // The old implementation cut the command line with split(';') / split('>')
+    // and dispatched each fragment to a hand-rolled switch. That broke on
+    // quoted '>' , on '>>' (it was echoed literally), on $? and $VAR, and it
+    // made the model believe bash, python and write used different filesystems.
+    // This is a real (small) POSIX shell: lexer -> parser -> executor over the
+    // one shared VFS.
+
+    const SHELL_OPS = ['&&', '||', '2>>', '2>&1', '2>', '&>', '>>', '<<-', '<<', '>', '<', '|', ';', '&'];
+
+    function shellState() {
+      if (!window.__DU_SHELL_STATE) {
+        window.__DU_SHELL_STATE = {
+          cwd: '/',
+          status: 0,
+          exit: null,
+          pid: 4242,
+          env: {
+            HOME: '/home/alex',
+            USER: 'alex',
+            LOGNAME: 'alex',
+            SHELL: '/bin/bash',
+            PATH: '/usr/local/bin:/usr/bin:/bin',
+            TERM: 'xterm-256color',
+            LANG: 'C.UTF-8',
+            PWD: '/',
+            OLDPWD: '/'
+          }
+        };
       }
-      if (curr.trim()) parts.push(curr.trim());
-      return parts;
+      return window.__DU_SHELL_STATE;
     }
 
-    function parseCommandArgs(cmd) {
-      const parts = [];
-      let curr = '';
-      let inQuote = null;
-      for (let i = 0; i < cmd.length; i++) {
-        const ch = cmd[i];
-        if ((ch === '"' || ch === "'") && !inQuote) {
-          inQuote = ch;
-        } else if (ch === inQuote) {
-          inQuote = null;
-        } else if (ch === ' ' && !inQuote) {
-          if (curr) { parts.push(curr); curr = ''; }
-        } else {
-          curr += ch;
-        }
-      }
-      if (curr) parts.push(curr);
-      return parts;
+    function shellResetExit() {
+      const st = shellState();
+      st.exit = null;
+      st.status = 0;
     }
 
-    async function executeShellCommand(cmdLine) {
-      let trimmed = cmdLine.trim();
+    function shellResolvePath(cwd, p) {
+      let s = String(p === undefined || p === null ? '' : p);
+      const st = shellState();
+      if (!s) s = cwd;
+      if (s === '~') s = st.env.HOME || '/';
+      else if (s.startsWith('~/')) s = (st.env.HOME || '/') + s.slice(1);
+      const abs = s.startsWith('/') ? s : (cwd === '/' ? '' : cwd) + '/' + s;
+      const parts = [];
+      for (const part of abs.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') parts.pop();
+        else parts.push(part);
+      }
+      return '/' + parts.join('/');
+    }
 
-      // Handle heredoc creation: cat << 'EOF' > filename.ext ... EOF
-      if (trimmed.includes('<<') && trimmed.includes('>')) {
-        const fileMatch = trimmed.match(/>\s*([^\s\n]+)/);
-        const eofMatch = trimmed.match(/<<\s*['"]?([A-Za-z0-9_-]+)['"]?/);
-        if (fileMatch && eofMatch) {
-          const targetFile = fileMatch[1];
-          const tag = eofMatch[1];
-          const lines = trimmed.split('\n');
-          let capturing = false;
-          let contentLines = [];
-          for (let line of lines) {
-            if (line.includes('<<')) {
-              capturing = true;
+    function vfsStatNorm(norm) {
+      const item = opfs.files.get(norm);
+      if (item) {
+        return { isDir: !!item.isDir, size: item.size || 0, mtime: item.mtime || Date.now() };
+      }
+      if (isPyodideFsReady()) {
+        try {
+          const st = pyodideInstance.FS.stat(norm);
+          if (st) {
+            return {
+              isDir: pyodideInstance.FS.isDir(st.mode),
+              size: st.size || 0,
+              mtime: st.mtime ? (st.mtime.getTime ? st.mtime.getTime() : Number(st.mtime) * 1000) : Date.now()
+            };
+          }
+        } catch (e) { /* not in the Pyodide FS */ }
+      }
+      // Directories are implicit: a file at /a/b/c means /a/b exists.
+      if (norm !== '/') {
+        const prefix = norm + '/';
+        for (const p of opfs.files.keys()) {
+          if (p.startsWith(prefix)) return { isDir: true, size: 0, mtime: Date.now() };
+        }
+      }
+      return null;
+    }
+
+    function vfsListNorm(norm) {
+      const out = new Map();
+      const prefix = norm === '/' ? '/' : norm + '/';
+      for (const [p, item] of opfs.files.entries()) {
+        if (p === norm || !p.startsWith(prefix)) continue;
+        const rest = p.slice(prefix.length);
+        const name = rest.split('/')[0];
+        const isDir = rest.includes('/') || !!item.isDir;
+        const prev = out.get(name);
+        if (!prev || (prev.isDir && !isDir)) {
+          out.set(name, {
+            name,
+            isDir,
+            size: isDir ? 0 : (item.size || 0),
+            mtime: item.mtime || Date.now()
+          });
+        }
+      }
+      if (isPyodideFsReady()) {
+        try {
+          for (const name of pyodideInstance.FS.readdir(norm)) {
+            if (name === '.' || name === '..' || name === '__pycache__') continue;
+            if (out.has(name)) continue;
+            const full = norm === '/' ? '/' + name : norm + '/' + name;
+            if (isReservedPath(full)) continue;
+            if (norm === '/' && !['home', 'tmp', 'skills', 'added'].includes(name)) continue;
+            let st;
+            try { st = pyodideInstance.FS.stat(full); } catch (e) { continue; }
+            out.set(name, {
+              name,
+              isDir: pyodideInstance.FS.isDir(st.mode),
+              size: st.size || 0,
+              mtime: st.mtime ? (st.mtime.getTime ? st.mtime.getTime() : Date.now()) : Date.now()
+            });
+          }
+        } catch (e) { /* no such directory in the Pyodide FS */ }
+      }
+      return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    function vfsReadTextNorm(norm) {
+      const item = opfs.files.get(norm);
+      if (item) {
+        if (item.isDir) return { error: 'Is a directory' };
+        if (item.content === null || item.content === undefined) return { text: '' };
+        if (typeof item.content === 'string') return { text: item.content };
+        try {
+          return { text: new TextDecoder('utf-8', { fatal: true }).decode(item.content) };
+        } catch (e) {
+          return { error: 'Is a binary file' };
+        }
+      }
+      if (isPyodideFsReady()) {
+        try {
+          const st = pyodideInstance.FS.stat(norm);
+          if (pyodideInstance.FS.isDir(st.mode)) return { error: 'Is a directory' };
+          const text = readPyodideText(norm);
+          if (text !== null) return { text };
+        } catch (e) { /* not in the Pyodide FS */ }
+      }
+      return { missing: true };
+    }
+
+    async function vfsWriteTextNorm(norm, text) {
+      if (norm === '/dev/null') return;
+      const parent = norm.split('/').slice(0, -1).join('/') || '/';
+      if (parent !== '/') {
+        const st = vfsStatNorm(parent);
+        if (!st || !st.isDir) {
+          const parts = parent.split('/').filter(Boolean);
+          let acc = '';
+          for (const part of parts) {
+            acc += '/' + part;
+            if (!vfsStatNorm(acc)) await opfs.makeDir(acc);
+          }
+        }
+      }
+      await opfs.writeFile(norm, text);
+    }
+
+    async function vfsRemoveNorm(norm, recursive) {
+      if (norm === '/') return { error: 'Refusing to remove /' };
+      const st = vfsStatNorm(norm);
+      if (!st) return { error: 'No such file or directory' };
+      if (st.isDir && !recursive) {
+        if (vfsListNorm(norm).length > 0) return { error: 'Directory not empty' };
+      }
+      for (const p of [...opfs.files.keys()]) {
+        if (p === norm || p.startsWith(norm + '/')) opfs.files.delete(p);
+      }
+      if (isPyodideFsReady()) {
+        try {
+          if (st.isDir) pyodideInstance.FS.rmdir(norm);
+          else pyodideInstance.FS.unlink(norm);
+        } catch (e) { /* already gone */ }
+      }
+      queueVfsPersist('remove', norm, null);
+      return { ok: true };
+    }
+
+    function globToRegExp(pattern) {
+      let out = '^';
+      for (let i = 0; i < pattern.length; i++) {
+        const ch = pattern[i];
+        if (ch === '*') out += '[^/]*';
+        else if (ch === '?') out += '[^/]';
+        else if (ch === '[') {
+          const end = pattern.indexOf(']', i + 1);
+          if (end === -1) out += '\\[';
+          else {
+            let cls = pattern.slice(i + 1, end);
+            if (cls.startsWith('!')) cls = '^' + cls.slice(1);
+            out += '[' + cls.replace(/\\/g, '\\\\') + ']';
+            i = end;
+          }
+        } else out += ch.replace(/[.+^${}()|\\]/g, '\\$&');
+      }
+      return new RegExp(out + '$');
+    }
+
+    function shellGlob(pattern, cwd) {
+      if (!/[*?\[]/.test(pattern)) return [pattern];
+      const absolute = shellResolvePath(cwd, pattern);
+      const segments = absolute.split('/').filter(Boolean);
+      let bases = ['/'];
+      for (const seg of segments) {
+        const next = [];
+        for (const base of bases) {
+          if (!/[*?\[]/.test(seg)) {
+            next.push(base === '/' ? '/' + seg : base + '/' + seg);
+            continue;
+          }
+          const re = globToRegExp(seg);
+          for (const entry of vfsListNorm(base)) {
+            if (re.test(entry.name)) next.push(base === '/' ? '/' + entry.name : base + '/' + entry.name);
+          }
+        }
+        bases = next;
+      }
+      const matches = bases.filter((p) => vfsStatNorm(p));
+      if (matches.length === 0) return [pattern];
+      if (pattern.startsWith('/')) return matches;
+      const baseDir = cwd === '/' ? '' : cwd;
+      return matches.map((p) => {
+        if (baseDir && p.startsWith(baseDir + '/')) return p.slice(baseDir.length + 1);
+        if (p === baseDir) return '.';
+        return p;
+      });
+    }
+
+    // --- lexer ---
+
+    function shellReadBalanced(src, startIdx) {
+      // src[startIdx] === '('
+      let depth = 0;
+      let quote = null;
+      for (let i = startIdx; i < src.length; i++) {
+        const ch = src[i];
+        if (quote) {
+          if (ch === '\\' && quote === '"') { i++; continue; }
+          if (ch === quote) quote = null;
+          continue;
+        }
+        if (ch === '\\') { i++; continue; }
+        if (ch === "'" || ch === '"') { quote = ch; continue; }
+        if (ch === '(') depth++;
+        else if (ch === ')') {
+          depth--;
+          if (depth === 0) return { text: src.slice(startIdx + 1, i), end: i };
+        }
+      }
+      return { text: src.slice(startIdx + 1), end: src.length - 1 };
+    }
+
+    function shellLex(src) {
+      const tokens = [];
+      let cur = null;
+      let pending = null;
+      let i = 0;
+      const n = src.length;
+
+      const flush = () => {
+        if (cur && cur.parts.length > 0) {
+          const token = {
+            type: 'word',
+            parts: cur.parts,
+            raw: cur.parts.map((p) => p.text).join('')
+          };
+          tokens.push(token);
+          if (pending && pending.delimiter === null) {
+            pending.delimiter = token.raw;
+            token.heredocDelim = true;
+          }
+        }
+        cur = null;
+      };
+      const add = (kind, text) => {
+        if (!cur) cur = { parts: [] };
+        const last = cur.parts[cur.parts.length - 1];
+        if (last && last.kind === kind) last.text += text;
+        else cur.parts.push({ kind, text });
+      };
+
+      while (i < n) {
+        const ch = src[i];
+
+        if (ch === '\\') {
+          const next = src[i + 1];
+          if (next === '\n') { i += 2; continue; }
+          if (next === undefined) { add('bare', '\\'); i++; continue; }
+          add('bare', next);
+          i += 2;
+          continue;
+        }
+
+        if (ch === "'") {
+          let j = i + 1;
+          let buf = '';
+          while (j < n && src[j] !== "'") buf += src[j++];
+          add('single', buf);
+          i = Math.min(j + 1, n);
+          continue;
+        }
+
+        if (ch === '"') {
+          let j = i + 1;
+          let buf = '';
+          while (j < n && src[j] !== '"') {
+            if (src[j] === '\\' && j + 1 < n && '"\\$`'.includes(src[j + 1])) {
+              buf += src[j + 1];
+              j += 2;
               continue;
             }
-            if (capturing && line.trim() === tag) {
-              break;
-            }
-            if (capturing) contentLines.push(line);
+            buf += src[j++];
           }
-          await opfs.writeFile(targetFile, contentLines.join('\n'));
-          return `File '${targetFile}' created successfully.`;
+          add('double', buf);
+          i = Math.min(j + 1, n);
+          continue;
         }
-      }
 
-      // Strip 2>&1 and 2>/dev/null redirects safely
-      trimmed = trimmed.replace(/\s*2>\s*\/dev\/null/g, '').replace(/\s*2>&1\s*/g, ' ').trim();
-
-      // Handle direct file redirection: echo "content" > file.ext (ignore redirects like >/dev/null)
-      if (trimmed.includes('>') && !trimmed.includes('>>')) {
-        const [cmdPart, filePart] = trimmed.split('>').map(s => s.trim());
-        if (filePart && filePart !== '/dev/null') {
-          const output = await runSingleCommand(cmdPart, '');
-          await opfs.writeFile(filePart, output);
-          return `Written to ${filePart}`;
-        } else if (filePart === '/dev/null') {
-          return await runSingleCommand(cmdPart, '');
+        if (ch === '$' && src[i + 1] === '(') {
+          const inner = shellReadBalanced(src, i + 1);
+          add('bare', src.slice(i, inner.end + 1));
+          i = inner.end + 1;
+          continue;
         }
-      }
 
-      // Handle piped commands
-      if (trimmed.includes('|')) {
-        const parts = trimmed.split('|').map(p => p.trim());
-        let pipeInput = '';
-        for (const segment of parts) {
-          pipeInput = await runSingleCommand(segment, pipeInput);
+        if (ch === ' ' || ch === '\t' || ch === '\r') { flush(); i++; continue; }
+        if (ch === '\n') {
+          flush();
+          if (pending && pending.delimiter !== null) {
+            const body = [];
+            let j = i + 1;
+            while (j <= n) {
+              const lineEnd = src.indexOf('\n', j);
+              const line = lineEnd === -1 ? src.slice(j) : src.slice(j, lineEnd);
+              const cmp = pending.stripTabs ? line.replace(/^\t+/, '') : line;
+              if (cmp === pending.delimiter) {
+                i = lineEnd === -1 ? n : lineEnd + 1;
+                break;
+              }
+              body.push(line);
+              if (lineEnd === -1) { i = n; break; }
+              j = lineEnd + 1;
+            }
+            pending.token.heredoc = body.join('\n') + (body.length ? '\n' : '');
+            pending = null;
+            tokens.push({ type: 'op', value: ';' });
+            continue;
+          }
+          tokens.push({ type: 'op', value: ';' });
+          i++;
+          continue;
         }
-        return pipeInput;
-      }
 
-      return await runSingleCommand(trimmed, '');
+        let op = null;
+        for (const candidate of SHELL_OPS) {
+          if (src.startsWith(candidate, i)) { op = candidate; break; }
+        }
+        if (op) {
+          flush();
+          const token = { type: 'op', value: op };
+          tokens.push(token);
+          i += op.length;
+          if (op === '<<' || op === '<<-') {
+            pending = { token, delimiter: null, stripTabs: op === '<<-' };
+          }
+          continue;
+        }
+
+        add('bare', ch);
+        i++;
+      }
+      flush();
+      return tokens;
     }
 
-    async function runSingleCommand(cmd, stdin) {
-      const parts = parseCommandArgs(cmd);
-      if (parts.length === 0) return stdin;
+    // --- parser ---
 
-      const program = parts[0];
-      const args = parts.slice(1);
+    function shellParse(tokens) {
+      let i = 0;
+      const peekOp = (value) => tokens[i] && tokens[i].type === 'op' && tokens[i].value === value;
 
-      switch (program) {
-        case 'echo':
-          return args.join(' ');
-
-        case 'printf':
-          if (args.length > 0) {
-            let fmt = args[0].replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-            let argIdx = 1;
-            return fmt.replace(/%[ds]/g, () => args[argIdx++] || '');
+      const parseCommand = () => {
+        const words = [];
+        const redirs = [];
+        while (i < tokens.length) {
+          const t = tokens[i];
+          if (t.type === 'word') {
+            if (t.heredocDelim) { i++; continue; }
+            words.push(t);
+            i++;
+            continue;
           }
-          return '';
-
-        case 'seq':
-          const start = args.length === 1 ? 1 : parseInt(args[0]) || 1;
-          const end = args.length === 1 ? parseInt(args[0]) || 1 : parseInt(args[1]) || 1;
-          let seqArr = [];
-          for (let i = start; i <= end; i++) seqArr.push(i);
-          return seqArr.join('\n');
-
-        case 'wc': {
-          let content = stdin || '';
-          const nonFlags = args.filter(a => !a.startsWith('-'));
-          if (nonFlags.length > 0) {
-            content = await opfs.readFile(nonFlags[0]);
-            if (content.startsWith('cat: ') && content.includes('No such file')) content = '';
+          if (['>', '>>', '<', '2>', '2>>', '&>'].includes(t.value)) {
+            const target = tokens[i + 1];
+            if (!target || target.type !== 'word') { i++; continue; }
+            redirs.push({ op: t.value, target });
+            i += 2;
+            continue;
           }
-          const lines = content ? content.split('\n') : [];
-          if (args.includes('-l')) return String(content ? lines.length : 0);
-          if (args.includes('-c') || args.includes('-m')) return String(content.length);
-          if (args.includes('-w')) return String(content.split(/\s+/).filter(Boolean).length);
-          return `${lines.length} ${content.split(/\s+/).filter(Boolean).length} ${content.length}`;
+          if (t.value === '<<' || t.value === '<<-') {
+            redirs.push({ op: t.value, heredoc: t.heredoc || '' });
+            i++;
+            continue;
+          }
+          if (t.value === '2>&1') { redirs.push({ op: '2>&1' }); i++; continue; }
+          break;
+        }
+        return { words, redirs };
+      };
+
+      const parsePipeline = () => {
+        const commands = [parseCommand()];
+        while (peekOp('|')) { i++; commands.push(parseCommand()); }
+        return commands;
+      };
+
+      const parseAndOr = () => {
+        const chain = [parsePipeline()];
+        while (peekOp('&&') || peekOp('||')) {
+          const op = tokens[i].value;
+          i++;
+          chain.push({ op, pipeline: parsePipeline() });
+        }
+        return chain;
+      };
+
+      const script = [];
+      while (i < tokens.length) {
+        if (peekOp(';') || peekOp('&') || peekOp('|')) { i++; continue; }
+        if (tokens[i].type === 'op' && [')'].includes(tokens[i].value)) { i++; continue; }
+        script.push(parseAndOr());
+        while (peekOp(';') || peekOp('&')) i++;
+      }
+      return script;
+    }
+
+    // --- expansion ---
+
+    function shellLookup(spec, state) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)(:?-)(.*)$/.exec(spec);
+      const name = m ? m[1] : spec;
+      const fallback = m ? m[3] : null;
+      const value = state.env[name];
+      if (fallback !== null) {
+        if (value === undefined) return shellExpandStatic(fallback, state);
+        if (m[2] === ':-' && value === '') return shellExpandStatic(fallback, state);
+      }
+      return value === undefined ? '' : value;
+    }
+
+    function shellExpandStatic(text, state) {
+      return String(text)
+        .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => state.env[name] ?? '')
+        .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_, name) => state.env[name] ?? '');
+    }
+
+    async function shellExpandVars(text, state, depth) {
+      let out = '';
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch !== '$') { out += ch; continue; }
+        const next = text[i + 1];
+
+        if (next === '(') {
+          const inner = shellReadBalanced(text, i + 1);
+          if (inner.text.startsWith('(')) {
+            out += safeBigIntEval(inner.text.slice(1, -1));
+          } else {
+            const captured = await runShellScript(inner.text, { depth: (depth || 0) + 1 });
+            out += captured.stdout.replace(/\n+$/, '');
+            state.status = captured.status;
+          }
+          i = inner.end;
+          continue;
         }
 
-        case 'head': {
-          let n = 10;
-          const nIdx = args.findIndex(a => a === '-n' || (a.startsWith('-') && /^\-\d+$/.test(a)));
-          if (nIdx !== -1) n = parseInt(args[nIdx].replace('-', '')) || 10;
-          let content = stdin || '';
-          const nonFlags = args.filter(a => !a.startsWith('-'));
-          if (nonFlags.length > 0) {
-            content = await opfs.readFile(nonFlags[0]);
-            if (content.startsWith('cat: ') && content.includes('No such file')) content = '';
+        if (next === '{') {
+          const end = text.indexOf('}', i + 2);
+          if (end === -1) { out += ch; continue; }
+          out += shellLookup(text.slice(i + 2, end), state);
+          i = end;
+          continue;
+        }
+
+        if (next === '?') { out += String(state.status); i++; continue; }
+        if (next === '#') { out += '0'; i++; continue; }
+        if (next === '$') { out += String(state.pid); i++; continue; }
+        if (next === '!') { out += String(state.pid); i++; continue; }
+        if (next === '0') { out += 'bash'; i++; continue; }
+        if (next === '-') { out += 'himBH'; i++; continue; }
+
+        const nameMatch = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(i + 1));
+        if (nameMatch) {
+          out += state.env[nameMatch[0]] ?? '';
+          i += nameMatch[0].length;
+          continue;
+        }
+
+        if (next !== undefined && /[1-9]/.test(next)) { i++; continue; }
+
+        out += ch;
+      }
+      return out;
+    }
+
+    async function shellExpandWord(token, state, depth) {
+      const parts = token.parts || [];
+      let text = '';
+      let sawBare = false;
+      for (const part of parts) {
+        if (part.kind === 'single') { text += part.text; continue; }
+        if (part.kind === 'double') { text += await shellExpandVars(part.text, state, depth); continue; }
+        sawBare = true;
+        text += await shellExpandVars(part.text, state, depth);
+      }
+
+      if (sawBare && text.startsWith('~') && (text === '~' || text.startsWith('~/'))) {
+        text = (state.env.HOME || '/') + text.slice(1);
+      }
+
+      if (!sawBare) return [text];
+
+      const fields = text.split(/[ \t\n]+/).filter((f) => f.length > 0);
+      if (fields.length === 0) return [];
+      const expanded = [];
+      for (const field of fields) expanded.push(...shellGlob(field, state.cwd));
+      return expanded;
+    }
+
+    // --- redirect helpers ---
+
+    function shellNullify(text) {
+      return text === undefined || text === null ? '' : String(text);
+    }
+
+    async function shellWriteTarget(state, rawTarget, text, append) {
+      const target = shellResolvePath(state.cwd, rawTarget);
+      if (target === '/dev/null') return { ok: true };
+      if (append) {
+        const existing = vfsReadTextNorm(target);
+        const base = existing.missing ? '' : (existing.text || '');
+        await vfsWriteTextNorm(target, base + text);
+      } else {
+        await vfsWriteTextNorm(target, text);
+      }
+      return { ok: true };
+    }
+
+    // --- command dispatch ---
+
+    function shellFormatList(names) {
+      return names.join('\n');
+    }
+
+    function shellHumanSize(bytes) {
+      if (bytes < 1024) return String(bytes);
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'K';
+      return (bytes / (1024 * 1024)).toFixed(1) + 'M';
+    }
+
+    function shellParseFlags(args) {
+      const flags = new Set();
+      const rest = [];
+      let onlyOperands = false;
+      for (const a of args) {
+        if (onlyOperands) { rest.push(a); continue; }
+        if (a === '--') { onlyOperands = true; continue; }
+        if (a.length > 1 && a.startsWith('-') && !/^-\d+$/.test(a)) {
+          for (const ch of a.slice(1)) flags.add(ch);
+          continue;
+        }
+        rest.push(a);
+      }
+      return { flags, args: rest };
+    }
+
+    function shellReadInputs(inputs, io) {
+      if (inputs.length === 0) return [{ name: null, text: io.stdin }];
+      const out = [];
+      for (const name of inputs) {
+        if (name === '-') { out.push({ name: null, text: io.stdin }); continue; }
+        const norm = shellResolvePath(io.state.cwd, name);
+        const read = vfsReadTextNorm(norm);
+        if (read.missing) { out.push({ name, error: 'No such file or directory' }); continue; }
+        if (read.error) { out.push({ name, error: read.error }); continue; }
+        out.push({ name, text: read.text });
+      }
+      return out;
+    }
+
+    function shellUnescape(text) {
+      return text.replace(/\\(.)/g, (m, c) => {
+        if (c === 'n') return '\n';
+        if (c === 't') return '\t';
+        if (c === 'r') return '\r';
+        if (c === '\\') return '\\';
+        if (c === 'a') return '\x07';
+        if (c === 'b') return '\b';
+        if (c === 'f') return '\f';
+        if (c === 'v') return '\v';
+        if (c === '0') return '\0';
+        return c;
+      });
+    }
+
+    function shellTestExpression(args, state) {
+      // Minimal but useful `test` / `[` implementation.
+      const path = (p) => shellResolvePath(state.cwd, p);
+      const unary = {
+        '-e': (p) => !!vfsStatNorm(path(p)),
+        '-f': (p) => { const s = vfsStatNorm(path(p)); return !!s && !s.isDir; },
+        '-d': (p) => { const s = vfsStatNorm(path(p)); return !!s && s.isDir; },
+        '-s': (p) => { const s = vfsStatNorm(path(p)); return !!s && s.size > 0; },
+        '-r': (p) => !!vfsStatNorm(path(p)),
+        '-w': (p) => !!vfsStatNorm(path(p)),
+        '-x': (p) => !!vfsStatNorm(path(p)),
+        '-z': (p) => p === '',
+        '-n': (p) => p !== ''
+      };
+      let i = 0;
+      let negate = false;
+      if (args[i] === '!') { negate = true; i++; }
+      const a = args[i];
+      if (a === undefined) return negate;
+      if (unary[a] && args.length === i + 2) {
+        const res = unary[a](args[i + 1]);
+        return negate ? !res : res;
+      }
+      if (args.length === i + 3) {
+        const left = a;
+        const op = args[i + 1];
+        const right = args[i + 2];
+        let res;
+        if (op === '=' || op === '==') res = left === right;
+        else if (op === '!=') res = left !== right;
+        else if (op === '-eq') res = Number(left) === Number(right);
+        else if (op === '-ne') res = Number(left) !== Number(right);
+        else if (op === '-lt') res = Number(left) < Number(right);
+        else if (op === '-le') res = Number(left) <= Number(right);
+        else if (op === '-gt') res = Number(left) > Number(right);
+        else if (op === '-ge') res = Number(left) >= Number(right);
+        else res = left !== '';
+        return negate ? !res : res;
+      }
+      return negate ? !(a !== '') : a !== '';
+    }
+
+    async function shellRunPython(args, io) {
+      let script = '';
+      if (args[0] === '-c') script = args.slice(1).join(' ');
+      else if (args[0] && !args[0].startsWith('-')) {
+        const norm = shellResolvePath(io.state.cwd, args[0]);
+        const read = vfsReadTextNorm(norm);
+        if (read.missing) return { stdout: '', stderr: `python: can't open file '${args[0]}': No such file or directory`, status: 2 };
+        script = read.text;
+      } else {
+        script = io.stdin;
+      }
+      if (!script.trim()) return { stdout: 'Python 3.12 (Pyodide Wasm Engine)', stderr: '', status: 0 };
+      try {
+        const py = await initPyodide();
+        syncVfsToPyodide();
+        const logs = [];
+        py.setStdout({ batched: (s) => logs.push(s) });
+        const res = await py.runPythonAsync(script);
+        syncPyodideToVfs();
+        let out = logs.join('\n');
+        if (res !== undefined) out += (out ? '\n' : '') + String(res);
+        return { stdout: out, stderr: '', status: 0 };
+      } catch (e) {
+        try { syncPyodideToVfs(); } catch (ignored) {}
+        return { stdout: '', stderr: `Python Error: ${e && e.message ? e.message : String(e)}`, status: 1 };
+      }
+    }
+
+    async function shellExec(name, args, io) {
+      const state = io.state;
+      const ok = (stdout, status) => ({ stdout: shellNullify(stdout), stderr: '', status: status || 0 });
+      const fail = (message, status) => ({ stdout: '', stderr: message, status: status === undefined ? 1 : status });
+
+      switch (name) {
+        case ':':
+        case 'true':
+          return ok('');
+
+        case 'false':
+          return { stdout: '', stderr: '', status: 1 };
+
+        case 'echo': {
+          let newline = true;
+          let escapes = false;
+          let i = 0;
+          while (args[i] === '-n' || args[i] === '-e' || args[i] === '-E' || args[i] === '-ne' || args[i] === '-en') {
+            if (args[i].includes('n')) newline = false;
+            if (args[i].includes('e')) escapes = true;
+            if (args[i].includes('E')) escapes = false;
+            i++;
           }
-          return content.split('\n').slice(0, n).join('\n');
+          let text = args.slice(i).join(' ');
+          if (escapes) text = shellUnescape(text);
+          return ok(newline ? text + '\n' : text);
         }
 
-        case 'tail':
-          let tn = 5;
-          const tnIdx = args.findIndex(a => a === '-n' || a.startsWith('-'));
-          if (tnIdx !== -1) tn = parseInt(args[tnIdx].replace('-', '')) || 5;
-          const allLines = (stdin || '').split('\n');
-          return allLines.slice(Math.max(0, allLines.length - tn)).join('\n');
-
-        case 'grep':
-          const pat = args[0] || '';
-          const re = new RegExp(pat);
-          return (stdin || '').split('\n').filter(l => re.test(l)).join('\n');
-
-        case 'sort':
-          return (stdin || '').split('\n').sort().join('\n');
-
-        case 'expr':
-          return safeBigIntEval(args.join(' ').replace(/\\/g, ''));
-
-        case 'bc':
-          return safeBigIntEval(stdin);
-
-        case 'mkdir': {
-          const dirPath = args.filter(a => !a.startsWith('-')).pop() || 'new_folder';
-          return await opfs.makeDir(dirPath);
+        case 'printf': {
+          if (args.length === 0) return ok('');
+          let format = args[0];
+          const values = args.slice(1);
+          let vi = 0;
+          let out = '';
+          let guard = 0;
+          do {
+            let chunk = '';
+            for (let i = 0; i < format.length; i++) {
+              const ch = format[i];
+              if (ch === '\\') {
+                const seq = format.slice(i, i + 2);
+                chunk += shellUnescape(seq);
+                i++;
+                continue;
+              }
+              if (ch === '%') {
+                const spec = format[i + 1];
+                if (spec === '%') { chunk += '%'; i++; continue; }
+                if (spec === 's' || spec === 'd' || spec === 'i' || spec === 'f' || spec === 'c' || spec === 'b') {
+                  const raw = values[vi++] ?? '';
+                  if (spec === 'd' || spec === 'i') chunk += String(parseInt(raw, 10) || 0);
+                  else if (spec === 'f') chunk += String(parseFloat(raw) || 0);
+                  else if (spec === 'c') chunk += String(raw).slice(0, 1);
+                  else if (spec === 'b') chunk += shellUnescape(String(raw));
+                  else chunk += String(raw);
+                  i++;
+                  continue;
+                }
+                chunk += ch;
+                continue;
+              }
+              chunk += ch;
+            }
+            out += chunk;
+            guard++;
+          } while (vi < values.length && guard < 10000);
+          return ok(out);
         }
 
-        case 'rm': {
-          const target = args.filter(a => !a.startsWith('-')).pop() || '';
-          return await opfs.remove(target);
+        case 'cat': {
+          const { flags, args: files } = shellParseFlags(args);
+          const inputs = shellReadInputs(files, io);
+          let out = '';
+          let status = 0;
+          let lineNo = 1;
+          for (const input of inputs) {
+            if (input.error) { return { stdout: out, stderr: `cat: ${input.name}: ${input.error}`, status: 1 }; }
+            if (flags.has('n')) {
+              out += input.text.split('\n').map((l) => `${String(lineNo++).padStart(6, ' ')}\t${l}`).join('\n');
+            } else {
+              out += input.text;
+            }
+          }
+          return ok(out, status);
         }
 
         case 'ls': {
-          const target = args.filter(a => !a.startsWith('-')).pop() || '/';
-          return await opfs.listDir(target);
-        }
+          const { flags, args: targets } = shellParseFlags(args);
+          const showAll = flags.has('a') || flags.has('A');
+          const long = flags.has('l');
+          const recursive = flags.has('R');
+          const listTargets = targets.length > 0 ? targets : ['.'];
+          const chunks = [];
+          let status = 0;
 
-        case 'cat':
-          return args[0] ? await opfs.readFile(args[0]) : stdin;
+          const formatEntry = (base, entry) => {
+            if (!long) return entry.name;
+            const kind = entry.isDir ? 'd' : '-';
+            const size = entry.isDir ? '4096' : String(entry.size);
+            const date = new Date(entry.mtime).toISOString().slice(0, 16).replace('T', ' ');
+            return `${kind}rw-r--r--  alex  alex  ${size.padStart(6, ' ')}  ${date}  ${entry.name}${entry.isDir ? '/' : ''}`;
+          };
+
+          const listDir = (displayPath, norm, header) => {
+            const entries = vfsListNorm(norm).filter((e) => showAll || !e.name.startsWith('.'));
+            if (header) chunks.push(`${displayPath}:`);
+            chunks.push(entries.length === 0 ? '' : entries.map((e) => formatEntry(displayPath, e)).filter(Boolean).join('\n'));
+            if (recursive) {
+              for (const e of entries) {
+                if (!e.isDir) continue;
+                const childDisplay = displayPath === '/' ? '/' + e.name : displayPath.replace(/\/$/, '') + '/' + e.name;
+                const childNorm = norm === '/' ? '/' + e.name : norm + '/' + e.name;
+                chunks.push('');
+                listDir(childDisplay, childNorm, true);
+              }
+            }
+          };
+
+          for (const target of listTargets) {
+            const norm = shellResolvePath(state.cwd, target);
+            const st = vfsStatNorm(norm);
+            if (!st) { chunks.push(`ls: cannot access '${target}': No such file or directory`); status = 2; continue; }
+            if (!st.isDir) { chunks.push(formatEntry('', { name: target, isDir: false, size: st.size, mtime: st.mtime })); continue; }
+            listDir(target, norm, listTargets.length > 1);
+            if (listTargets.length > 1 && target !== listTargets[listTargets.length - 1]) chunks.push('');
+          }
+          return ok(chunks.filter((c) => c !== undefined && c !== null).join('\n').replace(/\n+$/, ''), status);
+        }
 
         case 'pwd':
-          return '/opfs';
+          return ok(state.cwd + '\n');
 
-        case 'whoami':
-          return 'alex';
-
-        case 'curl': {
-          let url = args.find(a => a.startsWith('http://') || a.startsWith('https://')) || '';
-          if (!url) return 'curl: no URL specified';
-          try {
-            const resp = await proxyFetch(url);
-            return await resp.text();
-          } catch (e) {
-            return `curl: (7) Failed to connect to host: ${e.message}`;
-          }
+        case 'cd': {
+          const target = args[0] === undefined || args[0] === '' ? (state.env.HOME || '/') : (args[0] === '-' ? (state.env.OLDPWD || '/') : args[0]);
+          const norm = shellResolvePath(state.cwd, target);
+          const st = vfsStatNorm(norm);
+          if (!st) return fail(`cd: ${target}: No such file or directory`);
+          if (!st.isDir) return fail(`cd: ${target}: Not a directory`);
+          const prev = state.cwd;
+          state.cwd = norm;
+          state.env.OLDPWD = prev;
+          state.env.PWD = norm;
+          if (args[0] === '-') return ok(norm + '\n');
+          return ok('');
         }
 
-        case 'date':
-          return new Date().toUTCString();
+        case 'mkdir': {
+          const { flags, args: paths } = shellParseFlags(args);
+          if (paths.length === 0) return fail('mkdir: missing operand');
+          for (const p of paths) {
+            const norm = shellResolvePath(state.cwd, p);
+            if (vfsStatNorm(norm)) {
+              if (!flags.has('p')) return fail(`mkdir: cannot create directory '${p}': File exists`);
+              continue;
+            }
+            if (!flags.has('p')) {
+              const parent = norm.split('/').slice(0, -1).join('/') || '/';
+              const pst = vfsStatNorm(parent);
+              if (!pst || !pst.isDir) return fail(`mkdir: cannot create directory '${p}': No such file or directory`);
+            }
+            await opfs.makeDir(norm);
+          }
+          return ok('');
+        }
+
+        case 'rmdir': {
+          if (args.length === 0) return fail('rmdir: missing operand');
+          for (const p of args) {
+            const norm = shellResolvePath(state.cwd, p);
+            const st = vfsStatNorm(norm);
+            if (!st || !st.isDir) return fail(`rmdir: failed to remove '${p}': No such file or directory`);
+            if (vfsListNorm(norm).length > 0) return fail(`rmdir: failed to remove '${p}': Directory not empty`);
+            await vfsRemoveNorm(norm, true);
+          }
+          return ok('');
+        }
+
+        case 'rm': {
+          const { flags, args: paths } = shellParseFlags(args);
+          if (paths.length === 0) return fail('rm: missing operand');
+          const recursive = flags.has('r') || flags.has('R');
+          const force = flags.has('f');
+          for (const p of paths) {
+            const norm = shellResolvePath(state.cwd, p);
+            const st = vfsStatNorm(norm);
+            if (!st) {
+              if (force) continue;
+              return fail(`rm: cannot remove '${p}': No such file or directory`);
+            }
+            if (st.isDir && !recursive) return fail(`rm: cannot remove '${p}': Is a directory`);
+            const res = await vfsRemoveNorm(norm, recursive);
+            if (res.error && !force) return fail(`rm: cannot remove '${p}': ${res.error}`);
+          }
+          return ok('');
+        }
+
+        case 'cp': {
+          const { flags, args: operands } = shellParseFlags(args);
+          if (operands.length < 2) return fail('cp: missing destination file operand');
+          const recursive = flags.has('r') || flags.has('R');
+          const destRaw = operands[operands.length - 1];
+          const sources = operands.slice(0, -1);
+          const destNorm = shellResolvePath(state.cwd, destRaw);
+          const destStat = vfsStatNorm(destNorm);
+          const copyOne = async (srcRaw, targetNorm) => {
+            const srcNorm = shellResolvePath(state.cwd, srcRaw);
+            const st = vfsStatNorm(srcNorm);
+            if (!st) return `cp: cannot stat '${srcRaw}': No such file or directory`;
+            if (st.isDir) {
+              if (!recursive) return `cp: -r not specified; omitting directory '${srcRaw}'`;
+              await opfs.makeDir(targetNorm);
+              for (const entry of vfsListNorm(srcNorm)) {
+                const msg = await copyOne(
+                  srcNorm + '/' + entry.name,
+                  targetNorm + '/' + entry.name
+                );
+                if (msg) return msg;
+              }
+              return null;
+            }
+            const read = vfsReadTextNorm(srcNorm);
+            if (read.missing) return `cp: cannot stat '${srcRaw}': No such file or directory`;
+            if (read.error) return `cp: ${srcRaw}: ${read.error}`;
+            await vfsWriteTextNorm(targetNorm, read.text);
+            return null;
+          };
+          for (const src of sources) {
+            const target = (destStat && destStat.isDir) ? destNorm + '/' + src.split('/').filter(Boolean).pop() : destNorm;
+            const err = await copyOne(src, target);
+            if (err) return fail(err);
+          }
+          return ok('');
+        }
+
+        case 'mv': {
+          const operands = args.filter((a) => !a.startsWith('-'));
+          if (operands.length < 2) return fail('mv: missing destination file operand');
+          const destNorm = shellResolvePath(state.cwd, operands[operands.length - 1]);
+          const destStat = vfsStatNorm(destNorm);
+          for (const src of operands.slice(0, -1)) {
+            const srcNorm = shellResolvePath(state.cwd, src);
+            const st = vfsStatNorm(srcNorm);
+            if (!st) return fail(`mv: cannot stat '${src}': No such file or directory`);
+            const target = (destStat && destStat.isDir) ? destNorm + '/' + src.split('/').filter(Boolean).pop() : destNorm;
+            if (st.isDir) {
+              const entries = vfsListNorm(srcNorm);
+              for (const entry of entries) {
+                const sub = vfsReadTextNorm(srcNorm + '/' + entry.name);
+                if (sub.text !== undefined) await vfsWriteTextNorm(target + '/' + entry.name, sub.text);
+                else await opfs.makeDir(target + '/' + entry.name);
+              }
+            } else {
+              const read = vfsReadTextNorm(srcNorm);
+              await vfsWriteTextNorm(target, read.text || '');
+            }
+            await vfsRemoveNorm(srcNorm, true);
+          }
+          return ok('');
+        }
+
+        case 'touch': {
+          if (args.length === 0) return fail('touch: missing file operand');
+          for (const p of args.filter((a) => !a.startsWith('-'))) {
+            const norm = shellResolvePath(state.cwd, p);
+            if (vfsStatNorm(norm)) continue;
+            await vfsWriteTextNorm(norm, '');
+          }
+          return ok('');
+        }
+
+        case 'head':
+        case 'tail': {
+          const isHead = name === 'head';
+          let count = 10;
+          const files = [];
+          for (let i = 0; i < args.length; i++) {
+            const a = args[i];
+            if (a === '-n' || a === '--lines') { count = parseInt(args[++i], 10) || 10; continue; }
+            if (/^-n\d+$/.test(a)) { count = parseInt(a.slice(2), 10) || 10; continue; }
+            if (/^-\d+$/.test(a)) { count = parseInt(a.slice(1), 10) || 10; continue; }
+            if (a.length > 1 && a.startsWith('-')) continue;
+            files.push(a);
+          }
+          const inputs = shellReadInputs(files, io);
+          const chunks = [];
+          for (const input of inputs) {
+            if (input.error) return fail(`${name}: cannot open '${input.name}' for reading: ${input.error}`);
+            const lines = input.text.split('\n');
+            if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+            chunks.push(isHead ? lines.slice(0, count).join('\n') : lines.slice(Math.max(0, lines.length - count)).join('\n'));
+          }
+          return ok(chunks.join('\n'));
+        }
+
+        case 'wc': {
+          const { flags, args: files } = shellParseFlags(args);
+          const inputs = shellReadInputs(files, io);
+          const lines = [];
+          let totalL = 0, totalW = 0, totalC = 0;
+          const counts = (text) => {
+            const l = text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+            const w = text.split(/\s+/).filter(Boolean).length;
+            const c = new TextEncoder().encode(text).length;
+            return { l, w, c, m: [...text].length };
+          };
+          for (const input of inputs) {
+            if (input.error) return fail(`wc: ${input.name}: ${input.error}`);
+            const n = counts(input.text);
+            totalL += n.l; totalW += n.w; totalC += n.c;
+            const parts = [];
+            if (flags.has('l')) parts.push(n.l);
+            if (flags.has('w')) parts.push(n.w);
+            if (flags.has('m')) parts.push(n.m);
+            if (flags.has('c') || parts.length === 0) parts.push(flags.has('m') ? n.m : n.c);
+            lines.push(parts.join(' ').padStart(7, ' ') + (input.name ? ' ' + input.name : ''));
+          }
+          if (inputs.length > 1) {
+            const parts = [];
+            if (flags.has('l')) parts.push(totalL);
+            if (flags.has('w')) parts.push(totalW);
+            if (flags.has('c') || parts.length === 0) parts.push(totalC);
+            lines.push(parts.join(' ').padStart(7, ' ') + ' total');
+          }
+          return ok(lines.join('\n'));
+        }
+
+        case 'grep': {
+          const flags = new Set();
+          const operands = [];
+          let pattern = null;
+          for (let i = 0; i < args.length; i++) {
+            const a = args[i];
+            if (pattern === null && a.length > 1 && a.startsWith('-') && !/^-\d+$/.test(a)) {
+              for (const ch of a.slice(1)) flags.add(ch);
+              continue;
+            }
+            if (a === '-e' && args[i + 1]) { pattern = args[++i]; continue; }
+            if (pattern === null) { pattern = a; continue; }
+            operands.push(a);
+          }
+          if (pattern === null) return fail('grep: missing pattern');
+          let re;
+          try {
+            const body = flags.has('F') ? pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : pattern;
+            re = new RegExp(body, flags.has('i') ? 'i' : '');
+          } catch (e) {
+            return fail(`grep: invalid pattern: ${e.message}`, 2);
+          }
+          const inputs = shellReadInputs(operands, io);
+          const showName = inputs.length > 1 || (inputs.length === 1 && inputs[0].name !== null);
+          const lines = [];
+          let matchedAny = false;
+          for (const input of inputs) {
+            if (input.error) continue;
+            const rows = input.text.split('\n');
+            let fileMatches = 0;
+            for (let idx = 0; idx < rows.length; idx++) {
+              const hits = re.test(rows[idx]);
+              if (flags.has('v') ? !hits : hits) {
+                fileMatches++;
+                if (flags.has('q')) { matchedAny = true; break; }
+                if (flags.has('l')) break;
+                if (flags.has('c')) continue;
+                let line = rows[idx];
+                if (flags.has('n')) line = `${idx + 1}:${line}`;
+                if (showName) line = `${input.name}:${line}`;
+                lines.push(line);
+              }
+            }
+            if (fileMatches > 0) matchedAny = true;
+            if (flags.has('l') && fileMatches > 0) lines.push(input.name);
+            if (flags.has('c')) lines.push((showName ? input.name + ':' : '') + fileMatches);
+          }
+          return { stdout: lines.join('\n'), stderr: '', status: matchedAny ? 0 : 1 };
+        }
+
+        case 'sed': {
+          const operands = args.filter((a) => !a.startsWith('-'));
+          const script = operands.shift();
+          if (!script) return fail('sed: no script supplied');
+          const m = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(script);
+          if (!m) return fail(`sed: unsupported script '${script}'`);
+          const flags = m[4] || '';
+          let re;
+          try { re = new RegExp(m[2], flags.includes('g') ? (flags.includes('i') ? 'gi' : 'g') : (flags.includes('i') ? 'i' : '')); }
+          catch (e) { return fail(`sed: invalid regex: ${e.message}`, 2); }
+          const inputs = shellReadInputs(operands, io);
+          const out = [];
+          for (const input of inputs) {
+            if (input.error) return fail(`sed: can't read ${input.name}: ${input.error}`);
+            out.push(input.text.split('\n').map((l) => l.replace(re, m[3])).join('\n'));
+          }
+          return ok(out.join('\n'));
+        }
+
+        case 'sort': {
+          const { flags, args: files } = shellParseFlags(args);
+          const inputs = shellReadInputs(files, io);
+          let lines = inputs.flatMap((i) => (i.error ? [] : i.text.split('\n')));
+          if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+          if (flags.has('n')) lines.sort((a, b) => (parseFloat(a) || 0) - (parseFloat(b) || 0));
+          else lines.sort();
+          if (flags.has('r')) lines.reverse();
+          if (flags.has('u')) lines = lines.filter((l, idx) => idx === 0 || l !== lines[idx - 1]);
+          return ok(lines.join('\n'));
+        }
+
+        case 'uniq': {
+          const lines = io.stdin.split('\n');
+          const out = [];
+          let prev = null;
+          let count = 0;
+          for (const line of lines) {
+            if (line === prev) { count++; continue; }
+            if (prev !== null) out.push(args.includes('-c') ? `${String(count).padStart(4, ' ')} ${prev}` : prev);
+            prev = line;
+            count = 1;
+          }
+          if (prev !== null) out.push(args.includes('-c') ? `${String(count).padStart(4, ' ')} ${prev}` : prev);
+          return ok(out.join('\n'));
+        }
+
+        case 'tr': {
+          const [from, to] = args;
+          if (!from || !to) return fail('tr: missing operand');
+          const expand = (spec) => {
+            let out = '';
+            for (let i = 0; i < spec.length; i++) {
+              if (spec[i + 1] === '-' && spec[i + 2] && spec[i + 2] !== ']') {
+                const a = spec.charCodeAt(i);
+                const b = spec.charCodeAt(i + 2);
+                for (let c = a; c <= b; c++) out += String.fromCharCode(c);
+                i += 2;
+              } else out += spec[i];
+            }
+            return out;
+          };
+          const src = expand(from);
+          const dst = expand(to);
+          const map = new Map();
+          for (let i = 0; i < src.length; i++) map.set(src[i], dst[i] ?? dst[dst.length - 1] ?? '');
+          return ok([...io.stdin].map((ch) => (map.has(ch) ? map.get(ch) : ch)).join(''));
+        }
+
+        case 'find': {
+          let start = '.';
+          let namePattern = null;
+          let typeFilter = null;
+          let maxDepth = Infinity;
+          const positional = [];
+          for (let i = 0; i < args.length; i++) {
+            const a = args[i];
+            if (a === '-name') { namePattern = args[++i] || null; continue; }
+            if (a === '-type') { typeFilter = args[++i] || null; continue; }
+            if (a === '-maxdepth') { maxDepth = parseInt(args[++i], 10); continue; }
+            if (a.startsWith('-')) continue;
+            positional.push(a);
+          }
+          if (positional.length > 0) start = positional[0];
+          const startNorm = shellResolvePath(state.cwd, start);
+          const startStat = vfsStatNorm(startNorm);
+          if (!startStat) return fail(`find: '${start}': No such file or directory`);
+          let re = null;
+          if (namePattern) {
+            try { re = globToRegExp(namePattern); } catch (e) { re = null; }
+          }
+          const results = [];
+          const walk = (norm, depth) => {
+            const st = vfsStatNorm(norm);
+            if (!st) return;
+            const base = norm.split('/').filter(Boolean).pop() || '/';
+            const nameOk = !re || re.test(base);
+            const typeOk = !typeFilter || (typeFilter === 'd' ? st.isDir : typeFilter === 'f' ? !st.isDir : true);
+            if (depth > 0 && nameOk && typeOk) results.push(norm);
+            if (!st.isDir || depth >= maxDepth) return;
+            for (const entry of vfsListNorm(norm)) {
+              walk(norm === '/' ? '/' + entry.name : norm + '/' + entry.name, depth + 1);
+            }
+          };
+          walk(startNorm, 0);
+          if (results.length === 0) return { stdout: '', stderr: '', status: 0 };
+          return ok(results.join('\n'));
+        }
+
+        case 'tree': {
+          const root = shellResolvePath(state.cwd, args[0] || '.');
+          if (!vfsStatNorm(root)) return fail(`tree: ${args[0] || '.'}: No such file or directory`);
+          const lines = [args[0] || '.'];
+          let dirs = 0, files = 0;
+          const walk = (norm, prefix) => {
+            const entries = vfsListNorm(norm);
+            entries.forEach((entry, idx) => {
+              const last = idx === entries.length - 1;
+              lines.push(prefix + (last ? '└── ' : '├── ') + entry.name + (entry.isDir ? '/' : ''));
+              if (entry.isDir) { dirs++; walk(norm === '/' ? '/' + entry.name : norm + '/' + entry.name, prefix + (last ? '    ' : '│   ')); }
+              else files++;
+            });
+          };
+          walk(root, '');
+          lines.push('', `${dirs} directories, ${files} files`);
+          return ok(lines.join('\n'));
+        }
+
+        case 'basename': {
+          if (!args[0]) return fail('basename: missing operand');
+          const trimmed = args[0].replace(/\/+$/, '');
+          const base = trimmed.split('/').filter(Boolean).pop() || '/';
+          if (args[1] && base.endsWith(args[1])) return ok(base.slice(0, -args[1].length));
+          return ok(base);
+        }
+
+        case 'dirname': {
+          if (!args[0]) return fail('dirname: missing operand');
+          const parts = shellResolvePath(state.cwd, args[0]).split('/').filter(Boolean);
+          parts.pop();
+          return ok('/' + parts.join('/'));
+        }
+
+        case 'realpath': {
+          if (!args[0]) return fail('realpath: missing operand');
+          const norm = shellResolvePath(state.cwd, args[0]);
+          if (!vfsStatNorm(norm)) return fail(`realpath: ${args[0]}: No such file or directory`);
+          return ok(norm);
+        }
+
+        case 'test':
+        case '[': {
+          const expr = name === '[' ? args.filter((a, i) => !(i === args.length - 1 && a === ']')) : args;
+          return { stdout: '', stderr: '', status: shellTestExpression(expr, state) ? 0 : 1 };
+        }
+
+        case 'export': {
+          for (const a of args) {
+            const eq = a.indexOf('=');
+            if (eq === -1) { if (state.env[a] === undefined) state.env[a] = ''; continue; }
+            state.env[a.slice(0, eq)] = a.slice(eq + 1);
+          }
+          return ok('');
+        }
+
+        case 'unset': {
+          for (const a of args) delete state.env[a];
+          return ok('');
+        }
+
+        case 'set':
+        case 'env':
+        case 'printenv': {
+          return ok(Object.entries(state.env).map(([k, v]) => `${k}=${v}`).sort().join('\n'));
+        }
+
+        case 'which':
+        case 'command':
+        case 'type': {
+          const target = args.filter((a) => !a.startsWith('-')).pop() || '';
+          const known = SHELL_COMMANDS.has(target);
+          if (!known) return { stdout: '', stderr: `${name}: ${target}: not found`, status: 1 };
+          return ok('/usr/bin/' + target);
+        }
+
+        case 'seq': {
+          const nums = args.filter((a) => !a.startsWith('-')).map(Number);
+          const start = nums.length === 1 ? 1 : (nums[0] || 1);
+          const end = nums.length === 1 ? nums[0] : (nums[1] || 1);
+          const step = nums.length >= 3 ? (nums[2] || 1) : 1;
+          const out = [];
+          if (step > 0) for (let v = start; v <= end; v += step) out.push(v);
+          else for (let v = start; v >= end; v += step) out.push(v);
+          return ok(out.join('\n'));
+        }
+
+        case 'expr': {
+          const joined = args.join(' ');
+          if (/^[-+*/%() 0-9^]+$/.test(joined)) return ok(safeBigIntEval(joined));
+          return fail(`expr: syntax error`);
+        }
+
+        case 'date': {
+          const fmtIdx = args.indexOf('+%Y-%m-%d');
+          const now = new Date();
+          if (args.includes('+%s')) return ok(String(Math.floor(now.getTime() / 1000)));
+          const pad = (v) => String(v).padStart(2, '0');
+          if (args.some((a) => a.startsWith('+'))) {
+            return ok(args.filter((a) => a.startsWith('+')).join(' ')
+              .replace(/%Y/g, String(now.getFullYear()))
+              .replace(/%m/g, pad(now.getMonth() + 1))
+              .replace(/%d/g, pad(now.getDate()))
+              .replace(/%H/g, pad(now.getHours()))
+              .replace(/%M/g, pad(now.getMinutes()))
+              .replace(/%S/g, pad(now.getSeconds())));
+          }
+          return ok(now.toUTCString());
+        }
+
+        case 'sleep': {
+          const secs = parseFloat(args[0]) || 0;
+          await new Promise((r) => setTimeout(r, Math.min(secs, 30) * 1000));
+          return ok('');
+        }
+
+        case 'curl': {
+          const url = args.find((a) => a.startsWith('http://') || a.startsWith('https://')) || '';
+          if (!url) return fail('curl: no URL specified', 2);
+          try {
+            const resp = await proxyFetch(url);
+            const body = await resp.text();
+            if (args.includes('-o')) return ok('');
+            return ok(body);
+          } catch (e) {
+            return fail(`curl: (7) Failed to connect to host: ${e.message}`, 7);
+          }
+        }
 
         case 'python':
         case 'python3':
-          let scriptContent = '';
+          return shellRunPython(args, io);
 
-          // Check if running a file: python main.py
-          if (args[0] && !args[0].startsWith('-')) {
-            scriptContent = await opfs.readFile(args[0]);
-          } else if (args[0] === '-c') {
-            scriptContent = args.slice(1).join(' ');
-          } else {
-            scriptContent = stdin;
+        case 'uname': {
+          if (args.includes('-a')) return ok('Linux deepupgrade-wasm 6.6.0 #1 SMP PREEMPT_DYNAMIC wasm32 GNU/Linux');
+          if (args.includes('-r')) return ok('6.6.0');
+          if (args.includes('-m')) return ok('wasm32');
+          return ok('Linux');
+        }
+
+        case 'whoami':
+          return ok(state.env.USER + '\n');
+
+        case 'hostname':
+          return ok('deepupgrade-wasm\n');
+
+        case 'id':
+          return ok(`uid=1000(${state.env.USER}) gid=1000(${state.env.USER}) groups=1000(${state.env.USER})\n`);
+
+        case 'clear':
+          return ok('');
+
+        case 'more':
+        case 'less': {
+          const inputs = shellReadInputs(args, io);
+          return ok(inputs.map((i) => (i.error ? `less: ${i.name}: ${i.error}` : i.text)).join('\n'));
+        }
+
+        case 'diff': {
+          const a = args[0];
+          const b = args[1];
+          if (!a || !b) return fail('diff: missing operand');
+          const left = vfsReadTextNorm(shellResolvePath(state.cwd, a));
+          const right = vfsReadTextNorm(shellResolvePath(state.cwd, b));
+          if (left.missing) return fail(`diff: ${a}: No such file or directory`, 2);
+          if (right.missing) return fail(`diff: ${b}: No such file or directory`, 2);
+          if (left.text === right.text) return ok('');
+          const lLines = left.text.split('\n');
+          const rLines = right.text.split('\n');
+          const out = [`--- ${a}`, `+++ ${b}`];
+          const max = Math.max(lLines.length, rLines.length);
+          for (let i = 0; i < max; i++) {
+            if (lLines[i] === rLines[i]) continue;
+            if (lLines[i] !== undefined) out.push(`-${lLines[i]}`);
+            if (rLines[i] !== undefined) out.push(`+${rLines[i]}`);
           }
+          return { stdout: out.join('\n'), stderr: '', status: 1 };
+        }
 
-          if (!scriptContent) return 'Python 3.12 (Pyodide Wasm Engine)';
+        case 'git':
+          return fail('git: not available in the WASM sandbox (no git binary, no subprocess). Use the "js" tool with https://api.github.com + raw.githubusercontent.com to import files one by one.');
 
-          try {
-            const py = await initPyodide();
-            let pyOutput = [];
-            py.setStdout({ batched: (str) => pyOutput.push(str) });
-            const result = await py.runPythonAsync(scriptContent);
-            let out = pyOutput.join('\n');
-            if (result !== undefined) out += (out ? '\n' : '') + String(result);
-            return out || '(Python executed with no output)';
-          } catch (e) {
-            return `Python Error: ${e.message || String(e)}`;
-          }
+        case 'exit': {
+          const code = parseInt(args[0], 10);
+          state.exit = Number.isNaN(code) ? 0 : code;
+          return { stdout: '', stderr: '', status: state.exit };
+        }
 
         default:
-          return `${program}: command completed`;
+          return fail(`${name}: command not found`, 127);
       }
     }
+
+    const SHELL_COMMANDS = new Set([
+      'echo', 'printf', 'cat', 'ls', 'pwd', 'cd', 'mkdir', 'rmdir', 'rm', 'cp', 'mv',
+      'touch', 'head', 'tail', 'wc', 'grep', 'sed', 'sort', 'uniq', 'tr', 'find', 'tree',
+      'basename', 'dirname', 'realpath', 'test', '[', 'export', 'unset', 'set', 'env',
+      'printenv', 'which', 'command', 'type', 'seq', 'expr', 'date', 'sleep', 'curl',
+      'python', 'python3', 'uname', 'whoami', 'hostname', 'id', 'clear', 'more', 'less',
+      'diff', 'git', 'true', 'false', 'exit', ':'
+    ]);
+
+    async function shellRunCommand(command, stdin, io) {
+      const state = io.state;
+      const argv = [];
+      for (const word of command.words) {
+        const expanded = await shellExpandWord(word, state, io.depth);
+        argv.push(...expanded);
+      }
+
+      let input = stdin;
+      const outRedirs = [];
+      let mergeStderr = false;
+
+      for (const redir of command.redirs) {
+        if (redir.op === '2>&1') { mergeStderr = true; continue; }
+        if (redir.op === '<<' || redir.op === '<<-') { input = redir.heredoc || ''; continue; }
+        const target = (await shellExpandWord(redir.target, state, io.depth));
+        const targetPath = target.length > 0 ? target[0] : '';
+        if (redir.op === '<') {
+          const read = vfsReadTextNorm(shellResolvePath(state.cwd, targetPath));
+          if (read.missing) {
+            return { stdout: '', stderr: `bash: ${targetPath}: No such file or directory`, status: 1 };
+          }
+          input = read.text || '';
+          continue;
+        }
+        outRedirs.push({ op: redir.op, path: targetPath });
+      }
+
+      let result = { stdout: '', stderr: '', status: 0 };
+      let commandIndex = 0;
+      while (commandIndex < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[commandIndex])) {
+        const eq = argv[commandIndex].indexOf('=');
+        state.env[argv[commandIndex].slice(0, eq)] = argv[commandIndex].slice(eq + 1);
+        commandIndex++;
+      }
+      if (commandIndex >= argv.length) {
+        result = { stdout: input, stderr: '', status: 0 };
+      } else {
+        const name = argv[commandIndex];
+        try {
+          result = await shellExec(name, argv.slice(commandIndex + 1), {
+            stdin: input,
+            state,
+            depth: io.depth,
+            io
+          });
+        } catch (e) {
+          result = { stdout: '', stderr: `${name}: ${e && e.message ? e.message : String(e)}`, status: 1 };
+        }
+      }
+
+      if (mergeStderr) {
+        result = {
+          stdout: [result.stdout, result.stderr].filter((s) => s !== '').join('\n'),
+          stderr: '',
+          status: result.status
+        };
+      }
+
+      for (const redir of outRedirs) {
+        if (!redir.path) continue;
+        try {
+          if (redir.op === '2>') {
+            await shellWriteTarget(state, redir.path, result.stderr, false);
+            result = { stdout: result.stdout, stderr: '', status: result.status };
+          } else if (redir.op === '2>>') {
+            await shellWriteTarget(state, redir.path, result.stderr, true);
+            result = { stdout: result.stdout, stderr: '', status: result.status };
+          } else if (redir.op === '&>') {
+            const both = [result.stdout, result.stderr].filter((s) => s !== '').join('\n');
+            await shellWriteTarget(state, redir.path, both, false);
+            result = { stdout: '', stderr: '', status: result.status };
+          } else if (redir.op === '>>') {
+            await shellWriteTarget(state, redir.path, result.stdout, true);
+            result = { stdout: '', stderr: result.stderr, status: result.status };
+          } else {
+            await shellWriteTarget(state, redir.path, result.stdout, false);
+            result = { stdout: '', stderr: result.stderr, status: result.status };
+          }
+        } catch (e) {
+          result = { stdout: '', stderr: `bash: ${redir.path}: ${e && e.message ? e.message : String(e)}`, status: 1 };
+        }
+      }
+
+      return result;
+    }
+
+    async function shellRunPipeline(pipeline, io) {
+      let input = '';
+      let finalOut = '';
+      const errs = [];
+      let status = 0;
+      for (let i = 0; i < pipeline.length; i++) {
+        const isLast = i === pipeline.length - 1;
+        const res = await shellRunCommand(pipeline[i], input, io);
+        status = res.status;
+        if (res.stderr) errs.push(res.stderr);
+        input = res.stdout;
+        if (isLast) finalOut = res.stdout;
+      }
+      return { stdout: finalOut, stderr: errs.join('\n'), status };
+    }
+
+    async function shellRunAndOr(chain, io) {
+      let stdout = '';
+      let stderr = '';
+      let res = await shellRunPipeline(chain[0], io);
+      stdout = res.stdout;
+      stderr = res.stderr;
+      let status = res.status;
+      for (let i = 1; i < chain.length; i++) {
+        const step = chain[i];
+        if (step.op === '&&' && status !== 0) continue;
+        if (step.op === '||' && status === 0) continue;
+        res = await shellRunPipeline(step.pipeline, io);
+        stdout += res.stdout;
+        stderr += res.stderr;
+        status = res.status;
+      }
+      return { stdout, stderr, status };
+    }
+
+    async function runShellScript(script, options = {}) {
+      const state = shellState();
+      if (!options.depth) shellResetExit();
+      const depth = options.depth || 0;
+      const out = [];
+      const errs = [];
+      let status = 0;
+
+      const tokens = shellLex(String(script || ''));
+      const chains = shellParse(tokens);
+
+      for (const chain of chains) {
+        const res = await shellRunAndOr(chain, { state, depth });
+        state.status = res.status;
+        status = res.status;
+        if (res.stdout) out.push(res.stdout);
+        if (res.stderr) errs.push(res.stderr);
+        if (state.exit !== null) break;
+      }
+
+      const stdout = out.join('');
+      const stderr = errs.join('');
+      const output = [stdout, stderr].filter((s) => s !== '').join('\n').replace(/\n+$/, '');
+      return { output, stdout, stderr, status };
+    }
+    // </du-posix-shell>
 
     // 5. MESSAGE HANDLER FOR CONTENT SCRIPT
     window.addEventListener('message', async (event) => {
       const { id, type, tool, code } = event.data;
       if (type !== 'DU_RUN') return;
 
+      // Never answer a tool call before the durable VFS has been restored.
+      await waitForVfsBoot();
+
       const startTime = performance.now();
       let output = '';
 
       try {
-        if (tool === 'bash') {
-          // Resolve arithmetic $((...))
-          let processed = code.replace(/\$\(\(([^)]+)\)\)/g, (_, expr) => safeBigIntEval(expr));
-          // Resolve subcommands $(...)
-          const subMatches = [...processed.matchAll(/\$\(([^)]+)\)/g)];
-          for (const m of subMatches) {
-            const subRes = await executeShellCommand(m[1]);
-            processed = processed.replace(m[0], subRes);
-          }
+        if ((tool === 'bash' || tool === 'python' || tool === 'py' || tool === 'js') &&
+            (typeof code !== 'string' || code.trim() === '')) {
+          throw new Error(`Tool "${tool}" requires a non-empty "code" field (the tool block was not parsed correctly).`);
+        }
 
-          const lines = splitShellChain(processed);
-          let resList = [];
-          for (let l of lines) {
-            resList.push(await executeShellCommand(l));
+        if (tool === 'bash') {
+          const shellResult = await runShellScript(code);
+          output = shellResult.output;
+          if (shellResult.status !== 0) {
+            const detail = shellResult.output || `Command exited with code ${shellResult.status}`;
+            throw new Error(detail);
           }
-          output = resList.filter(Boolean).join('\n');
 
         } else if (tool === 'question' || tool === 'ask') {
           const questionText = event.data.question || event.data.prompt || 'Требуется ваш выбор:';
@@ -762,6 +2270,25 @@
             if (grepResults.length >= 200) break;
           }
 
+          // Search files that exist only in the Pyodide FS (created by `python`).
+          if (isPyodideFsReady() && grepResults.length < 200) {
+            for (const f of collectPyodideFiles(normSearch)) {
+              if (grepResults.length >= 200) break;
+              if (opfs.files.has(f.path)) continue;
+              const text = readPyodideText(f.path);
+              if (text === null) continue;
+              const baseName = f.path.split('/').filter(Boolean).pop() || '';
+              if (fileRegex && !fileRegex.test(baseName) && !fileRegex.test(f.path)) continue;
+              const lines = text.split('\n');
+              for (let idx = 0; idx < lines.length; idx++) {
+                if (searchRegex.test(lines[idx])) {
+                  grepResults.push(`${f.path}:${idx + 1}: ${lines[idx]}`);
+                  if (grepResults.length >= 200) break;
+                }
+              }
+            }
+          }
+
           output = grepResults.length > 0 ? grepResults.join('\n') : `No matches found for '${pattern}' in ${searchPath}`;
 
         } else if (tool === 'read') {
@@ -770,7 +2297,17 @@
           const limit = event.data.limit !== undefined ? parseInt(event.data.limit, 10) : 2000;
 
           if (!filePath) throw new Error('Parameter "path" is required for read tool');
-          const raw = await opfs.readFile(filePath);
+          let raw = await opfs.readFile(filePath);
+          if (raw instanceof Uint8Array) {
+            try {
+              raw = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+            } catch (e) {
+              throw new Error(`File '${filePath}' is binary and cannot be read as text.`);
+            }
+          }
+          if (typeof raw !== 'string') {
+            throw new Error(`File '${filePath}' could not be read as text.`);
+          }
           if (raw.startsWith('cat: ') && raw.includes('No such file')) {
             throw new Error(`File '${filePath}' does not exist.`);
           }
@@ -790,11 +2327,21 @@
 
         } else if (tool === 'write') {
           const filePath = event.data.path || event.data.file || '';
-          const content = event.data.content ?? event.data.text ?? event.data.code ?? '';
+          const rawContent = event.data.content;
+          const content = rawContent ?? event.data.text ?? event.data.code ?? '';
 
           if (!filePath) throw new Error('Parameter "path" is required for write tool');
+          if (typeof content !== 'string') {
+            throw new Error('Parameter "content" must be a string for write tool');
+          }
+          if (content.length === 0 && event.data.allow_empty !== true && event.data.allowEmpty !== true) {
+            throw new Error('Parameter "content" is empty — the tool block was not parsed correctly. File was NOT written.');
+          }
           await opfs.writeFile(filePath, content);
-          output = `Successfully wrote ${content.length} characters to '${filePath}'.`;
+          await flushVfsPersistence();
+          const charCount = [...content].length;
+          const byteCount = new TextEncoder().encode(content).length;
+          output = `Successfully wrote ${charCount} characters (${byteCount} bytes) to '${filePath}'.`;
 
         } else if (tool === 'todowrite' || tool === 'todo') {
           const rawTodos = event.data.todos || [];
@@ -813,13 +2360,21 @@
           const newStr = event.data.new_str ?? event.data.newStr ?? '';
 
           if (!filePath) throw new Error('Parameter "path" is required for edit tool');
-          const fileContent = await opfs.readFile(filePath);
-          if (fileContent.startsWith('cat: ') && fileContent.includes('No such file')) {
-            throw new Error(`File '${filePath}' does not exist.`);
+          if (typeof oldStr !== 'string' || typeof newStr !== 'string') {
+            throw new Error('Parameters "old_str" and "new_str" are required for edit tool');
           }
+          const fileContent = await opfs.readFile(filePath);
+          const fileMissing = typeof fileContent !== 'string' ||
+            (fileContent.startsWith('cat: ') && fileContent.includes('No such file'));
 
-          if (!oldStr && !fileContent) {
-            // New file creation via edit
+          if (fileMissing) {
+            if (oldStr) {
+              throw new Error(`File '${filePath}' does not exist. Use "write" to create new files.`);
+            }
+            // New file creation via edit with an empty old_str
+            await opfs.writeFile(filePath, newStr);
+            output = `Successfully created and wrote ${newStr.length} bytes to ${filePath}`;
+          } else if (!oldStr && !fileContent) {
             await opfs.writeFile(filePath, newStr);
             output = `Successfully created and wrote ${newStr.length} bytes to ${filePath}`;
           } else {
@@ -870,8 +2425,12 @@
           let pyLogs = [];
           try {
             const py = await initPyodide();
+            // Mount files written before/while Pyodide was loading (including /skills)
+            syncVfsToPyodide();
             py.setStdout({ batched: (s) => pyLogs.push(s) });
             const res = await py.runPythonAsync(code);
+            // Import files created by the Python script back into the canonical VFS
+            syncPyodideToVfs();
             output = pyLogs.join('\n');
             if (res !== undefined) output += (output ? '\n' : '') + String(res);
 
@@ -889,7 +2448,8 @@
             } catch (e) {}
 
           } catch (pyErr) {
-            output = `Python Error: ${pyErr ? (pyErr.message || String(pyErr)) : 'Runtime error'}`;
+            try { syncPyodideToVfs(); } catch (ignored) {}
+            throw new Error(`Python Error: ${pyErr ? (pyErr.message || String(pyErr)) : 'Runtime error'}`);
           }
 
         } else if (tool === 'js') {
@@ -921,6 +2481,8 @@
           const res = await fn(customConsole, opfs, proxyFetch);
           output = logs.join('\n');
           if (res !== undefined) output += (output ? '\n' : '') + String(res);
+        } else {
+          throw new Error(`Unknown tool: "${tool}". Supported tools: write, edit, read, glob, grep, bash, python, js, question, todowrite, install_skill.`);
         }
 
         const origin = (event.origin && event.origin !== 'null') ? event.origin : '*';
@@ -941,6 +2503,9 @@
         }, origin);
       }
     });
+
+    // Ask the host page to restore the durable VFS before any tool runs.
+    requestVfsBoot();
   </script>
 </body>
 </html>
