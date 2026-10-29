@@ -54,20 +54,27 @@ function configureStealthSession(ses) {
   // 1. Spoof User-Agent globally
   ses.setUserAgent(AUTHENTIC_USER_AGENT);
 
-  // 2. Strip Electron/automation headers from all outgoing requests
+  // 2. Full authentic Google Chrome HTTP Headers & Client Hints
   ses.webRequest.onBeforeSendHeaders((details, callback) => {
     const url = details.url || '';
-    // Special handling for accounts.google.com to ensure clean Google OAuth flow
-    if (url.includes('accounts.google.com') || url.includes('google.com/signin')) {
-      details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
-    } else {
-      details.requestHeaders['User-Agent'] = AUTHENTIC_USER_AGENT;
-    }
+    
+    // Inject full realistic Chrome 130 Headers
+    details.requestHeaders['User-Agent'] = AUTHENTIC_USER_AGENT;
+    details.requestHeaders['sec-ch-ua'] = '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"';
+    details.requestHeaders['sec-ch-ua-mobile'] = '?0';
+    details.requestHeaders['sec-ch-ua-platform'] = '"Windows"';
+    details.requestHeaders['sec-ch-ua-platform-version'] = '"15.0.0"';
+    details.requestHeaders['sec-ch-ua-full-version-list'] = '"Chromium";v="130.0.6723.70", "Google Chrome";v="130.0.6723.70", "Not?A_Brand";v="99.0.0.0"';
+    details.requestHeaders['Accept-Language'] = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7';
+
+    // Remove any automation or leaking headers
+    delete details.requestHeaders['X-Requested-With'];
     delete details.requestHeaders['Sec-Fetch-User'];
+
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 
-  // 3. Remove navigator.webdriver & Client Hints anomalies
+  // 3. Prevent CSP or site isolation from blocking auth
   ses.webRequest.onHeadersReceived((details, callback) => {
     callback({ cancel: false, responseHeaders: details.responseHeaders });
   });
