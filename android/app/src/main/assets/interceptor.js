@@ -14,6 +14,30 @@
     powModule: null
   };
 
+  /**
+   * The agent directive published by the content script.
+   *
+   * The content script runs in the isolated world, so this MAIN-world script
+   * cannot call its functions. Both worlds share the page's localStorage, so
+   * the directive travels through it: { system, skills, assets }.
+   */
+  function readSharedDirective() {
+    try {
+      const raw = localStorage.getItem('du_system_directive_v2');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (typeof parsed.system !== 'string' || typeof parsed.skills !== 'string') return null;
+      return {
+        system: parsed.system,
+        skills: parsed.skills,
+        assets: typeof parsed.assets === 'string' ? parsed.assets : ''
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   // 1. Dynamic Discovery of Rspack/Webpack PoW Solver Module
   function getDynamicPowSolver() {
     if (window.__DU_NETWORK_CONTEXT__.powModule) {
@@ -370,7 +394,28 @@
             // Only inject system prompt if session has no parent (first turn) and not already injected
             const isFirstTurn = !parsedBody.parent_message_id && !window.__DU_NETWORK_CONTEXT__.lastParentMessageId;
 
-            if (isAgentActive && isFirstTurn && !hasDirectiveAlready && !isSandboxOutput) {
+            // The content script runs in the isolated world, so this MAIN-world
+            // script cannot call its directive builder. It publishes the full
+            // directive into the page's localStorage instead, which both
+            // worlds share. Without this bridge the model only ever saw the
+            // short fallback directive - and never the skill list.
+            const shared = readSharedDirective();
+            let newPrompt = null;
+
+            if (isAgentActive && !isSandboxOutput && shared) {
+              const markerIdx = rawPrompt.indexOf('[USER REQUEST]:');
+              const userText = markerIdx !== -1
+                ? rawPrompt.slice(markerIdx + '[USER REQUEST]:'.length).trim()
+                : rawPrompt;
+              // The full system prompt only goes with the first message; the
+              // skill list and the attached assets go with every message, so a
+              // skill installed mid-conversation is applied right away.
+              const head = ((isFirstTurn ? shared.system : '') + shared.skills + shared.assets).trim();
+              if (head) {
+                newPrompt = `${head}\n\n[USER REQUEST]: ${userText}`;
+                console.log(`[DeepUpgrade Sniffer] Directive attached (skills=${(shared.skills.match(/\n- /g) || []).length}, assets=${(shared.assets.match(/\n- /g) || []).length})`);
+              }
+            } else if (isAgentActive && isFirstTurn && !hasDirectiveAlready && !isSandboxOutput) {
               console.log('%c[DeepUpgrade Sniffer] 🛡️ Применяем агентский системный промпт (первое сообщение сессии)!', 'color: #3b82f6; font-weight: bold;');
               
               // Get directive generator from content script or fallback
@@ -378,7 +423,11 @@
                 return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]\nYou are DeepUpgrade, an autonomous AI software engineer with direct access to an in-browser WebAssembly sandbox (POSIX Shell, VFS /, Python 3, JS Runner).\n\nTOOL USAGE MATRIX:\n- "write": MUST be used whenever creating or completely writing any file. Never use bash echo or python open.\n- "edit": Surgical string replacement in existing files (exact old_str match).\n- "read": Read file contents with line offset/limit.\n- "glob": Search files by pattern.\n- "grep": Search file contents.\n- "bash": Running shell commands, git, directory inspections.\n- "python": Data analysis, computing, generating charts.\n- "js": Async network and API requests.\n- "question": Interactive user clarification options.\n- "todowrite": Create/update structured task list when task has multiple steps (todos: [{content, status}]).\n- "install_skill": Register persistent workflows.\n\nEXECUTION PROTOCOL:\n1. Call ONLY ONE \`\`\`json:tool block per response.\n2. STOP immediately after closing the tool block and wait for [SANDBOX OUTPUT].\n3. No conversational filler before tools. Directly invoke the tool.\n\n`;
               });
 
-              parsedBody.prompt = `${getSysDirective()}\n\n[USER REQUEST]: ${rawPrompt}`;
+              newPrompt = `${getSysDirective()}\n\n[USER REQUEST]: ${rawPrompt}`;
+            }
+
+            if (newPrompt !== null) {
+              parsedBody.prompt = newPrompt;
 
               // Mutate the outgoing request body transparently
               const newBodyStr = JSON.stringify(parsedBody);

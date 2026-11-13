@@ -602,16 +602,25 @@ function syncSkillsToVfs() {
   }
 }
 
-function buildSystemDirective() {
+/**
+ * The list of active skills.
+ *
+ * This block is small and must be sent with EVERY message: a skill that was
+ * installed in the middle of a conversation was never part of the first
+ * message, so the model never learned that the rules exist.
+ */
+function buildSkillsDirective() {
   const all = getAllSkills();
   const enabled = all.filter(s => activeSkills.includes(s.id));
-  let skillsSection = '';
-  if (enabled.length > 0) {
-    skillsSection = `\n\n[AVAILABLE SKILLS (Loaded in VFS)]:\n` + enabled.map(s => {
-      const slug = getSkillSlug(s.name);
-      return `- ${s.name}: ${s.desc || s.name} (Rules: /skills/${slug}/SKILL.md)`;
-    }).join('\n');
-  }
+  if (enabled.length === 0) return '';
+  return `\n\n[AVAILABLE SKILLS (Loaded in VFS)]:\n` + enabled.map(s => {
+    const slug = getSkillSlug(s.name);
+    return `- ${s.name}: ${s.desc || s.name} (Rules: /skills/${slug}/SKILL.md)`;
+  }).join('\n');
+}
+
+function buildSystemDirective() {
+  const skillsSection = buildSkillsDirective();
 
   // Detect whether running in Desktop environment with real OS terminal
   let envHeader = `You have direct access to a high-performance in-browser WebAssembly POSIX sandbox:
@@ -799,6 +808,7 @@ window.addEventListener('message', async (ev) => {
     localStorage.setItem('du_custom_skills', JSON.stringify(customSkills));
     localStorage.setItem('du_active_skills', JSON.stringify(activeSkills));
     syncSkillsToVfs();
+    publishDirectiveToMainWorld(true);
     if (isSkillsTabActive) renderNativeSkillsContent();
   }
 });
@@ -880,6 +890,42 @@ window.__DU_GET_SYSTEM_DIRECTIVE__ = function() {
   return `${buildSystemDirective()}${buildAttachedAssetsDirective()}`;
 };
 
+/**
+ * The directive for one turn.
+ * The first message carries the full system prompt, every later message still
+ * carries the skill list and the attached assets.
+ */
+function buildTurnDirective(isFirstTurn) {
+  return (isFirstTurn ? buildSystemDirective() : '')
+    + buildSkillsDirective()
+    + buildAttachedAssetsDirective();
+}
+
+// --- MAIN world bridge ---
+// The interceptor (MAIN world) cannot see the functions of this content
+// script (isolated world), so it always fell back to its own short directive
+// without the skill list. The full directive is published into the page's
+// localStorage, which both worlds share.
+const DU_DIRECTIVE_KEY = 'du_system_directive_v2';
+let duDirectiveSignature = '';
+
+function publishDirectiveToMainWorld(force) {
+  try {
+    const signature = JSON.stringify({
+      skills: getAllSkills().map(s => [s.id, s.name, s.desc, activeSkills.includes(s.id)]),
+      assets: [...stagedAttachments.values()].map(a => a.path)
+    });
+    if (!force && signature === duDirectiveSignature) return;
+    duDirectiveSignature = signature;
+    localStorage.setItem(DU_DIRECTIVE_KEY, JSON.stringify({
+      ts: Date.now(),
+      system: buildSystemDirective(),
+      skills: buildSkillsDirective(),
+      assets: buildAttachedAssetsDirective()
+    }));
+  } catch (e) { /* storage full or blocked - the composer prefix still works */ }
+}
+
 // Clean up files in VFS older than configured days
 function runAttachmentCleanup() {
   const days = parseInt(localStorage.getItem('du_cleanup_days') ?? '7', 10);
@@ -946,6 +992,7 @@ function handleFileInputChange(fileInput) {
         isPicture: isPic,
         mtime: Date.now()
       });
+      publishDirectiveToMainWorld(true);
 
       if (sandboxIframe && sandboxIframe.contentWindow) {
         sandboxIframe.contentWindow.postMessage({
@@ -995,6 +1042,7 @@ function hookAttachmentElements() {
             }, '*');
           }
           stagedAttachments.delete(key);
+          publishDirectiveToMainWorld(true);
         }
       }
     }
@@ -1527,6 +1575,7 @@ function hideInjectedDirectiveBlocks() {
     const text = bubble.textContent || '';
     const hasDirective = text.includes('[SYSTEM CAPABILITY:')
       || text.includes('[SYSTEM INSTRUCTION:')
+      || text.includes('[AVAILABLE SKILLS (Loaded in VFS)]:')
       || text.includes('[ATTACHED ASSETS AVAILABLE IN VFS]:');
     if (!hasDirective) return;
 
@@ -2479,12 +2528,14 @@ function hookInput() {
       const existingBubbles = document.querySelectorAll('.ds-message, div._9663006');
       const isFirstTurn = existingBubbles.length === 0;
 
-      if (isFirstTurn || attachedDirective) {
+      if (isFirstTurn || attachedDirective || buildSkillsDirective()) {
         const container = inputEl.closest('form, div:has(textarea), div:has([contenteditable])') || inputEl.parentElement;
         if (container) container.classList.add('du-locked-box');
         inputEl.classList.add('du-freezing');
 
-        const promptPrefix = isFirstTurn ? `${buildSystemDirective()}${attachedDirective}\n\n[USER REQUEST]: ` : `${attachedDirective}\n\n`;
+        const promptPrefix = `${buildTurnDirective(isFirstTurn)}\n\n[USER REQUEST]: `;
+        // The interceptor reads the directive from here (MAIN world bridge).
+        publishDirectiveToMainWorld(true);
         updateReactInput(inputEl, `${promptPrefix}${val}`);
         
         // Clear staged attachments after successful dispatch
@@ -3952,6 +4003,7 @@ async function duStoreUploadedFile(file) {
     fromFileManager: true,
     mtime: Date.now()
   });
+  publishDirectiveToMainWorld(true);
 
   return vfsPath;
 }
@@ -4305,6 +4357,7 @@ function renderNativeSkillsContent() {
         activeSkills = activeSkills.filter(id => id !== sid);
       }
       localStorage.setItem('du_active_skills', JSON.stringify(activeSkills));
+      publishDirectiveToMainWorld(true);
       renderNativeSkillsContent();
     };
   });
@@ -4317,6 +4370,7 @@ function renderNativeSkillsContent() {
       activeSkills = activeSkills.filter(id => id !== idToDel);
       localStorage.setItem('du_custom_skills', JSON.stringify(customSkills));
       localStorage.setItem('du_active_skills', JSON.stringify(activeSkills));
+      publishDirectiveToMainWorld(true);
       renderNativeSkillsContent();
     };
   });
@@ -4421,6 +4475,7 @@ function renderNativeSkillsContent() {
       localStorage.setItem('du_custom_skills', JSON.stringify(customSkills));
       localStorage.setItem('du_active_skills', JSON.stringify(activeSkills));
       syncSkillsToVfs();
+      publishDirectiveToMainWorld(true);
       renderNativeSkillsContent();
     };
   }
@@ -4944,6 +4999,7 @@ const observer = new MutationObserver(() => {
   hookInput();
   hookAttachmentElements();
   processToolCalls();
+  publishDirectiveToMainWorld(false);
   injectSkillsSettingsButton();
   injectAgentToggleButton();
   injectProjectSelector();
@@ -4962,3 +5018,5 @@ injectSkillsSettingsButton();
 injectAgentToggleButton();
 injectNewProjectButton();
 runAttachmentCleanup();
+// Publish the directive for the MAIN-world interceptor (skill list + assets).
+publishDirectiveToMainWorld(true);
