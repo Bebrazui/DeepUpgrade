@@ -38,6 +38,59 @@
     }
   }
 
+  /**
+   * Build the agent prompt for an outgoing message.
+   *
+   * DeepSeek sends its messages over fetch AND over XMLHttpRequest, so this
+   * runs for both transports - otherwise the directive was silently dropped
+   * whenever the request went through XHR.
+   *
+   * Returns the new prompt, or null when the body must stay untouched.
+   */
+  function buildAgentPrompt(parsedBody) {
+    const rawPrompt = String(parsedBody.prompt || '').trim();
+    if (!rawPrompt) return null;
+
+    // Agent switch is shared with the content script through the page's
+    // localStorage: content.js writes the flag, this MAIN-world script
+    // reads it. 'false' (any casing) disables the agent, anything else
+    // keeps it enabled - the same default as the content script.
+    const rawSetting = localStorage.getItem('du_tools_enabled');
+    const isAgentActive = String(rawSetting || '').toLowerCase() !== 'false';
+
+    const hasDirectiveAlready = rawPrompt.includes('[SYSTEM CAPABILITY:') || rawPrompt.includes('[SYSTEM INSTRUCTION:');
+    const isSandboxOutput = rawPrompt.startsWith('[SANDBOX OUTPUT');
+    const isFirstTurn = !parsedBody.parent_message_id && !window.__DU_NETWORK_CONTEXT__.lastParentMessageId;
+
+    const shared = readSharedDirective();
+
+    if (isAgentActive && !isSandboxOutput && shared) {
+      const markerIdx = rawPrompt.indexOf('[USER REQUEST]:');
+      const userText = markerIdx !== -1
+        ? rawPrompt.slice(markerIdx + '[USER REQUEST]:'.length).trim()
+        : rawPrompt;
+      // The full system prompt only goes with the first message; the skill
+      // list and the attached assets go with every message, so a skill
+      // installed mid-conversation is applied right away.
+      const head = ((isFirstTurn ? shared.system : '') + shared.skills + shared.assets).trim();
+      if (head) {
+        console.log(`[DeepUpgrade Sniffer] Directive attached (skills=${(shared.skills.match(/\n- /g) || []).length}, assets=${(shared.assets.match(/\n- /g) || []).length})`);
+        return `${head}\n\n[USER REQUEST]: ${userText}`;
+      }
+      return null;
+    }
+
+    if (isAgentActive && isFirstTurn && !hasDirectiveAlready && !isSandboxOutput) {
+      console.log('%c[DeepUpgrade Sniffer] 🛡️ Применяем агентский системный промпт (первое сообщение сессии)!', 'color: #3b82f6; font-weight: bold;');
+      const getSysDirective = window.__DU_GET_SYSTEM_DIRECTIVE__ || (() => {
+        return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]\nYou are DeepUpgrade, an autonomous AI software engineer with direct access to an in-browser WebAssembly sandbox (POSIX Shell, VFS /, Python 3, JS Runner).\n\nTOOL USAGE MATRIX:\n- "write": MUST be used whenever creating or completely writing any file. Never use bash echo or python open.\n- "edit": Surgical string replacement in existing files (exact old_str match).\n- "read": Read file contents with line offset/limit.\n- "glob": Search files by pattern.\n- "grep": Search file contents.\n- "bash": Running shell commands, git, directory inspections.\n- "python": Data analysis, computing, generating charts.\n- "js": Async network and API requests.\n- "question": Interactive user clarification options.\n- "todowrite": Create/update structured task list when task has multiple steps (todos: [{content, status}]).\n- "install_skill": Register persistent workflows.\n\nEXECUTION PROTOCOL:\n1. Call ONLY ONE \`\`\`json:tool block per response.\n2. STOP immediately after closing the tool block and wait for [SANDBOX OUTPUT].\n3. No conversational filler before tools. Directly invoke the tool.\n\n`;
+      });
+      return `${getSysDirective()}\n\n[USER REQUEST]: ${rawPrompt}`;
+    }
+
+    return null;
+  }
+
   // 1. Dynamic Discovery of Rspack/Webpack PoW Solver Module
   function getDynamicPowSolver() {
     if (window.__DU_NETWORK_CONTEXT__.powModule) {
@@ -378,53 +431,7 @@
 
           // If this is a user message being sent and Agent mode is active
           if (parsedBody && typeof parsedBody.prompt === 'string') {
-            const rawPrompt = parsedBody.prompt.trim();
-            // Agent switch is shared with the content script through the page's
-            // localStorage: content.js writes the flag, this MAIN-world script
-            // reads it. 'false' (any casing) disables the agent, anything else
-            // keeps it enabled - the same default as the content script.
-            const rawSetting = localStorage.getItem('du_tools_enabled');
-            const isAgentActive = String(rawSetting || '').toLowerCase() !== 'false';
-            console.log(`[DeepUpgrade Sniffer] Agent Check: du_tools_enabled='${rawSetting}', Active=${isAgentActive}`);
-            
-            // Check if prompt already has system directive or is a sandbox output
-            const hasDirectiveAlready = rawPrompt.includes('[SYSTEM CAPABILITY:') || rawPrompt.includes('[SYSTEM INSTRUCTION:');
-            const isSandboxOutput = rawPrompt.startsWith('[SANDBOX OUTPUT');
-            
-            // Only inject system prompt if session has no parent (first turn) and not already injected
-            const isFirstTurn = !parsedBody.parent_message_id && !window.__DU_NETWORK_CONTEXT__.lastParentMessageId;
-
-            // The content script runs in the isolated world, so this MAIN-world
-            // script cannot call its directive builder. It publishes the full
-            // directive into the page's localStorage instead, which both
-            // worlds share. Without this bridge the model only ever saw the
-            // short fallback directive - and never the skill list.
-            const shared = readSharedDirective();
-            let newPrompt = null;
-
-            if (isAgentActive && !isSandboxOutput && shared) {
-              const markerIdx = rawPrompt.indexOf('[USER REQUEST]:');
-              const userText = markerIdx !== -1
-                ? rawPrompt.slice(markerIdx + '[USER REQUEST]:'.length).trim()
-                : rawPrompt;
-              // The full system prompt only goes with the first message; the
-              // skill list and the attached assets go with every message, so a
-              // skill installed mid-conversation is applied right away.
-              const head = ((isFirstTurn ? shared.system : '') + shared.skills + shared.assets).trim();
-              if (head) {
-                newPrompt = `${head}\n\n[USER REQUEST]: ${userText}`;
-                console.log(`[DeepUpgrade Sniffer] Directive attached (skills=${(shared.skills.match(/\n- /g) || []).length}, assets=${(shared.assets.match(/\n- /g) || []).length})`);
-              }
-            } else if (isAgentActive && isFirstTurn && !hasDirectiveAlready && !isSandboxOutput) {
-              console.log('%c[DeepUpgrade Sniffer] 🛡️ Применяем агентский системный промпт (первое сообщение сессии)!', 'color: #3b82f6; font-weight: bold;');
-              
-              // Get directive generator from content script or fallback
-              const getSysDirective = window.__DU_GET_SYSTEM_DIRECTIVE__ || (() => {
-                return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]\nYou are DeepUpgrade, an autonomous AI software engineer with direct access to an in-browser WebAssembly sandbox (POSIX Shell, VFS /, Python 3, JS Runner).\n\nTOOL USAGE MATRIX:\n- "write": MUST be used whenever creating or completely writing any file. Never use bash echo or python open.\n- "edit": Surgical string replacement in existing files (exact old_str match).\n- "read": Read file contents with line offset/limit.\n- "glob": Search files by pattern.\n- "grep": Search file contents.\n- "bash": Running shell commands, git, directory inspections.\n- "python": Data analysis, computing, generating charts.\n- "js": Async network and API requests.\n- "question": Interactive user clarification options.\n- "todowrite": Create/update structured task list when task has multiple steps (todos: [{content, status}]).\n- "install_skill": Register persistent workflows.\n\nEXECUTION PROTOCOL:\n1. Call ONLY ONE \`\`\`json:tool block per response.\n2. STOP immediately after closing the tool block and wait for [SANDBOX OUTPUT].\n3. No conversational filler before tools. Directly invoke the tool.\n\n`;
-              });
-
-              newPrompt = `${getSysDirective()}\n\n[USER REQUEST]: ${rawPrompt}`;
-            }
+            const newPrompt = buildAgentPrompt(parsedBody);
 
             if (newPrompt !== null) {
               parsedBody.prompt = newPrompt;
@@ -521,7 +528,41 @@
         return;
       }
     }
-    return origSend.apply(this, arguments);
+
+    // DeepSeek sends the chat message over XMLHttpRequest, so the agent
+    // directive has to be attached here as well. Without it the request went
+    // out untouched and the model never saw the system prompt or the skills.
+    const xhrUrl = String(this.__url || '').toLowerCase();
+    const looksLikeChat = xhrUrl.includes('chat') || xhrUrl.includes('message') || xhrUrl.includes('completion');
+    if (looksLikeChat && typeof body === 'string' && body.includes('"prompt"')) {
+      try {
+        const parsedBody = JSON.parse(body);
+        if (parsedBody && typeof parsedBody.prompt === 'string') {
+          const newPrompt = buildAgentPrompt(parsedBody);
+          if (newPrompt !== null) {
+            parsedBody.prompt = newPrompt;
+            body = JSON.stringify(parsedBody);
+            if (parsedBody.chat_session_id) {
+              window.__DU_NETWORK_CONTEXT__.chatSessionId = parsedBody.chat_session_id;
+            }
+            if (parsedBody.parent_message_id !== undefined && !window.__DU_NETWORK_CONTEXT__.lastParentMessageId) {
+              window.__DU_NETWORK_CONTEXT__.lastParentMessageId = parsedBody.parent_message_id;
+            }
+            window.__DU_API_SNAPSHOT__ = {
+              url: this.__url,
+              method: 'POST',
+              headers: {},
+              body: parsedBody,
+              capturedAt: new Date().toISOString()
+            };
+          }
+        }
+      } catch (e) {
+        console.warn('[DeepUpgrade Sniffer] XHR body rewrite failed:', e);
+      }
+    }
+
+    return origSend.call(this, body);
   };
 
   console.log('%c[DeepUpgrade] Telemetry Guardian Active', 'background: #10b981; color: white; padding: 2px 6px;');
