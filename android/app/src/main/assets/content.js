@@ -1245,6 +1245,7 @@ function runInSandbox(toolObj) {
 // wrong output for the wrong tool.
 const EXECUTED_KEY = 'du_executed_turns_v3';
 const EXECUTED_OUTPUT_KEY = 'du_executed_tool_outputs_v3';
+const EXECUTED_BLOCKS_KEY = 'du_executed_tool_blocks_v3';
 
 function readJsonStorage(key, fallback) {
   try {
@@ -1257,6 +1258,9 @@ function readJsonStorage(key, fallback) {
 
 const executedTurns = new Set(readJsonStorage(EXECUTED_KEY, []));
 const executedOutputs = new Map(readJsonStorage(EXECUTED_OUTPUT_KEY, []));
+// Exact tool blocks that already ran. A single answer may contain several
+// calls; each of them must run once, but never twice after a re-render.
+const executedBlocks = new Set(readJsonStorage(EXECUTED_BLOCKS_KEY, []));
 
 function hashText(str) {
   let h = 0x811c9dc5;
@@ -1346,7 +1350,12 @@ function findCachedOutput(blockKey) {
 
 function markExecuted(turnKey, blockKey, output) {
   executedTurns.add(turnKey);
-  if (typeof output === 'string' && blockKey) executedOutputs.set(blockKey, output);
+  if (blockKey) {
+    executedOutputs.set(blockKey, output);
+    // The hash part is stable even when the turn key changes (our own
+    // [SANDBOX OUTPUT] reply adds a new user bubble and therefore a new key).
+    executedBlocks.add(blockKey.split('|').pop());
+  }
 
   if (executedTurns.size > 300) {
     [...executedTurns].slice(0, executedTurns.size - 300).forEach((oldKey) => executedTurns.delete(oldKey));
@@ -1354,10 +1363,14 @@ function markExecuted(turnKey, blockKey, output) {
   if (executedOutputs.size > 300) {
     [...executedOutputs.keys()].slice(0, executedOutputs.size - 300).forEach((oldKey) => executedOutputs.delete(oldKey));
   }
+  if (executedBlocks.size > 300) {
+    [...executedBlocks].slice(0, executedBlocks.size - 300).forEach((oldKey) => executedBlocks.delete(oldKey));
+  }
 
   try {
     sessionStorage.setItem(EXECUTED_KEY, JSON.stringify([...executedTurns]));
     sessionStorage.setItem(EXECUTED_OUTPUT_KEY, JSON.stringify([...executedOutputs].slice(-300)));
+    sessionStorage.setItem(EXECUTED_BLOCKS_KEY, JSON.stringify([...executedBlocks].slice(-300)));
   } catch (e) { /* storage quota - dedupe still works in memory */ }
 }
 // </du-tool-dedupe>
@@ -1391,6 +1404,41 @@ document.addEventListener('click', async (e) => {
     }, 50);
   }
 }, true);
+
+/**
+ * DeepSeek sometimes ignores the ```json:tool fence and emits the call as raw
+ * markup (<tool_call> or DSML). React re-renders the message while it streams,
+ * which wipes inline styles, so the raw text would flash in the chat. This
+ * pass runs on every DOM mutation and re-hides the whole call region.
+ */
+function hideRawToolCallMarkup() {
+  document.querySelectorAll('.ds-markdown').forEach((msg) => {
+    const text = msg.textContent || '';
+    const isDsml = /DSML/i.test(text);
+    const isTag = /<\s*\/?\s*tool_call/i.test(text);
+    if (!isDsml && !isTag) return;
+
+    const children = Array.from(msg.children);
+    if (!children.length) return;
+
+    const openRe = isDsml ? /DSML/i : /<\s*tool_call/i;
+    const closeRe = isDsml ? /DSML[\s\S]*?calls\s*>/i : /<\s*\/\s*tool_call/i;
+
+    let start = -1;
+    let end = -1;
+    children.forEach((child, index) => {
+      const childText = child.textContent || '';
+      if (start === -1 && openRe.test(childText)) start = index;
+      if (closeRe.test(childText)) end = index;
+    });
+    if (start === -1) return;
+    if (end === -1 || end < start) end = children.length - 1;
+
+    for (let i = start; i <= end; i++) {
+      children[i].style.setProperty('display', 'none', 'important');
+    }
+  });
+}
 
 // Preemptively hide any streaming json:tool block before parser even finishes
 function preemptiveHide() {
@@ -1465,6 +1513,7 @@ function hideInjectedDirectiveBlocks() {
 // Seamless unification & absolute stealth (Safe non-destructive mode)
 function cleanAndUnifyChat() {
   preemptiveHide();
+  hideRawToolCallMarkup();
   hideInjectedDirectiveBlocks();
 
   // 1. Clean user prompts inside main chat message text nodes
@@ -3063,7 +3112,7 @@ function collectInlineToolCalls() {
   return out;
 }
 
-async function executeToolBlock(block, codeText, toolObj, alreadyComplete) {
+async function executeToolBlock(block, codeText, toolObj, alreadyComplete, latestHint) {
   // Never execute a block that is still streaming.
   if (!alreadyComplete) {
     const readiness = isToolBlockReady(block, codeText);
@@ -3107,17 +3156,25 @@ async function executeToolBlock(block, codeText, toolObj, alreadyComplete) {
     return;
   }
 
-  if (executedTurns.has(turnKey) || !isLatestAssistantBlock(block)) {
-    // React re-render, reload, an old message, or a second tool block in the
-    // same answer: replay this block's cached result but never execute or send
-    // again.
+  if (executedBlocks.has(blockHash)) {
+    // The exact same block already ran (React re-render or a second pass).
+    // Replay its cached output, never execute it again.
     const cached = findCachedOutput(blockKey);
     setOpenCodeOutput(toolWidget, typeof cached === 'string'
       ? cached
-      : (executedTurns.has(turnKey)
-        ? 'В этом сообщении уже выполнен другой инструмент — вызов пропущен.'
-        : 'Исторический вызов: повторно не выполняется.'));
-    duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey, latest: isLatestAssistantBlock(block) });
+      : 'Этот вызов уже выполнен.');
+    duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey });
+    return;
+  }
+
+  // "Latest" is decided once for the whole batch: our own [SANDBOX OUTPUT]
+  // reply inserts a new user bubble, which would make the remaining calls of
+  // the same answer look like history.
+  const isLatest = latestHint === undefined ? isLatestAssistantBlock(block) : latestHint;
+  if (!isLatest) {
+    // A newer user message exists: this call is history and must never run.
+    setOpenCodeOutput(toolWidget, 'Исторический вызов: повторно не выполняется.');
+    duSendLog('tool-skip-history', { tool: toolObj.tool, turn: turnKey });
     return;
   }
 
@@ -3157,22 +3214,20 @@ async function executeToolBlock(block, codeText, toolObj, alreadyComplete) {
 function processToolCalls() {
   cleanAndUnifyChat();
 
-  // Find all code blocks (strictly targeting container .md-code-block or standalone pre)
+  // Collect every tool call of the latest answers, in document order.
+  const tasks = [];
+
   const allBlocks = Array.from(document.querySelectorAll('.md-code-block, pre'));
-  const inlineCalls = collectInlineToolCalls();
-
-  if (allBlocks.length === 0 && inlineCalls.length === 0) return;
-
-  allBlocks.forEach(async block => {
-   try {
+  for (const rawBlock of allBlocks) {
+    let block = rawBlock;
     // If this is a <pre> whose parent .md-code-block is already processed, skip
     if (block.tagName.toLowerCase() === 'pre' && block.closest('.md-code-block')) {
       const parentBlock = block.closest('.md-code-block');
-      if (parentBlock.hasAttribute('data-du-rendered')) return;
+      if (parentBlock.hasAttribute('data-du-rendered')) continue;
       block = parentBlock; // Process the parent wrapper directly
     }
 
-    if (block.hasAttribute('data-du-rendered')) return;
+    if (block.hasAttribute('data-du-rendered')) continue;
 
     const codeText = block.innerText || '';
     const toolObj = extractToolCall(codeText);
@@ -3181,27 +3236,49 @@ function processToolCalls() {
       // soon as the tool name is readable instead of waiting for the full block.
       const partial = extractPartialToolMeta(codeText);
       if (partial) renderStreamingToolCard(block, partial);
-      return;
+      continue;
     }
+    tasks.push({ block, codeText, toolObj, inline: false });
+  }
 
-    await executeToolBlock(block, codeText, toolObj, false);
-   } catch (err) {
-    console.error('[DeepUpgrade] tool block processing failed:', err);
-    duSendLog('tool-error', { error: String((err && err.message) || err) });
-   }
+  for (const call of collectInlineToolCalls()) {
+    tasks.push({ block: call.block, codeText: call.block.innerText || '', toolObj: call.toolObj, inline: true });
+  }
+
+  if (tasks.length === 0) return;
+
+  // Document order: the model asked for the calls in this order, so the
+  // sandbox outputs must be sent back in the same order.
+  tasks.sort((a, b) => {
+    if (a.block === b.block) return 0;
+    const rel = a.block.compareDocumentPosition(b.block);
+    if (rel & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (rel & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
   });
 
-  inlineCalls.forEach(async ({ block, toolObj, kind }) => {
-    try {
-      const raw = block.innerText || '';
-      hideInlineCallRegion(block);
-      duSendLog('tool-inline-format', { kind, tool: toolObj.tool });
-      await executeToolBlock(block, raw, toolObj, true);
-    } catch (err) {
-      console.error('[DeepUpgrade] inline tool call processing failed:', err);
-      duSendLog('tool-error', { error: String((err && err.message) || err) });
+  // Sequential execution: several calls inside one answer must not run in
+  // parallel, otherwise their outputs arrive in the wrong order and the model
+  // reacts to the wrong result.
+  const latestFlags = new Map();
+  for (const task of tasks) {
+    latestFlags.set(task.block, isLatestAssistantBlock(task.block));
+  }
+
+  (async () => {
+    for (const task of tasks) {
+      try {
+        if (task.inline) {
+          hideInlineCallRegion(task.block);
+          duSendLog('tool-inline-format', { tool: task.toolObj.tool });
+        }
+        await executeToolBlock(task.block, task.codeText, task.toolObj, task.inline, latestFlags.get(task.block));
+      } catch (err) {
+        console.error('[DeepUpgrade] tool processing failed:', err);
+        duSendLog('tool-error', { error: String((err && err.message) || err) });
+      }
     }
-  });
+  })();
 }
 
 // Track active session for Todo panel auto-clear on new chat / session switch

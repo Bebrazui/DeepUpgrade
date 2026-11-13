@@ -280,6 +280,12 @@
           isDir: false
         });
 
+        // Remember the content fingerprint so the Pyodide sync can skip this
+        // file instead of re-uploading it on every tool call.
+        try {
+          vfsFingerprints.set(norm, isBinary ? fingerprintBytes(bytes) : fingerprintText(String(content ?? '')));
+        } catch (e) {}
+
         // Also synchronize into Pyodide virtual filesystem if Pyodide is active
         try {
           if (isPyodideFsReady() && !isReservedPath(norm)) {
@@ -637,13 +643,54 @@
       return bytes;
     }
 
+    /**
+     * Content fingerprints of the VFS.
+     *
+     * After every python run the whole Pyodide FS is scanned and every file is
+     * written back to the host-side OPFS. Without change detection a 3 MB
+     * attachment was re-uploaded on every single tool call, which made the
+     * agent look like it "hung". The fingerprint is derived from the content,
+     * so an unchanged file is skipped completely.
+     */
+    const vfsFingerprints = new Map();
+
+    function fingerprintText(text) {
+      let h = 0x811c9dc5;
+      const str = String(text ?? '');
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = (h * 0x01000193) >>> 0;
+      }
+      return str.length + ':' + h.toString(16);
+    }
+
+    function fingerprintBytes(bytes) {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < bytes.length; i++) {
+        h ^= bytes[i];
+        h = (h * 0x01000193) >>> 0;
+      }
+      return bytes.length + ':' + h.toString(16);
+    }
+
     /** Import text files created by Python back into the canonical VFS. */
     function syncPyodideToVfs() {
       for (const f of collectPyodideFiles('/')) {
         const text = readPyodideText(f.path);
         if (text === null) continue;
+        const fingerprint = fingerprintText(text);
+        const known = vfsFingerprints.get(f.path);
+        if (known === fingerprint) continue; // unchanged since the last sync
         const existing = opfs.files.get(f.path);
-        if (existing && existing.content === text) continue;
+        if (existing && existing.content && (existing.content instanceof Uint8Array || ArrayBuffer.isView(existing.content))) {
+          // The VFS already holds the binary version of this file: keep it.
+          vfsFingerprints.set(f.path, fingerprint);
+          continue;
+        }
+        if (existing && existing.size === text.length && existing.content === text) {
+          vfsFingerprints.set(f.path, fingerprint);
+          continue;
+        }
         opfs.files.set(f.path, {
           path: f.path,
           content: text,
@@ -651,6 +698,7 @@
           mtime: f.mtime,
           isDir: false
         });
+        vfsFingerprints.set(f.path, fingerprint);
         // Persist to the host-side OPFS, otherwise the file is lost on reload.
         queueVfsPersist('write', f.path, text, 'utf8');
       }
@@ -670,8 +718,9 @@
         // Text files are handled by syncPyodideToVfs().
         if (readPyodideText(f.path) !== null) continue;
 
-        const existing = opfs.files.get(f.path);
-        if (existing && existing.content && existing.content.byteLength === bytes.byteLength) continue;
+        const fingerprint = fingerprintBytes(bytes);
+        const known = vfsFingerprints.get(f.path);
+        if (known === fingerprint) continue; // unchanged since the last sync
 
         const copy = new Uint8Array(bytes.byteLength);
         copy.set(bytes);
@@ -682,6 +731,7 @@
           mtime: f.mtime,
           isDir: false
         });
+        vfsFingerprints.set(f.path, fingerprint);
         queueVfsPersist('write', f.path, bytesToBase64(copy), 'base64');
       }
     }
