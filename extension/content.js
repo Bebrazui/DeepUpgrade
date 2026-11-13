@@ -53,6 +53,124 @@
   init();
 })();
 
+// <du-settings-bridge>
+// One switch, three worlds.
+//
+// The popup lives in the chrome-extension:// origin and can only reach the page
+// through chrome.storage + chrome.tabs.sendMessage, while the MAIN-world
+// interceptor can only read the page's localStorage. So the flag is kept in
+// BOTH places: chrome.storage.local is the durable source of truth, and the
+// page's localStorage mirror is what the interceptor reads.
+//
+// Every writer goes through this bridge, so the popup switch and the in-page
+// "Agent" button can never drift apart.
+(function initDuSettingsBridge() {
+  'use strict';
+
+  const KEY = 'du_tools_enabled';
+  const LEGACY_KEY = 'du_agent_enabled';
+
+  function parseFlag(raw, fallback) {
+    if (raw === null || raw === undefined) return fallback;
+    const v = String(raw).trim().toLowerCase();
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    return fallback;
+  }
+
+  function readPageMirror() {
+    try {
+      const current = localStorage.getItem(KEY);
+      if (current !== null) return parseFlag(current, null);
+      // Migration: the in-page Agent button used to write du_agent_enabled.
+      return parseFlag(localStorage.getItem(LEGACY_KEY), null);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writePageMirror(value) {
+    try {
+      localStorage.setItem(KEY, value ? 'true' : 'false');
+    } catch (e) { /* private mode / disabled storage */ }
+  }
+
+  function readStored(cb) {
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        cb(readPageMirror());
+        return;
+      }
+      chrome.storage.local.get([KEY], (res) => {
+        const stored = res && res[KEY] !== undefined ? parseFlag(res[KEY], null) : null;
+        cb(stored === null ? readPageMirror() : stored);
+      });
+    } catch (e) {
+      cb(readPageMirror());
+    }
+  }
+
+  function writeStored(value) {
+    const next = !!value;
+    writePageMirror(next);
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ [KEY]: next });
+      }
+    } catch (e) { /* storage unavailable (Android WebView) */ }
+    return next;
+  }
+
+  const listeners = [];
+
+  window.__DU_SETTINGS__ = {
+    KEY,
+
+    // Synchronous read of the page mirror (seeded from durable storage below).
+    isEnabled() {
+      const mirrored = readPageMirror();
+      return mirrored === null ? true : mirrored;
+    },
+
+    setEnabled(value) {
+      const next = writeStored(value);
+      listeners.forEach(fn => { try { fn(next); } catch (e) {} });
+      return next;
+    },
+
+    read(cb) {
+      readStored((value) => {
+        if (value !== null && value !== undefined) {
+          writePageMirror(value);
+          listeners.forEach(fn => { try { fn(value); } catch (e) {} });
+        }
+        cb(value);
+      });
+    },
+
+    onChanged(cb) {
+      listeners.push(cb);
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+          chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== 'local' || !changes || !changes[KEY]) return;
+            const next = parseFlag(changes[KEY].newValue, true);
+            writePageMirror(next);
+            listeners.forEach(fn => { try { fn(next); } catch (e) {} });
+          });
+        }
+      } catch (e) { /* storage API unavailable */ }
+    }
+  };
+
+  // Seed the page mirror from the durable storage on load, so a popup switch
+  // made in another tab is honoured even before the user sends a message.
+  readStored((value) => {
+    if (value !== null && value !== undefined) writePageMirror(value);
+  });
+})();
+// </du-settings-bridge>
+
 ﻿// DeepUpgrade - OpenCode Authentic Core v7.0 (Skills Engine & Settings Integration)
 console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6; color: white; font-weight: bold; padding: 2px 6px;');
 
@@ -78,6 +196,34 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       .replace(/\\/g, '/')
       .split('/')
       .filter((part) => part && part !== '.' && part !== '..');
+  }
+
+  // Bytes are stored raw in OPFS and their encoding is derived from the data
+  // itself, so no sidecar metadata file can get out of sync with the tree:
+  // valid UTF-8 is text, everything else is base64. Both directions are
+  // lossless (UTF-8 decode -> encode returns the original bytes).
+  function bytesToBase64(bytes) {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToBytes(b64) {
+    const binary = atob(String(b64 || ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function decodeUtf8OrNull(bytes) {
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch (e) {
+      return null;
+    }
   }
 
   class DuVfsStore {
@@ -120,7 +266,16 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
           if (handle.kind === 'file') {
             try {
               const file = await handle.getFile();
-              out.push({ path, content: await file.text(), mtime: file.lastModified || Date.now() });
+              const bytes = new Uint8Array(await file.arrayBuffer());
+              const text = decodeUtf8OrNull(bytes);
+              out.push({
+                path,
+                // Binary files travel as base64 so the sandbox can restore the
+                // exact bytes (charts, images) after a reload.
+                content: text !== null ? text : bytesToBase64(bytes),
+                encoding: text !== null ? 'utf8' : 'base64',
+                mtime: file.lastModified || Date.now()
+              });
             } catch (err) {
               if (err && err.name !== 'NotFoundError') console.warn('[DeepUpgrade] VFS read failed:', path, err.message);
             }
@@ -147,21 +302,101 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       return { dir, fileName };
     }
 
-    async writeFile(path, content) {
-      const text = typeof content === 'string' ? content : String(content ?? '');
-      const bytes = new TextEncoder().encode(text);
+    /**
+     * List the durable tree without reading file contents.
+     * Used by the file manager, which needs names, sizes and timestamps only.
+     */
+    async listAll() {
+      await this.init();
+      if (this.mode !== 'opfs') {
+        return [...this.memory.values()].map((f) => ({
+          path: f.path,
+          size: f.size || 0,
+          mtime: f.mtime || Date.now(),
+          encoding: f.encoding || 'utf8'
+        }));
+      }
+      const out = [];
+      const walk = async (dirHandle, prefix) => {
+        for await (const [name, handle] of dirHandle.entries()) {
+          const path = `${prefix}/${name}`;
+          if (handle.kind === 'file') {
+            try {
+              const file = await handle.getFile();
+              out.push({
+                path,
+                size: file.size,
+                mtime: file.lastModified || Date.now(),
+                encoding: 'utf8'
+              });
+            } catch (err) { /* file vanished while listing */ }
+          } else {
+            await walk(handle, path);
+          }
+        }
+      };
+      try {
+        await walk(this.root, '');
+      } catch (err) {
+        console.warn('[DeepUpgrade] VFS listing failed:', err && err.message);
+      }
+      return out;
+    }
+
+    /** Read one durable file: { content, encoding, size, mtime }. */
+    async readFile(path) {
+      await this.init();
+      const normalized = '/' + splitPath(path).join('/');
+      if (this.mode !== 'opfs') {
+        const item = this.memory.get(normalized);
+        if (!item) return null;
+        return { content: item.content, encoding: item.encoding || 'utf8', size: item.size || 0, mtime: item.mtime || Date.now() };
+      }
+      try {
+        const { dir, fileName } = await this.dirFor(normalized, false);
+        const handle = await dir.getFileHandle(fileName);
+        const file = await handle.getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const text = decodeUtf8OrNull(bytes);
+        return {
+          content: text !== null ? text : bytesToBase64(bytes),
+          encoding: text !== null ? 'utf8' : 'base64',
+          size: bytes.byteLength,
+          mtime: file.lastModified || Date.now()
+        };
+      } catch (err) {
+        return null;
+      }
+    }
+
+    async writeFile(path, content, encoding) {
+      await this.init();
+      const isBinary = encoding === 'base64';
+      let bytes;
+      if (isBinary) {
+        bytes = base64ToBytes(content);
+      } else {
+        bytes = new TextEncoder().encode(typeof content === 'string' ? content : String(content ?? ''));
+      }
       if (bytes.length > MAX_FILE_BYTES) {
         throw new Error(`file is larger than ${MAX_FILE_BYTES} bytes and was not persisted`);
       }
-      await this.init();
       if (this.mode !== 'opfs') {
-        this.memory.set(path, { path, content: text, mtime: Date.now() });
+        this.memory.set(path, {
+          path,
+          // Keep the same wire format as the OPFS branch: text stays text,
+          // binary travels as base64.
+          content: isBinary ? bytesToBase64(bytes) : new TextDecoder().decode(bytes),
+          encoding: isBinary ? 'base64' : 'utf8',
+          size: bytes.byteLength,
+          mtime: Date.now()
+        });
         return;
       }
       const { dir, fileName } = await this.dirFor(path, true);
       const handle = await dir.getFileHandle(fileName, { create: true });
       const writable = await handle.createWritable();
-      await writable.write(text);
+      await writable.write(bytes);
       await writable.close();
     }
 
@@ -197,13 +432,13 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
     }
 
     apply(message) {
-      const { op, path, content } = message || {};
+      const { op, path, content, encoding } = message || {};
       if (!path) return Promise.resolve({ ok: false, error: 'missing path' });
       const normalized = '/' + splitPath(path).join('/');
       return this.enqueue(async () => {
         try {
           if (op === 'write') {
-            await this.writeFile(normalized, content);
+            await this.writeFile(normalized, content, encoding);
           } else if (op === 'mkdir') {
             await this.makeDir(normalized);
           } else if (op === 'remove') {
@@ -457,7 +692,18 @@ window.addEventListener('message', async (ev) => {
     const { fetchId, url, options } = ev.data;
     try {
       const resp = await fetch(url, options);
-      const text = await resp.text();
+      // Read the body as bytes so binary downloads (images, archives) survive
+      // the trip; the text form is derived from the same bytes.
+      const buffer = await resp.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let text = null;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch (e) {
+        text = null; // not valid UTF-8 -> binary payload
+      }
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       let headersObj = {};
       resp.headers.forEach((v, k) => { headersObj[k] = v; });
       sandboxIframe.contentWindow.postMessage({
@@ -467,7 +713,9 @@ window.addEventListener('message', async (ev) => {
         status: resp.status,
         statusText: resp.statusText,
         headers: headersObj,
-        data: text
+        data: text !== null ? text : '',
+        dataBase64: btoa(binary),
+        isBinary: text === null
       }, '*');
     } catch (err) {
       sandboxIframe.contentWindow.postMessage({
@@ -499,6 +747,43 @@ window.addEventListener('message', async (ev) => {
 // Setup Sandbox Iframe (Universal for Chrome Extension and Android WebView)
 let sandboxIframe = null;
 const pendingCalls = new Map();
+// File reads requested from the sandbox (DU_GET_FILE -> DU_GET_FILE_RESULT).
+const pendingFileRequests = new Map();
+const DU_FILE_REQUEST_TIMEOUT = 12000;
+
+// --- shared binary helpers (host page scope) ---
+function duBytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function duBase64ToBytes(b64) {
+  const binary = atob(String(b64 || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function duDecodeUtf8OrNull(bytes) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+function escapeAttr(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // --- ATTACHED ASSETS (OPFS /added/) ENGINE ---
 // Maps file key / name -> { name, path, type, size, isPicture }
@@ -557,6 +842,16 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
       runAttachmentCleanup();
     } else if (msg && msg.action === 'set_block_telemetry') {
       localStorage.setItem('du_block_telemetry', JSON.stringify(msg.value));
+    } else if (msg && msg.action === 'set_agent_enabled') {
+      // The popup switch goes through the shared bridge, so the page mirror,
+      // the durable storage and the MAIN-world interceptor stay in sync.
+      if (typeof window.__DU_SETTINGS__ !== 'undefined') {
+        window.__DU_SETTINGS__.setEnabled(!!msg.value);
+      }
+    } else if (msg && msg.action === 'set_theme') {
+      if (typeof window.__DU_THEME__ !== 'undefined') {
+        window.__DU_THEME__.apply(msg.theme);
+      }
     }
   });
 }
@@ -627,6 +922,9 @@ function hookAttachmentElements() {
       const currentChipTexts = Array.from(chipElements).map(el => el.innerText || '');
 
       for (const [key, info] of stagedAttachments.entries()) {
+        // Files uploaded through the file manager are not chat attachments and
+        // have no chip in the composer, so they must survive the cleanup.
+        if (info.fromFileManager) continue;
         // If the chip is no longer present in inputArea DOM
         const stillInDom = currentChipTexts.some(txt => txt.includes(info.name) || txt.includes(key));
         if (!stillInDom && chipElements.length > 0) {
@@ -728,6 +1026,65 @@ window.addEventListener('pagehide', () => {
   const store = duVfsStore();
   if (store) store.flush();
 });
+
+/**
+ * Read a file the tools produced.
+ *
+ * The sandbox (unique origin) owns the live copy, the host page owns the
+ * durable OPFS copy. The sandbox answers first because it also sees files
+ * that were not persisted yet; the durable store is the fallback, so cards
+ * and downloads keep working after a reload.
+ */
+async function resolveDurableFile(path) {
+  const store = duVfsStore();
+  if (!store) return { success: false, error: 'vfs store unavailable' };
+  try {
+    const file = await store.readFile(path);
+    if (!file) return { success: false, error: 'File not found' };
+    const base64 = file.encoding === 'base64'
+      ? file.content
+      : duBytesToBase64(new TextEncoder().encode(file.content));
+    return { success: true, path: file.path || path, size: file.size, base64 };
+  } catch (err) {
+    return { success: false, error: (err && err.message) || String(err) };
+  }
+}
+
+function fetchFileFromSandbox(path) {
+  return new Promise((resolve) => {
+    const done = (res) => resolve(res || { success: false, error: 'File not found' });
+
+    if (!sandboxIframe || !sandboxIframe.contentWindow) {
+      resolveDurableFile(path).then(done);
+      return;
+    }
+
+    const reqId = 'f' + Math.random().toString(36).slice(2);
+    const timer = setTimeout(() => {
+      if (pendingFileRequests.has(reqId)) {
+        pendingFileRequests.delete(reqId);
+        resolveDurableFile(path).then(done);
+      }
+    }, DU_FILE_REQUEST_TIMEOUT);
+
+    pendingFileRequests.set(reqId, (res) => {
+      clearTimeout(timer);
+      if (res && res.success) {
+        done(res);
+        return;
+      }
+      resolveDurableFile(path).then(done);
+    });
+
+    try {
+      sandboxIframe.contentWindow.postMessage({ type: 'DU_GET_FILE', reqId, path }, '*');
+    } catch (err) {
+      clearTimeout(timer);
+      pendingFileRequests.delete(reqId);
+      resolveDurableFile(path).then(done);
+    }
+  });
+}
 
 function runInSandbox(toolObj) {
   // If running in DeepUpgrade Desktop, route directly to real OS terminal & FS!
@@ -1907,7 +2264,35 @@ function sendSilentReply(text) {
 // </du-send-path>
 
 // Agent Toggle State (Persisted in localStorage)
-let isAgentEnabled = JSON.parse(localStorage.getItem('du_agent_enabled') ?? 'true');
+let isAgentEnabled = (typeof window.__DU_SETTINGS__ !== 'undefined')
+  ? window.__DU_SETTINGS__.isEnabled()
+  : true;
+
+// The popup, the in-page Agent button and the MAIN-world interceptor all read
+// the same flag. Keep the in-page button in sync when it changes elsewhere.
+function syncAgentToggleButton() {
+  const btn = document.querySelector('.du-agent-toggle-btn');
+  if (!btn) return;
+  btn.setAttribute('aria-pressed', isAgentEnabled ? 'true' : 'false');
+  if (isAgentEnabled) {
+    btn.classList.add('ds-toggle-button--selected');
+  } else {
+    btn.classList.remove('ds-toggle-button--selected');
+  }
+}
+
+if (typeof window.__DU_SETTINGS__ !== 'undefined') {
+  window.__DU_SETTINGS__.onChanged((value) => {
+    isAgentEnabled = !!value;
+    syncAgentToggleButton();
+  });
+  // Pull the durable value (a switch flipped in another tab) into the page.
+  window.__DU_SETTINGS__.read((value) => {
+    if (value === null || value === undefined) return;
+    isAgentEnabled = !!value;
+    syncAgentToggleButton();
+  });
+}
 
 function hookInput() {
   const inputEl = findDeepSeekInput();
@@ -2896,20 +3281,341 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// --- Native Settings Tab: Skills Integration ---
+// --- Native Settings Tab: File Manager (durable OPFS tree) ---
+const DU_FILE_PREVIEW_LIMIT = 120 * 1024;
+
+function duFileIcon(name, isPicture) {
+  if (isPicture) {
+    return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>
+    </svg>`;
+  }
+  return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+  </svg>`;
+}
+
+function duFormatDate(mtime) {
+  try {
+    const d = new Date(mtime || Date.now());
+    return d.toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  } catch (e) {
+    return '';
+  }
+}
+
+async function renderNativeFilesContent() {
+  const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
+  if (!contentArea) return;
+
+  // Hide original settings items (Theme, Language, Voice)
+  Array.from(contentArea.children).forEach(ch => {
+    if (!ch.classList.contains('du-native-files-panel')) {
+      ch.style.display = 'none';
+    }
+  });
+
+  let panel = contentArea.querySelector('.du-native-files-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.className = 'du-native-files-panel';
+    contentArea.appendChild(panel);
+  }
+
+  const store = duVfsStore();
+  let files = [];
+  let mode = 'memory';
+  try {
+    if (store) {
+      mode = await store.init();
+      files = await store.listAll();
+    }
+  } catch (err) {
+    console.warn('[DeepUpgrade] File manager listing failed:', err);
+  }
+
+  files = files.filter(f => f && f.path && !f.path.endsWith('/'));
+  files.sort((a, b) => a.path.localeCompare(b.path));
+
+  const groups = new Map();
+  for (const file of files) {
+    const parts = file.path.split('/').filter(Boolean);
+    const name = parts.pop() || file.path;
+    const dir = '/' + parts.join('/');
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push({ ...file, name });
+  }
+
+  const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
+
+  let listHtml = '';
+  if (files.length === 0) {
+    listHtml = `
+      <div class="du-skills-empty-state">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M1.5 5.5a1 1 0 011-1h5l2 2.5h11a1 1 0 011 1v10a1 1 0 01-1 1h-18a1 1 0 01-1-1v-12z" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="du-empty-text">Файлов пока нет</div>
+        <div class="du-empty-hint">Файлы, созданные агентом в Python или шелле, попадут сюда автоматически и переживут перезагрузку страницы</div>
+      </div>
+    `;
+  } else {
+    listHtml = [...groups.entries()].map(([dir, items]) => `
+      <div class="du-files-group">
+        <div class="du-files-group-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+            <path d="M1.5 5.5a1 1 0 011-1h5l2 2.5h11a1 1 0 011 1v10a1 1 0 01-1 1h-18a1 1 0 01-1-1v-12z"/>
+          </svg>
+          <span>${escapeHtml(dir === '/' ? '/' : dir)}</span>
+        </div>
+        ${items.map(item => {
+          const isPic = isImageFile(item.name);
+          return `
+          <div class="du-files-row" data-path="${escapeAttr(item.path)}">
+            <div class="du-files-icon ${isPic ? 'is-image' : ''}">${duFileIcon(item.name, isPic)}</div>
+            <div class="du-files-info">
+              <div class="du-files-name" title="${escapeAttr(item.path)}">${escapeHtml(item.name)}</div>
+              <div class="du-files-meta">${formatBytes(item.size || 0)} • ${escapeHtml(duFormatDate(item.mtime))}</div>
+            </div>
+            <div class="du-files-actions">
+              <button class="du-files-btn du-files-preview-btn" title="Просмотр" type="button">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+              <button class="du-files-btn du-files-download-btn" title="Скачать" type="button">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </button>
+              <button class="du-files-btn du-files-delete-btn" title="Удалить" type="button">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>
+                </svg>
+              </button>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    `).join('');
+  }
+
+  panel.innerHTML = `
+    <div class="du-native-files-container">
+      <div class="du-native-header-row">
+        <div>
+          <div class="du-native-title">Файлы</div>
+          <div class="du-native-sub">${mode === 'opfs' ? 'Дюрабельное хранилище OPFS' : 'Временное хранилище (OPFS недоступен)'}</div>
+        </div>
+        <div class="du-files-head-actions">
+          <span class="du-native-badge">${files.length} • ${formatBytes(totalSize)}</span>
+          <button class="du-files-btn du-files-refresh-btn" title="Обновить" type="button">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 11-2.6-6.4"/><polyline points="21 3 21 9 15 9"/>
+            </svg>
+          </button>
+          <button class="du-files-btn du-files-upload-btn" title="Загрузить свой файл" type="button">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <input type="file" id="duFilesInput" multiple style="display: none;" />
+
+      <div class="du-native-files-list">
+        ${listHtml}
+      </div>
+
+      <div class="du-files-preview" hidden></div>
+    </div>
+  `;
+
+  // Refresh
+  const refreshBtn = panel.querySelector('.du-files-refresh-btn');
+  if (refreshBtn) refreshBtn.onclick = () => renderNativeFilesContent();
+
+  // Upload own files -> durable store + sandbox VFS (the agent sees them too)
+  const uploadBtn = panel.querySelector('.du-files-upload-btn');
+  const fileInput = panel.querySelector('#duFilesInput');
+  if (uploadBtn && fileInput) {
+    uploadBtn.onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const picked = Array.from(fileInput.files || []);
+      fileInput.value = '';
+      for (const file of picked) {
+        try {
+          await duStoreUploadedFile(file);
+        } catch (err) {
+          console.warn('[DeepUpgrade] Upload failed:', file.name, err);
+        }
+      }
+      renderNativeFilesContent();
+    };
+  }
+
+  // Preview / download / delete
+  panel.querySelectorAll('.du-files-row').forEach(row => {
+    const path = row.getAttribute('data-path');
+    const name = path.split('/').filter(Boolean).pop() || path;
+
+    const previewBtn = row.querySelector('.du-files-preview-btn');
+    if (previewBtn) previewBtn.onclick = (e) => { e.stopPropagation(); duShowFilePreview(panel, path, name); };
+
+    const downloadBtn = row.querySelector('.du-files-download-btn');
+    if (downloadBtn) downloadBtn.onclick = (e) => { e.stopPropagation(); duDownloadFile(path, name); };
+
+    const deleteBtn = row.querySelector('.du-files-delete-btn');
+    if (deleteBtn) deleteBtn.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Удалить файл ${name}?`)) return;
+      await duDeleteFile(path);
+      renderNativeFilesContent();
+    };
+  });
+}
+
+async function duStoreUploadedFile(file) {
+  const safeName = sanitizeFileName(file.name);
+  const isPic = isImageFile(file.name, file.type);
+  const vfsPath = `${isPic ? '/added/picture' : '/added/file'}/${safeName}`;
+
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const base64 = duBytesToBase64(bytes);
+  const text = duDecodeUtf8OrNull(bytes);
+
+  // 1. Durable host copy
+  const store = duVfsStore();
+  if (store) {
+    await store.writeFile(vfsPath, text !== null ? text : base64, text !== null ? 'utf8' : 'base64');
+  }
+
+  // 2. Sandbox copy, so the agent can read the file right away
+  if (sandboxIframe && sandboxIframe.contentWindow) {
+    try {
+      sandboxIframe.contentWindow.postMessage({
+        type: 'DU_STORE_ATTACHMENT',
+        path: vfsPath,
+        data: base64,
+        isBinary: true,
+        mtime: Date.now()
+      }, '*');
+    } catch (e) {}
+  }
+
+  stagedAttachments.set(safeName, {
+    name: file.name,
+    path: vfsPath,
+    type: file.type || (isPic ? 'image/png' : 'application/octet-stream'),
+    size: file.size,
+    isPicture: isPic,
+    fromFileManager: true,
+    mtime: Date.now()
+  });
+
+  return vfsPath;
+}
+
+async function duDownloadFile(path, name) {
+  const res = await fetchFileFromSandbox(path);
+  if (!res || !res.success || !res.base64) {
+    alert('Не удалось прочитать файл: ' + ((res && res.error) || 'файл не найден'));
+    return;
+  }
+  try {
+    const bytes = duBase64ToBytes(res.base64);
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name || path.split('/').pop() || 'file';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (err) {
+    alert('Ошибка сохранения файла: ' + (err && err.message));
+  }
+}
+
+async function duShowFilePreview(panel, path, name) {
+  const box = panel.querySelector('.du-files-preview');
+  if (!box) return;
+  box.hidden = false;
+  box.innerHTML = `<div class="du-files-preview-head">
+      <span class="du-files-preview-title">${escapeHtml(name)}</span>
+      <button class="du-files-btn du-files-preview-close" title="Закрыть" type="button">✕</button>
+    </div>
+    <div class="du-files-preview-body">Загрузка…</div>`;
+
+  const closeBtn = box.querySelector('.du-files-preview-close');
+  if (closeBtn) closeBtn.onclick = () => { box.hidden = true; box.innerHTML = ''; };
+
+  const body = box.querySelector('.du-files-preview-body');
+  const res = await fetchFileFromSandbox(path);
+  if (!body) return;
+
+  if (!res || !res.success || !res.base64) {
+    body.innerHTML = `<div class="du-files-preview-error">${escapeHtml((res && res.error) || 'Файл не найден')}</div>`;
+    return;
+  }
+
+  const isPic = isImageFile(name);
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const bytes = duBase64ToBytes(res.base64);
+  const text = duDecodeUtf8OrNull(bytes);
+
+  if (isPic) {
+    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext || 'png'}`;
+    body.innerHTML = `<img class="du-files-preview-image" src="data:${mime};base64,${res.base64}" alt="${escapeAttr(name)}" />`;
+  } else if (text !== null) {
+    const truncated = text.length > DU_FILE_PREVIEW_LIMIT;
+    const shown = truncated ? text.slice(0, DU_FILE_PREVIEW_LIMIT) : text;
+    body.innerHTML = `<pre class="du-files-preview-text">${escapeHtml(shown)}</pre>${truncated ? '<div class="du-files-preview-note">Показаны первые ' + Math.round(DU_FILE_PREVIEW_LIMIT / 1024) + ' КБ</div>' : ''}`;
+  } else {
+    body.innerHTML = `<div class="du-files-preview-error">Бинарный файл (${formatBytes(res.size || bytes.length)})</div>`;
+  }
+}
+
+async function duDeleteFile(path) {
+  const store = duVfsStore();
+  if (store) {
+    try {
+      await store.removeEntry(path);
+    } catch (err) {
+      console.warn('[DeepUpgrade] Delete failed:', path, err);
+    }
+  }
+  if (sandboxIframe && sandboxIframe.contentWindow) {
+    try {
+      sandboxIframe.contentWindow.postMessage({ type: 'DU_REMOVE_ATTACHMENT', path }, '*');
+    } catch (e) {}
+  }
+  for (const [key, info] of [...stagedAttachments.entries()]) {
+    if (info.path === path) stagedAttachments.delete(key);
+  }
+}
+
+// --- Native Settings Tab: Skills + Files Integration ---
 let isSkillsTabActive = false;
+let isFilesTabActive = false;
+let duSkillsNavBtn = null;
+let duFilesNavBtn = null;
 
 function injectSkillsSettingsButton() {
   const settingsNav = document.querySelector('.d316d158');
-  if (!settingsNav || settingsNav.querySelector('.du-skills-nav-btn')) return;
+  if (!settingsNav) return;
 
-  const btn = document.createElement('div');
-  btn.setAttribute('role', 'button');
-  btn.setAttribute('tabindex', '0');
-  btn.className = 'ds-button ds-button--outlinedNeutral ds-button--borderless ds-button--capsule ds-button--m ds-button--icon-relative-m ds-button--min-width _266abb8 du-skills-nav-btn';
-  btn.style.cssText = '--dsl-button-text-color: var(--dsw-alias-label-primary); --dsl-button-padding: 0 10px 0 8px; --dsl-button-border-radius: 12px; --dsl-button-icon-gap: 8px; cursor: pointer;';
+  if (!settingsNav.querySelector('.du-skills-nav-btn')) {
+    const btn = document.createElement('div');
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('tabindex', '0');
+    btn.className = 'ds-button ds-button--outlinedNeutral ds-button--borderless ds-button--capsule ds-button--m ds-button--icon-relative-m ds-button--min-width _266abb8 du-skills-nav-btn';
+    btn.style.cssText = '--dsl-button-text-color: var(--dsw-alias-label-primary); --dsl-button-padding: 0 10px 0 8px; --dsl-button-border-radius: 12px; --dsl-button-icon-gap: 8px; cursor: pointer;';
 
-  btn.innerHTML = `
+    btn.innerHTML = `
     <div class="ds-button__background"></div>
     <div class="ds-button__icon">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -2919,23 +3625,55 @@ function injectSkillsSettingsButton() {
     <span class="ds-button__content">Skills</span>
   `;
 
-  btn.onclick = (e) => {
-    e.stopPropagation();
-    activateSkillsTab(btn, settingsNav);
-  };
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      activateSkillsTab(btn, settingsNav);
+    };
 
-  // When clicking any original DeepSeek tabs, restore original content
-  const origTabs = settingsNav.querySelectorAll('div[role="button"]:not(.du-skills-nav-btn)');
+    settingsNav.appendChild(btn);
+    duSkillsNavBtn = btn;
+  }
+
+  if (!settingsNav.querySelector('.du-files-nav-btn')) {
+    const btn = document.createElement('div');
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('tabindex', '0');
+    btn.className = 'ds-button ds-button--outlinedNeutral ds-button--borderless ds-button--capsule ds-button--m ds-button--icon-relative-m ds-button--min-width _266abb8 du-files-nav-btn';
+    btn.style.cssText = '--dsl-button-text-color: var(--dsw-alias-label-primary); --dsl-button-padding: 0 10px 0 8px; --dsl-button-border-radius: 12px; --dsl-button-icon-gap: 8px; cursor: pointer;';
+
+    btn.innerHTML = `
+    <div class="ds-button__background"></div>
+    <div class="ds-button__icon">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M1.5 4.5a1 1 0 011-1h3.2a1 1 0 01.77.36l.83 1.01a1 1 0 00.77.36H13.5a1 1 0 011 1v6.27a1 1 0 01-1 1h-11a1 1 0 01-1-1V4.5z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <span class="ds-button__content">Files</span>
+  `;
+
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      activateFilesTab(btn, settingsNav);
+    };
+
+    settingsNav.appendChild(btn);
+    duFilesNavBtn = btn;
+  }
+
+  // When clicking any original DeepSeek tab, restore the original content
+  const origTabs = settingsNav.querySelectorAll('div[role="button"]:not(.du-skills-nav-btn):not(.du-files-nav-btn)');
   origTabs.forEach(t => {
+    if (t.getAttribute('data-du-tab-bound') === 'true') return;
+    t.setAttribute('data-du-tab-bound', 'true');
     t.addEventListener('click', () => {
-      deactivateSkillsTab(btn, settingsNav);
+      deactivateSkillsTab(duSkillsNavBtn, settingsNav);
+      deactivateFilesTab(duFilesNavBtn, settingsNav);
     }, { capture: true });
   });
-
-  settingsNav.appendChild(btn);
 }
 
 function activateSkillsTab(skillsBtn, settingsNav) {
+  if (duFilesNavBtn) deactivateFilesTab(duFilesNavBtn, settingsNav);
   isSkillsTabActive = true;
 
   // Un-highlight other tabs, highlight Skills
@@ -2951,14 +3689,47 @@ function activateSkillsTab(skillsBtn, settingsNav) {
 
 function deactivateSkillsTab(skillsBtn, settingsNav) {
   isSkillsTabActive = false;
-  skillsBtn.classList.remove('_699d482');
-  skillsBtn.style.removeProperty('--dsl-button-color');
+  if (skillsBtn) {
+    skillsBtn.classList.remove('_699d482');
+    skillsBtn.style.removeProperty('--dsl-button-color');
+  }
 
   const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
   if (contentArea) {
     const customPanel = contentArea.querySelector('.du-native-skills-panel');
     if (customPanel) customPanel.remove();
     // Unhide original children
+    Array.from(contentArea.children).forEach(ch => {
+      ch.style.removeProperty('display');
+    });
+  }
+}
+
+function activateFilesTab(filesBtn, settingsNav) {
+  if (duSkillsNavBtn) deactivateSkillsTab(duSkillsNavBtn, settingsNav);
+  isFilesTabActive = true;
+
+  settingsNav.querySelectorAll('div[role="button"]').forEach(t => {
+    t.classList.remove('_699d482');
+    t.style.removeProperty('--dsl-button-color');
+  });
+  filesBtn.classList.add('_699d482');
+  filesBtn.style.setProperty('--dsl-button-color', 'var(--dsw-alias-interactive-bg-hover)');
+
+  renderNativeFilesContent();
+}
+
+function deactivateFilesTab(filesBtn, settingsNav) {
+  isFilesTabActive = false;
+  if (filesBtn) {
+    filesBtn.classList.remove('_699d482');
+    filesBtn.style.removeProperty('--dsl-button-color');
+  }
+
+  const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
+  if (contentArea) {
+    const customPanel = contentArea.querySelector('.du-native-files-panel');
+    if (customPanel) customPanel.remove();
     Array.from(contentArea.children).forEach(ch => {
       ch.style.removeProperty('display');
     });
@@ -3289,14 +4060,16 @@ function injectAgentToggleButton() {
   };
 
   btn.onclick = () => {
-    isAgentEnabled = !isAgentEnabled;
-    localStorage.setItem('du_agent_enabled', JSON.stringify(isAgentEnabled));
-    btn.setAttribute('aria-pressed', isAgentEnabled ? 'true' : 'false');
-    if (isAgentEnabled) {
-      btn.classList.add('ds-toggle-button--selected');
+    const next = !(typeof window.__DU_SETTINGS__ !== 'undefined'
+      ? window.__DU_SETTINGS__.isEnabled()
+      : isAgentEnabled);
+    if (typeof window.__DU_SETTINGS__ !== 'undefined') {
+      window.__DU_SETTINGS__.setEnabled(next);
     } else {
-      btn.classList.remove('ds-toggle-button--selected');
+      isAgentEnabled = next;
+      localStorage.setItem('du_tools_enabled', JSON.stringify(isAgentEnabled));
     }
+    syncAgentToggleButton();
   };
 
   toggleBar.appendChild(btn);

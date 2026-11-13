@@ -355,8 +355,12 @@
           // If this is a user message being sent and Agent mode is active
           if (parsedBody && typeof parsedBody.prompt === 'string') {
             const rawPrompt = parsedBody.prompt.trim();
+            // Agent switch is shared with the content script through the page's
+            // localStorage: content.js writes the flag, this MAIN-world script
+            // reads it. 'false' (any casing) disables the agent, anything else
+            // keeps it enabled - the same default as the content script.
             const rawSetting = localStorage.getItem('du_tools_enabled');
-            const isAgentActive = rawSetting !== 'false';
+            const isAgentActive = String(rawSetting || '').toLowerCase() !== 'false';
             console.log(`[DeepUpgrade Sniffer] Agent Check: du_tools_enabled='${rawSetting}', Active=${isAgentActive}`);
             
             // Check if prompt already has system directive or is a sandbox output

@@ -170,6 +170,59 @@
   border-radius: 2px;
 }
 
+/* Scrollable code view (write / python / js / terminal) */
+.du-code-view {
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #e4e4e7;
+  background: transparent;
+}
+
+.du-code-view::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.du-code-view::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+}
+
+.du-code-view::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.du-code-view::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Scrollable diff for edit */
+.du-diff-scroll {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.du-code-more {
+  margin-top: 6px;
+  color: #94a3b8;
+  font-size: 11.5px;
+  opacity: 0.9;
+}
+
+.du-code-streaming {
+  color: #94a3b8;
+  font-size: 11.5px;
+  opacity: 0.85;
+  font-style: italic;
+}
+
 /* Bottom section: Output */
 .opencode-terminal-output {
   padding: 10px 14px;
@@ -1256,8 +1309,386 @@ div:has(> .du-project-top-bar) > div:has(textarea),
 .du-todo-item.completed .du-todo-title {
   color: #7E7E82;
 }
+
+/* ==========================================================================
+   THEMES
+   --------------------------------------------------------------------------
+   DeepSeek paints the UI through CSS custom properties: the static palette
+   (--dsw-static-*) lives on `body`, the dark aliases (--dsw-alias-*) on
+   `body[data-ds-dark-theme]`. Every surface, border and label reads those
+   variables, so a theme only needs to remap the palette. No hashed class names
+   and no per-component overrides.
+
+   `default` applies no rules at all: the attribute is removed from <html>.
+   ========================================================================== */
+
+/* ---------- Pure OLED Black ---------- */
+html[data-du-theme="oled"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #f1f2f4;
+  --dsw-static-neutral-bluish-300: #cfd3d6;
+  --dsw-static-neutral-bluish-400: #a9aeb4;
+  --dsw-static-neutral-bluish-600: #7c8087;
+  --dsw-static-neutral-bluish-750: #2e2f31;
+  --dsw-static-neutral-bluish-800: #1c1c1e;
+  --dsw-static-neutral-bluish-850: #111113;
+  --dsw-static-neutral-bluish-875: #09090a;
+  --dsw-static-neutral-bluish-900: #050506;
+  --dsw-static-neutral-bluish-950: #000000;
+  --dsw-static-neutral-850: #0d0d0e;
+  --dsw-static-neutral-700: #262628;
+  --dsw-static-neutral-600: #4a4a4d;
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.06);
+  --dsw-alias-border-inverted2: rgba(255, 255, 255, 0.1);
+  --dsw-alias-border-inverted: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.18);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.24);
+  --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.1);
+  --dsw-alias-interactive-bg-active: rgba(255, 255, 255, 0.16);
+  --dsw-alias-interactive-bg-hover-accent: rgba(255, 255, 255, 0.26);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(0, 0, 0, 0.4);
+  --dsw-alias-button-tool-bar-fill: rgba(38, 38, 40, 0.62);
+  --dsw-alias-button-tool-bar-hover: rgba(52, 52, 55, 0.72);
+  background-color: #000000;
+}
+
+/* ---------- Cyberpunk Neon ---------- */
+html[data-du-theme="cyberpunk"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #f4e9ff;
+  --dsw-static-neutral-bluish-300: #dcc6f2;
+  --dsw-static-neutral-bluish-400: #bda1d9;
+  --dsw-static-neutral-bluish-600: #9573b3;
+  --dsw-static-neutral-bluish-750: #3d1c5e;
+  --dsw-static-neutral-bluish-800: #2a1042;
+  --dsw-static-neutral-bluish-850: #1d0a30;
+  --dsw-static-neutral-bluish-875: #150722;
+  --dsw-static-neutral-bluish-900: #0d0418;
+  --dsw-static-neutral-bluish-950: #07020f;
+  --dsw-static-neutral-850: #12051f;
+  --dsw-static-neutral-700: #33124f;
+  --dsw-static-neutral-600: #57207d;
+  --dsw-static-deepseek-400: #22e6ff;
+  --dsw-static-deepseek-450: #ff2bd6;
+  --dsw-static-deepseek-500: #ff5ce0;
+  --dsw-static-deepseek-600: #ff2bd6;
+  --dsw-static-deepseek-800: #4a0c5c;
+  --dsw-static-deepseek-900: #2a0436;
+  --dsw-alias-bg-skeleton: rgba(255, 43, 214, 0.12);
+  --dsw-alias-border-inverted2: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-inverted: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-l1: rgba(255, 43, 214, 0.18);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 43, 214, 0.22);
+  --dsw-alias-border-l2: rgba(255, 43, 214, 0.32);
+  --dsw-alias-border-l3: rgba(34, 230, 255, 0.36);
+  --dsw-alias-border-l4: rgba(34, 230, 255, 0.5);
+  --dsw-alias-interactive-bg-hover: rgba(255, 43, 214, 0.14);
+  --dsw-alias-interactive-bg-active: rgba(255, 43, 214, 0.22);
+  --dsw-alias-interactive-bg-hover-accent: rgba(34, 230, 255, 0.26);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(13, 4, 24, 0.5);
+  --dsw-alias-button-tool-bar-fill: rgba(61, 28, 94, 0.55);
+  --dsw-alias-button-tool-bar-hover: rgba(87, 32, 125, 0.65);
+  background-color: #07020f;
+  background-image:
+    radial-gradient(900px 540px at 10% -12%, rgba(255, 43, 214, 0.18), transparent 62%),
+    radial-gradient(820px 520px at 94% 2%, rgba(34, 230, 255, 0.14), transparent 64%);
+  background-attachment: fixed;
+}
+
+/* Neon brand text and focus rings, still using the site's own variables. */
+html[data-du-theme="cyberpunk"] body[data-ds-dark-theme] ::selection {
+  background: rgba(255, 43, 214, 0.35);
+  color: #ffffff;
+}
+
+/* ---------- Liquid Glass ---------- */
+html[data-du-theme="glass"] body[data-ds-dark-theme] {
+  --dsw-static-neutral-bluish-100: #eef4ff;
+  --dsw-static-neutral-bluish-300: #d2ddec;
+  --dsw-static-neutral-bluish-400: #aebdd4;
+  --dsw-static-neutral-bluish-600: #8fa2bd;
+  --dsw-static-neutral-bluish-750: rgba(44, 62, 92, 0.62);
+  --dsw-static-neutral-bluish-800: rgba(30, 44, 70, 0.6);
+  --dsw-static-neutral-bluish-850: rgba(21, 32, 54, 0.62);
+  --dsw-static-neutral-bluish-875: rgba(14, 23, 40, 0.66);
+  --dsw-static-neutral-bluish-900: rgba(10, 17, 30, 0.7);
+  --dsw-static-neutral-bluish-950: #060b14;
+  --dsw-static-neutral-850: rgba(16, 26, 44, 0.66);
+  --dsw-static-neutral-700: rgba(60, 82, 116, 0.55);
+  --dsw-static-neutral-600: rgba(96, 122, 158, 0.6);
+  --dsw-static-deepseek-400: #9cc7ff;
+  --dsw-static-deepseek-450: #6ea8ff;
+  --dsw-static-deepseek-500: #8dbcff;
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-inverted2: rgba(255, 255, 255, 0.18);
+  --dsw-alias-border-inverted: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.12);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.2);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.26);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.32);
+  --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.1);
+  --dsw-alias-interactive-bg-active: rgba(255, 255, 255, 0.16);
+  --dsw-alias-interactive-bg-hover-accent: rgba(255, 255, 255, 0.24);
+  --dsw-alias-button-tool-bar-fill-invisible: rgba(6, 11, 20, 0.35);
+  --dsw-alias-button-tool-bar-fill: rgba(60, 84, 120, 0.45);
+  --dsw-alias-button-tool-bar-hover: rgba(76, 104, 146, 0.55);
+  background-color: #060b14;
+  background-image: linear-gradient(135deg, #060b14 0%, #0c1a2e 38%, #16324c 68%, #081222 100%);
+  background-attachment: fixed;
+}
+
+/* Frosted overlays: menus, dialogs and notifications are the surfaces that sit
+   above arbitrary content, so those are the ones worth blurring. */
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-modal-content,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-dropdown-menu,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-select__select,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-notification,
+html[data-du-theme="glass"] body[data-ds-dark-theme] .ds-toast {
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+/* Theme switches are instant by default; soften only the page background. */
+html[data-du-theme] body {
+  transition: background-color 0.2s ease, background-image 0.2s ease;
+}
+
   transform: scale(0.98);
 }
 
 
 
+
+/* Sidebar New Project button: exact 1:1 match with New chat button */
+.du-new-project-btn {
+  position: relative !important;
+  box-sizing: border-box !important;
+  width: 100% !important;
+  cursor: pointer !important;
+  user-select: none !important;
+}
+
+.du-new-project-btn::after,
+.du-new-project-btn::before {
+  display: none !important;
+  content: none !important;
+}
+
+.du-new-project-badge {
+  position: absolute !important;
+  right: 12px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-size: 14px !important;
+  font-weight: 400 !important;
+  color: #73777D !important;
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  line-height: normal !important;
+  pointer-events: none !important;
+  font-family: inherit !important;
+  opacity: 0 !important;
+  transition: opacity 0.15s ease !important;
+}
+
+.du-new-project-btn:hover .du-new-project-badge {
+  opacity: 1 !important;
+  color: #73777D !important;
+}
+
+.du-new-project-wrapper {
+  margin-top: 8px !important;
+  margin-bottom: 4px !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+/* Let DeepSeek's native classes (_5a8ac7a etc) handle hover/active backgrounds naturally */
+.du-new-project-btn .du-new-project-badge {
+  color: #73777D !important;
+}
+
+/* --- Native Settings Tab: File Manager --- */
+.du-native-files-panel {
+  width: 100%;
+  padding-top: 6px;
+  animation: du-fade-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.du-native-files-container {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.du-files-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.du-files-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.04));
+  color: var(--dsw-alias-label-secondary, #a1a1aa);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.du-files-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-native-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.du-files-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.du-files-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  padding: 2px 2px 0;
+}
+
+.du-files-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: 10px;
+  transition: background 0.15s;
+}
+
+.du-files-row:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.du-files-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  color: #8b8b8b;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.du-files-icon.is-image {
+  color: #60a5fa;
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.du-files-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.du-files-name {
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary, #ededed);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.du-files-meta {
+  font-size: 11.5px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  margin-top: 1px;
+}
+
+.du-files-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.du-files-delete-btn:hover {
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.du-files-preview {
+  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 12px;
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.025));
+  overflow: hidden;
+}
+
+.du-files-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
+}
+
+.du-files-preview-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary, #ededed);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.du-files-preview-body {
+  max-height: 340px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.du-files-preview-text {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dsw-alias-label-primary, #ededed);
+}
+
+.du-files-preview-image {
+  display: block;
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.du-files-preview-note,
+.du-files-preview-error {
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  padding-top: 8px;
+}
+
+.du-files-preview-error {
+  color: #f87171;
+}

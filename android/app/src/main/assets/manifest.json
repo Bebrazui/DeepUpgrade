@@ -35,8 +35,7 @@
     {
       "resources": [
         "sandbox/runner.html",
-        "sandbox/pyodide/*",
-        "ui/*"
+        "sandbox/pyodide/*"
       ],
       "matches": ["https://chat.deepseek.com/*"]
     }
