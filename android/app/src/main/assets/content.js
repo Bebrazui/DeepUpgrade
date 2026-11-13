@@ -1405,9 +1405,67 @@ function preemptiveHide() {
   });
 }
 
+/**
+ * The agent directive is prefixed to the prompt, so DeepSeek renders it inside
+ * the user bubble as separate paragraphs (code fences included). The cleanup
+ * above can only strip the directive when it sits in one text node, so the
+ * leftover "[ATTACHED ASSETS AVAILABLE IN VFS]:" block stayed visible.
+ *
+ * Everything before the "[USER REQUEST]:" marker belongs to us: hide it and
+ * keep only the user's own text.
+ */
+function hideInjectedDirectiveBlocks() {
+  const bubbles = document.querySelectorAll('.fbb737a4');
+  bubbles.forEach((bubble) => {
+    const text = bubble.textContent || '';
+    const hasDirective = text.includes('[SYSTEM CAPABILITY:')
+      || text.includes('[SYSTEM INSTRUCTION:')
+      || text.includes('[ATTACHED ASSETS AVAILABLE IN VFS]:');
+    if (!hasDirective) return;
+
+    let target = bubble.querySelector('[data-du-user-request="1"]');
+    if (!target) {
+      const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if ((node.nodeValue || '').includes('[USER REQUEST]:')) {
+          target = node.parentElement;
+          break;
+        }
+      }
+      if (!target) return;
+      target.setAttribute('data-du-user-request', '1');
+
+      // Strip the marker itself, keep the user's text.
+      const inner = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+      let innerNode;
+      while ((innerNode = inner.nextNode())) {
+        const idx = (innerNode.nodeValue || '').indexOf('[USER REQUEST]:');
+        if (idx === -1) continue;
+        innerNode.nodeValue = innerNode.nodeValue.slice(0, idx)
+          + innerNode.nodeValue.slice(idx + '[USER REQUEST]:'.length).replace(/^\s+/, '');
+        break;
+      }
+    }
+
+    // Hide every sibling that precedes the user's text inside this bubble.
+    let el = target;
+    while (el && el !== bubble) {
+      let sib = el.previousElementSibling;
+      while (sib) {
+        const prev = sib.previousElementSibling;
+        sib.style.setProperty('display', 'none', 'important');
+        sib = prev;
+      }
+      el = el.parentElement;
+    }
+  });
+}
+
 // Seamless unification & absolute stealth (Safe non-destructive mode)
 function cleanAndUnifyChat() {
   preemptiveHide();
+  hideInjectedDirectiveBlocks();
 
   // 1. Clean user prompts inside main chat message text nodes
   const messageNodes = document.querySelectorAll('.ds-message, div[class*="message"], .ds-collapsible-text');
@@ -2781,12 +2839,329 @@ function isToolBlockReady(block, codeText) {
   return 'incomplete';
 }
 
+// --- alternative tool-call syntaxes ---
+// DeepSeek does not always honour the ```json:tool fence. It sometimes emits a
+// bare <tool_call>{...}</tool_call> block or its native DSML markup. Both must be
+// understood, including zero-width characters and arbitrary whitespace.
+const DU_INVISIBLE_RE = /[\u200B-\u200F\u2060\uFEFF\u00AD\u180E\u202A-\u202E]/g;
+
+function stripInvisibleChars(text) {
+  return String(text || '').replace(DU_INVISIBLE_RE, '');
+}
+
+// DSML delimiters: DeepSeek uses full-width bars, but ASCII pipes are accepted
+// as well so a model that "helpfully" normalizes them still works.
+const DSML_BAR = '(?:\\uFF5C\\uFF5C|\\|\\|)';
+
+function parseDsmlToolCall(rawText) {
+  const src = stripInvisibleChars(rawText);
+  const invokeRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*invoke\\s+name="([^"]+)"([^>]*)>`, 'i');
+  const inv = invokeRe.exec(src);
+  if (!inv) return null;
+
+  const toolName = (inv[1] || '').trim();
+  const bodyStart = inv.index + inv[0].length;
+  const closeRe = new RegExp(`</${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*invoke>`, 'i');
+  const closeMatch = closeRe.exec(src.slice(bodyStart));
+  const body = closeMatch ? src.slice(bodyStart, bodyStart + closeMatch.index) : src.slice(bodyStart);
+
+  const params = {};
+  const paramRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter\\s+name="([^"]+)"([^>]*)>`, 'gi');
+  const nextParamRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter`, 'i');
+  const trailingTagRe = new RegExp(`(?:</?${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter>)\\s*$`, 'i');
+  let pm;
+  while ((pm = paramRe.exec(body)) !== null) {
+    const valueStart = pm.index + pm[0].length;
+    const nextParam = nextParamRe.exec(body.slice(valueStart));
+    const valueEnd = nextParam ? valueStart + nextParam.index : body.length;
+    let value = body.slice(valueStart, valueEnd).replace(trailingTagRe, '');
+    const attrs = pm[2] || '';
+    // string="true" means the payload is raw text; anything else is JSON.
+    if (!/string="true"/i.test(attrs)) {
+      try { value = JSON.parse(value); } catch (e) { /* keep raw text */ }
+    }
+    params[pm[1]] = value;
+    paramRe.lastIndex = valueEnd;
+    if (valueEnd >= body.length) break;
+  }
+
+  return { toolName, params, complete: !!closeMatch };
+}
+
+function dsmlParamsToTool(toolName, params) {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      if (params[key] !== undefined && params[key] !== null) return params[key];
+    }
+    return undefined;
+  };
+  const name = String(toolName || '').toLowerCase();
+
+  switch (name) {
+    case 'write':
+    case 'write_file':
+    case 'create':
+      return { tool: 'write', path: pick('path', 'file', 'filename'), content: pick('content', 'text', 'body') ?? '' };
+    case 'read':
+    case 'read_file':
+      return {
+        tool: 'read',
+        path: pick('path', 'file'),
+        offset: parseInt(pick('offset') ?? '1', 10) || 1,
+        limit: parseInt(pick('limit') ?? '2000', 10) || 2000
+      };
+    case 'edit':
+    case 'str_replace':
+    case 'replace':
+      return {
+        tool: 'edit',
+        path: pick('path', 'file'),
+        old_str: pick('old_str', 'oldStr', 'old_string') ?? '',
+        new_str: pick('new_str', 'newStr', 'new_string') ?? ''
+      };
+    case 'bash':
+    case 'shell':
+    case 'sh':
+    case 'terminal':
+      return { tool: 'bash', code: pick('code', 'command', 'cmd', 'script') ?? '' };
+    case 'python':
+    case 'python3':
+    case 'py':
+      return { tool: 'python', code: pick('code', 'script', 'source') ?? '' };
+    case 'js':
+    case 'javascript':
+      return { tool: 'js', code: pick('code', 'script', 'source') ?? '' };
+    case 'grep':
+    case 'search':
+      return {
+        tool: 'grep',
+        pattern: pick('pattern', 'query', 'regex') ?? '',
+        path: pick('path', 'dir', 'directory') ?? '/',
+        include: pick('include', 'glob') ?? ''
+      };
+    case 'glob':
+    case 'find':
+      return { tool: 'glob', pattern: pick('pattern', 'glob') ?? '*', path: pick('path', 'dir') ?? '/' };
+    case 'question':
+    case 'ask':
+      return { tool: 'question', question: pick('question', 'prompt') ?? '', options: pick('options') ?? [] };
+    default:
+      return { tool: name, ...params };
+  }
+}
+
+function parseToolCallTag(rawText) {
+  const src = stripInvisibleChars(rawText);
+  const openRe = /<tool_call(?:\s[^>]*)?>/i;
+  const open = openRe.exec(src);
+  if (!open) return null;
+
+  const bodyStart = open.index + open[0].length;
+  const closeIdx = src.toLowerCase().indexOf('</tool_call>', bodyStart);
+  const body = closeIdx === -1 ? src.slice(bodyStart) : src.slice(bodyStart, closeIdx);
+  const toolObj = extractToolCall(body);
+  if (!toolObj) return null;
+
+  // A call is only safe to run when the tag is closed or the JSON is balanced.
+  const balanced = extractBalancedJsonObjects(body).length > 0;
+  return { toolObj, raw: body, complete: closeIdx !== -1 || balanced };
+}
+
+/**
+ * Detect a tool call that is NOT inside a ```json:tool fence.
+ * Returns { toolObj, kind, complete } or null.
+ */
+function parseInlineToolCall(rawText) {
+  const dsml = parseDsmlToolCall(rawText);
+  if (dsml && dsml.toolName) {
+    const toolObj = validateToolObject(dsmlParamsToTool(dsml.toolName, dsml.params));
+    if (toolObj && !toolObj.__parseError) {
+      return { toolObj, kind: 'dsml', complete: dsml.complete };
+    }
+  }
+  const tag = parseToolCallTag(rawText);
+  if (tag) {
+    return { toolObj: validateToolObject(tag.toolObj), kind: 'tool_call', complete: tag.complete };
+  }
+  return null;
+}
+
+/** Deepest element that fully contains the given needle. */
+function findDeepestElementWith(root, needle) {
+  if (!root || !needle) return null;
+  let best = null;
+  root.querySelectorAll('p, pre, div, span, code').forEach((el) => {
+    const text = el.textContent || '';
+    if (!text.includes(needle)) return;
+    if (el.querySelector('p, pre, div, span, code')) return; // a child matches too -> not the deepest
+    best = el;
+  });
+  return best;
+}
+
+/**
+ * Climb to the element that carries the whole call (the deepest match is often
+ * a single <span> around the opening tag). Never climbs past the message root.
+ */
+function climbToCallHost(el, msg, marker) {
+  let node = el;
+  while (node && node !== msg) {
+    const parent = node.parentElement;
+    if (!parent || parent === msg) break;
+    if ((parent.textContent || '').includes(marker)) { node = parent; continue; }
+    break;
+  }
+  return node;
+}
+
+/** Hide the raw markup of an inline tool call (it is replaced by the tool card). */
+function hideInlineCallRegion(startEl) {
+  if (!startEl) return;
+  startEl.style.setProperty('display', 'none', 'important');
+  let sib = startEl.nextElementSibling;
+  let guard = 0;
+  while (sib && guard++ < 12) {
+    const text = (sib.textContent || '').trim();
+    const looksLikeCall = /"tool"\s*:/.test(text) || /DSML/i.test(text) || /parameter\s+name=/.test(text);
+    if (!looksLikeCall && text !== '') break;
+    sib.style.setProperty('display', 'none', 'important');
+    sib = sib.nextElementSibling;
+  }
+}
+
+/**
+ * Collect tool calls that the model emitted as plain text (no code fence).
+ * They are attached to the element that holds them, so the usual tool card
+ * replaces the raw markup.
+ */
+function collectInlineToolCalls() {
+  const out = [];
+  const messages = document.querySelectorAll('.ds-markdown');
+  messages.forEach((msg) => {
+    if (msg.closest('.fbb737a4')) return;              // user bubbles never hold tool calls
+    const raw = msg.innerText || '';
+    if (!raw) return;
+    if (!/tool_call|DSML/i.test(raw)) return;
+
+    const parsed = parseInlineToolCall(raw);
+    if (!parsed || !parsed.complete) return;
+
+    const isDsml = parsed.kind === 'dsml';
+    const needle = isDsml
+      ? (raw.match(/<[^>]*DSML[^>]*>/i) || ['DSML'])[0].slice(0, 24)
+      : 'tool_call';
+    const marker = isDsml ? 'DSML' : '"tool"';
+
+    let el = findDeepestElementWith(msg, needle);
+    if (!el) el = msg;
+    if (el.closest('.md-code-block') || el.tagName.toLowerCase() === 'pre') return; // handled by the fenced path
+    el = climbToCallHost(el, msg, marker);
+    if (el.hasAttribute('data-du-rendered')) return;
+
+    out.push({ block: el, toolObj: parsed.toolObj, kind: parsed.kind });
+  });
+  return out;
+}
+
+async function executeToolBlock(block, codeText, toolObj, alreadyComplete) {
+  // Never execute a block that is still streaming.
+  if (!alreadyComplete) {
+    const readiness = isToolBlockReady(block, codeText);
+    if (readiness === false) {
+      renderStreamingToolCard(block, toolObj);
+      return;
+    }
+    if (readiness === 'incomplete') {
+      block.setAttribute('data-du-rendered', 'true');
+      const stuckWidget = renderOpenCode1to1(block, toolObj);
+      setOpenCodeOutput(stuckWidget, '⚠️ Блок не дописан: выполнение отменено, чтобы не записать обрезанный файл.\nОтправьте запрос ещё раз.');
+      duSendLog('tool-incomplete', { tool: toolObj.tool, chars: codeText.length, preview: codeText.slice(-80) });
+      return;
+    }
+  }
+
+  const blockHash = 'du_' + codeText.replace(/\s+/g, '').slice(0, 80);
+  const turnKey = getToolTurnKey(block);
+  const blockKey = `${turnKey}|${blockHash}`;
+
+  block.setAttribute('data-du-rendered', 'true');
+  const toolWidget = renderOpenCode1to1(block, toolObj);
+
+  // A malformed block must never reach the sandbox: writing an empty file and
+  // reporting success is worse than showing a visible parse error.
+  if (toolObj.__parseError) {
+    console.warn('[DeepUpgrade] Tool parse error:', toolObj.__parseError, '\nRaw block:\n' + codeText);
+    setOpenCodeOutput(toolWidget, `⚠️ ${toolObj.__parseError}\n\nИнструмент не выполнен, чтобы не повредить файлы.`);
+    return;
+  }
+
+  // Auto-execution requires the user to have sent a message in this page
+  // session (allowExecution). Agent mode alone must not re-run tool calls that
+  // were already in chat history when the page loaded.
+  const isAutoExecutionEligible = allowExecution && isAgentEnabled;
+
+  if (!isAutoExecutionEligible) {
+    setOpenCodeOutput(toolWidget, isAgentEnabled
+      ? 'Не выполнено: вызов найден в истории чата. Отправьте сообщение, чтобы запустить агента.'
+      : 'Не выполнено: включите Agent, чтобы разрешить выполнение инструментов.');
+    return;
+  }
+
+  if (executedTurns.has(turnKey) || !isLatestAssistantBlock(block)) {
+    // React re-render, reload, an old message, or a second tool block in the
+    // same answer: replay this block's cached result but never execute or send
+    // again.
+    const cached = findCachedOutput(blockKey);
+    setOpenCodeOutput(toolWidget, typeof cached === 'string'
+      ? cached
+      : (executedTurns.has(turnKey)
+        ? 'В этом сообщении уже выполнен другой инструмент — вызов пропущен.'
+        : 'Исторический вызов: повторно не выполняется.'));
+    duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey, latest: isLatestAssistantBlock(block) });
+    return;
+  }
+
+  markExecuted(turnKey);
+  duSendLog('tool-execute', { tool: toolObj.tool, turn: turnKey, chars: (toolObj.code || toolObj.content || '').length });
+
+  // If this is an interactive question tool, PAUSE loop and render interactive selection card
+  if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
+    renderInteractiveQuestionCard(toolWidget, toolObj);
+    return;
+  }
+
+  const res = await runInSandbox(toolObj);
+  const outputStr = typeof res.output === 'string' ? res.output : '';
+  setOpenCodeOutput(toolWidget, outputStr || '(no output)');
+
+  // Record what the sandbox actually returned. If this length is 0 the model
+  // text was extracted fine but the tool produced no output; the send log
+  // then shows whether the empty part is on the sandbox or on the send side.
+  markExecuted(turnKey, blockKey, outputStr);
+  duSendLog('tool-output', {
+    tool: toolObj.tool,
+    success: res.success !== false,
+    outLen: outputStr.length,
+    preview: outputStr.slice(0, 60)
+  });
+  if (outputStr.trim() === '') {
+    duSendLog('tool-output-EMPTY', { tool: toolObj.tool, note: 'sandbox returned no output' });
+  }
+
+  // Autonomous Multi-Turn ReAct loop:
+  // Allow the agent to call multiple tools sequentially if needed, or conclude when finished
+  const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${outputStr}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
+  sendSilentReply(reply);
+}
+
 function processToolCalls() {
   cleanAndUnifyChat();
 
   // Find all code blocks (strictly targeting container .md-code-block or standalone pre)
   const allBlocks = Array.from(document.querySelectorAll('.md-code-block, pre'));
-  if (allBlocks.length === 0) return;
+  const inlineCalls = collectInlineToolCalls();
+
+  if (allBlocks.length === 0 && inlineCalls.length === 0) return;
 
   allBlocks.forEach(async block => {
    try {
@@ -2809,96 +3184,23 @@ function processToolCalls() {
       return;
     }
 
-    // Never execute a block that is still streaming.
-    const readiness = isToolBlockReady(block, codeText);
-    if (readiness === false) {
-      renderStreamingToolCard(block, toolObj);
-      return;
-    }
-    if (readiness === 'incomplete') {
-      block.setAttribute('data-du-rendered', 'true');
-      const stuckWidget = renderOpenCode1to1(block, toolObj);
-      setOpenCodeOutput(stuckWidget, '⚠️ Блок не дописан: выполнение отменено, чтобы не записать обрезанный файл.\nОтправьте запрос ещё раз.');
-      duSendLog('tool-incomplete', { tool: toolObj.tool, chars: codeText.length, preview: codeText.slice(-80) });
-      return;
-    }
-
-    const blockHash = 'du_' + codeText.replace(/\s+/g, '').slice(0, 80);
-    const turnKey = getToolTurnKey(block);
-    const blockKey = `${turnKey}|${blockHash}`;
-
-    block.setAttribute('data-du-rendered', 'true');
-    const toolWidget = renderOpenCode1to1(block, toolObj);
-
-    // A malformed block must never reach the sandbox: writing an empty file and
-    // reporting success is worse than showing a visible parse error.
-    if (toolObj.__parseError) {
-      console.warn('[DeepUpgrade] Tool parse error:', toolObj.__parseError, '\nRaw block:\n' + codeText);
-      setOpenCodeOutput(toolWidget, `⚠️ ${toolObj.__parseError}\n\nИнструмент не выполнен, чтобы не повредить файлы.`);
-      return;
-    }
-
-    // Auto-execution requires the user to have sent a message in this page
-    // session (allowExecution). Agent mode alone must not re-run tool calls that
-    // were already in chat history when the page loaded.
-    const isAutoExecutionEligible = allowExecution && isAgentEnabled;
-
-    if (!isAutoExecutionEligible) {
-      setOpenCodeOutput(toolWidget, isAgentEnabled
-        ? 'Не выполнено: вызов найден в истории чата. Отправьте сообщение, чтобы запустить агента.'
-        : 'Не выполнено: включите Agent, чтобы разрешить выполнение инструментов.');
-      return;
-    }
-
-    if (executedTurns.has(turnKey) || !isLatestAssistantBlock(block)) {
-      // React re-render, reload, an old message, or a second tool block in the
-      // same answer: replay this block's cached result but never execute or send
-      // again.
-      const cached = findCachedOutput(blockKey);
-      setOpenCodeOutput(toolWidget, typeof cached === 'string'
-        ? cached
-        : (executedTurns.has(turnKey)
-          ? 'В этом сообщении уже выполнен другой инструмент — вызов пропущен.'
-          : 'Исторический вызов: повторно не выполняется.'));
-      duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey, latest: isLatestAssistantBlock(block) });
-      return;
-    }
-
-    markExecuted(turnKey);
-    duSendLog('tool-execute', { tool: toolObj.tool, turn: turnKey, chars: (toolObj.code || toolObj.content || '').length });
-
-    // If this is an interactive question tool, PAUSE loop and render interactive selection card
-    if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
-      renderInteractiveQuestionCard(toolWidget, toolObj);
-      return;
-    }
-
-    const res = await runInSandbox(toolObj);
-    const outputStr = typeof res.output === 'string' ? res.output : '';
-    setOpenCodeOutput(toolWidget, outputStr || '(no output)');
-
-    // Record what the sandbox actually returned. If this length is 0 the model
-    // text was extracted fine but the tool produced no output; the send log
-    // then shows whether the empty part is on the sandbox or on the send side.
-    markExecuted(turnKey, blockKey, outputStr);
-    duSendLog('tool-output', {
-      tool: toolObj.tool,
-      success: res.success !== false,
-      outLen: outputStr.length,
-      preview: outputStr.slice(0, 60)
-    });
-    if (outputStr.trim() === '') {
-      duSendLog('tool-output-EMPTY', { tool: toolObj.tool, note: 'sandbox returned no output' });
-    }
-
-    // Autonomous Multi-Turn ReAct loop:
-    // Allow the agent to call multiple tools sequentially if needed, or conclude when finished
-    const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${outputStr}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
-    sendSilentReply(reply);
+    await executeToolBlock(block, codeText, toolObj, false);
    } catch (err) {
     console.error('[DeepUpgrade] tool block processing failed:', err);
     duSendLog('tool-error', { error: String((err && err.message) || err) });
    }
+  });
+
+  inlineCalls.forEach(async ({ block, toolObj, kind }) => {
+    try {
+      const raw = block.innerText || '';
+      hideInlineCallRegion(block);
+      duSendLog('tool-inline-format', { kind, tool: toolObj.tool });
+      await executeToolBlock(block, raw, toolObj, true);
+    } catch (err) {
+      console.error('[DeepUpgrade] inline tool call processing failed:', err);
+      duSendLog('tool-error', { error: String((err && err.message) || err) });
+    }
   });
 }
 
