@@ -259,14 +259,18 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       if (this.mode !== 'opfs') {
         return [...this.memory.values()].map((f) => ({ ...f }));
       }
+      // Wait for pending writes. A file that is being replaced at this very
+      // moment cannot be read (Chrome throws NotReadableError), and the file
+      // would silently be missing from the snapshot the sandbox boots with -
+      // which is exactly how a skill prompt stops being applied.
+      await this.queue.catch(() => {});
       const out = [];
       const walk = async (dirHandle, prefix) => {
         for await (const [name, handle] of dirHandle.entries()) {
           const path = `${prefix}/${name}`;
           if (handle.kind === 'file') {
             try {
-              const file = await handle.getFile();
-              const bytes = new Uint8Array(await file.arrayBuffer());
+              const bytes = await this.readBytesWithRetry(handle);
               const text = decodeUtf8OrNull(bytes);
               out.push({
                 path,
@@ -274,7 +278,7 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
                 // exact bytes (charts, images) after a reload.
                 content: text !== null ? text : bytesToBase64(bytes),
                 encoding: text !== null ? 'utf8' : 'base64',
-                mtime: file.lastModified || Date.now()
+                mtime: Date.now()
               });
             } catch (err) {
               if (err && err.name !== 'NotFoundError') console.warn('[DeepUpgrade] VFS read failed:', path, err.message);
@@ -290,6 +294,54 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
         console.warn('[DeepUpgrade] VFS listing failed:', err && err.message);
       }
       return out;
+    }
+
+    /**
+     * Read an OPFS file. A file that is being rewritten at the same time is
+     * temporarily unreadable, so a few short retries are needed instead of
+     * dropping the file from the result.
+     */
+    async readBytesWithRetry(handle) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          const file = await handle.getFile();
+          return new Uint8Array(await file.arrayBuffer());
+        } catch (err) {
+          lastError = err;
+          if (err && err.name === 'NotFoundError') break;
+          await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+        }
+      }
+      throw lastError;
+    }
+
+    /**
+     * Write bytes to an OPFS file.
+     *
+     * Two rules matter here: an abandoned writable keeps the file locked
+     * forever (every later read fails), and a file that is currently locked by
+     * another writer cannot be opened for writing. Both are handled: the
+     * writable is always aborted on failure and a locked file is retried.
+     */
+    async writeBytesWithRetry(handle, bytes) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let writable = null;
+        try {
+          writable = await handle.createWritable();
+          await writable.write(bytes);
+          await writable.close();
+          return;
+        } catch (err) {
+          lastError = err;
+          if (writable) {
+            try { await writable.abort(); } catch (e) { /* already closed */ }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+        }
+      }
+      throw lastError;
     }
 
     async dirFor(path, create) {
@@ -355,14 +407,13 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       try {
         const { dir, fileName } = await this.dirFor(normalized, false);
         const handle = await dir.getFileHandle(fileName);
-        const file = await handle.getFile();
-        const bytes = new Uint8Array(await file.arrayBuffer());
+        const bytes = await this.readBytesWithRetry(handle);
         const text = decodeUtf8OrNull(bytes);
         return {
           content: text !== null ? text : bytesToBase64(bytes),
           encoding: text !== null ? 'utf8' : 'base64',
           size: bytes.byteLength,
-          mtime: file.lastModified || Date.now()
+          mtime: Date.now()
         };
       } catch (err) {
         return null;
@@ -395,9 +446,7 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       }
       const { dir, fileName } = await this.dirFor(path, true);
       const handle = await dir.getFileHandle(fileName, { create: true });
-      const writable = await handle.createWritable();
-      await writable.write(bytes);
-      await writable.close();
+      await this.writeBytesWithRetry(handle, bytes);
     }
 
     async removeEntry(path) {
@@ -429,6 +478,16 @@ console.log('%c[DeepUpgrade] OpenCode Engine v7.0 Active', 'background: #3b82f6;
       const run = this.queue.then(job, job);
       this.queue = run.catch(() => {});
       return run;
+    }
+
+    // Queued variants for callers outside the mutation pipeline: they must not
+    // run while a sandbox mutation is writing the same tree.
+    writeFileQueued(path, content, encoding) {
+      return this.enqueue(() => this.writeFile(path, content, encoding));
+    }
+
+    removeEntryQueued(path) {
+      return this.enqueue(() => this.removeEntry(path));
     }
 
     apply(message) {
@@ -3868,7 +3927,7 @@ async function duStoreUploadedFile(file) {
   // 1. Durable host copy
   const store = duVfsStore();
   if (store) {
-    await store.writeFile(vfsPath, text !== null ? text : base64, text !== null ? 'utf8' : 'base64');
+    await store.writeFileQueued(vfsPath, text !== null ? text : base64, text !== null ? 'utf8' : 'base64');
   }
 
   // 2. Sandbox copy, so the agent can read the file right away
@@ -3962,7 +4021,7 @@ async function duDeleteFile(path) {
   const store = duVfsStore();
   if (store) {
     try {
-      await store.removeEntry(path);
+      await store.removeEntryQueued(path);
     } catch (err) {
       console.warn('[DeepUpgrade] Delete failed:', path, err);
     }
