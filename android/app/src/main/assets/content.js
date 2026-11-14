@@ -1983,7 +1983,10 @@ const EXECUTED_BLOCKS_KEY = 'du_executed_tool_blocks_v3';
 
 function readJsonStorage(key, fallback) {
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(key) || '');
+    const raw = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(key)) ||
+                (typeof localStorage !== 'undefined' && localStorage.getItem(key));
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
     return parsed ?? fallback;
   } catch (e) {
     return fallback;
@@ -2110,10 +2113,77 @@ function markExecuted(turnKey, blockKey, output) {
   }
 
   try {
-    sessionStorage.setItem(EXECUTED_KEY, JSON.stringify([...executedTurns]));
-    sessionStorage.setItem(EXECUTED_OUTPUT_KEY, JSON.stringify([...executedOutputs].slice(-300)));
-    sessionStorage.setItem(EXECUTED_BLOCKS_KEY, JSON.stringify([...executedBlocks].slice(-300)));
+    const turnsJson = JSON.stringify([...executedTurns]);
+    const outJson = JSON.stringify([...executedOutputs].slice(-300));
+    const blocksJson = JSON.stringify([...executedBlocks].slice(-300));
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(EXECUTED_KEY, turnsJson);
+      sessionStorage.setItem(EXECUTED_OUTPUT_KEY, outJson);
+      sessionStorage.setItem(EXECUTED_BLOCKS_KEY, blocksJson);
+    }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(EXECUTED_KEY, turnsJson);
+      localStorage.setItem(EXECUTED_OUTPUT_KEY, outJson);
+      localStorage.setItem(EXECUTED_BLOCKS_KEY, blocksJson);
+    }
   } catch (e) { /* storage quota - dedupe still works in memory */ }
+}
+
+function extractSandboxOutput(text) {
+  if (!text) return null;
+  const re = /\[SANDBOX OUTPUT(?:\s*\([^)]+\))?\]:\s*\n?([\s\S]*?)(?:\n\n(?:Continue with your next tool call|Please proceed|Provide your final)|\s*$)/;
+  const m = text.match(re);
+  if (m) {
+    return m[1].replace(/\n+$/, '');
+  }
+  const mErr = text.match(/\[SANDBOX ERROR\]:\s*([\s\S]*?)(?:\n\nPlease fix|\s*$)/);
+  if (mErr) {
+    return mErr[1].replace(/\n+$/, '');
+  }
+  return null;
+}
+
+function findHistoricalOutputFromDom(block, toolObj) {
+  if (!block || typeof document === 'undefined') return null;
+  const currentMsg = block.closest('.ds-message, div._9663006, [data-virtual-list-item-key]');
+  if (!currentMsg) return null;
+
+  let el = currentMsg.nextElementSibling;
+  while (el) {
+    const text = el.textContent || '';
+    if (text.includes('[SANDBOX OUTPUT')) {
+      const out = extractSandboxOutput(text);
+      if (out !== null) return out;
+    }
+    if (text.includes('[USER ANSWER]:')) {
+      const m = text.match(/\[USER ANSWER\]:\s*"([^"]+)"/);
+      if (m) return `Выбран ответ: ${m[1]}`;
+    }
+    if (el.querySelector && el.querySelector('.ds-markdown') && el !== currentMsg) {
+      break;
+    }
+    el = el.nextElementSibling;
+  }
+
+  const allBubbles = document.querySelectorAll('.ds-message, div._9663006, [data-virtual-list-item-key]');
+  for (const b of allBubbles) {
+    if (currentMsg.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      const text = b.textContent || '';
+      if (text.includes('[SANDBOX OUTPUT')) {
+        const out = extractSandboxOutput(text);
+        if (out !== null) return out;
+      }
+      if (text.includes('[USER ANSWER]:')) {
+        const m = text.match(/\[USER ANSWER\]:\s*"([^"]+)"/);
+        if (m) return `Выбран ответ: ${m[1]}`;
+      }
+      if (b.querySelector && b.querySelector('.ds-markdown') && b !== currentMsg) {
+        break;
+      }
+    }
+  }
+
+  return null;
 }
 // </du-tool-dedupe>
 
@@ -3970,21 +4040,30 @@ async function executeToolBlock(block, codeText, toolObj, alreadyComplete, lates
     return;
   }
 
+  // Check if we already have output for this block:
+  // - from memory / storage cache (sessionStorage or localStorage)
+  // - or directly extracted from the following [SANDBOX OUTPUT] in chat history DOM
+  let cached = findCachedOutput(blockKey);
+  if (typeof cached !== 'string') {
+    cached = findHistoricalOutputFromDom(block, toolObj);
+    if (typeof cached === 'string') {
+      markExecuted(turnKey, blockKey, cached);
+    }
+  }
+
+  if (typeof cached === 'string') {
+    setOpenCodeOutput(toolWidget, cached || '(no output)');
+    if (toolObj.tool === 'question' || toolObj.tool === 'ask') {
+      renderInteractiveQuestionCard(toolWidget, toolObj, true);
+    }
+    duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey });
+    return;
+  }
+
   if (!isAutoExecutionEligible) {
     setOpenCodeOutput(toolWidget, isAgentEnabled
       ? 'Не выполнено: это сообщение из истории чата. Отправьте новое сообщение, чтобы запустить агента.'
       : 'Не выполнено: включите Agent, чтобы разрешить выполнение инструментов.');
-    return;
-  }
-
-  if (executedBlocks.has(blockHash)) {
-    // The exact same block already ran (React re-render or a second pass).
-    // Replay its cached output, never execute it again.
-    const cached = findCachedOutput(blockKey);
-    setOpenCodeOutput(toolWidget, typeof cached === 'string'
-      ? cached
-      : 'Этот вызов уже выполнен.');
-    duSendLog('tool-skip-already-executed', { tool: toolObj.tool, turn: turnKey });
     return;
   }
 

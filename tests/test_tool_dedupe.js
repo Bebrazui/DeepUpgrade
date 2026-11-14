@@ -176,12 +176,34 @@ async function main() {
         hasA: executedTurns.has('turn-a'),
         outputA: executedOutputs.get('block-a'),
         persisted: JSON.parse(sessionStorage.getItem(EXECUTED_KEY) || '[]'),
-        outputs: JSON.parse(sessionStorage.getItem(EXECUTED_OUTPUT_KEY) || '[]')
+        outputs: JSON.parse(sessionStorage.getItem(EXECUTED_OUTPUT_KEY) || '[]'),
+        localOutputs: JSON.parse(localStorage.getItem(EXECUTED_OUTPUT_KEY) || '[]')
       };
     });
     check('execution is recorded per turn', storage.hasA === true, JSON.stringify(storage));
     check('output is cached per block', storage.outputA === 'output-a', JSON.stringify(storage));
     check('execution is persisted for reloads', storage.persisted.includes('turn-a'), JSON.stringify(storage));
+    check('execution is persisted to localStorage', Array.isArray(storage.localOutputs) && storage.localOutputs.some(item => item[0] === 'block-a'), JSON.stringify(storage));
+
+    console.log('history DOM output extraction');
+    const domTest = await page.evaluate(() => {
+      const msg1 = document.createElement('div');
+      msg1.className = 'ds-message';
+      const block = document.createElement('div');
+      block.className = 'md-code-block';
+      block.textContent = '{"tool":"bash","code":"echo hi"}';
+      msg1.appendChild(block);
+      document.body.appendChild(msg1);
+
+      const msg2 = document.createElement('div');
+      msg2.className = 'ds-message';
+      msg2.textContent = '[SANDBOX OUTPUT (bash)]:\nhi from sandbox\n\nContinue with your next tool call if more steps are needed, or provide your final answer.';
+      document.body.appendChild(msg2);
+
+      const extracted = findHistoricalOutputFromDom(block, { tool: 'bash' });
+      return { extracted };
+    });
+    check('findHistoricalOutputFromDom extracts output from following bubble', domTest.extracted === 'hi from sandbox', JSON.stringify(domTest));
   } finally {
     await browser.close();
     server.close();
