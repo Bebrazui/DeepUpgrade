@@ -653,8 +653,8 @@ ${isPowershell ? `- IMPORTANT FOR TERMINAL & DAEMONS:
     This lets the server run continuously without hanging your response.` : '- IMPORTANT FOR TERMINAL: Use POSIX bash commands. For background servers, append " &" to detach.'}`;
   }
 
-  return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]
-You are DeepUpgrade, an autonomous AI software engineer and terminal runtime environment powered by OpenCode architecture.
+  return `[SYSTEM CAPABILITY: DEEPSEEK LOCAL AGENT RUNTIME ACTIVE]
+You are DeepSeek, operating with the DeepUpgrade local execution environment enabled for this session.
 ${envHeader}
 
 ═══════════════════════════════════════════════════════════
@@ -1133,11 +1133,8 @@ async function duInstallPluginFromZip(arrayBuffer, originalFileName = 'plugin.zi
     throw new Error(`Файл точки входа ${entryFileName} пуст или является бинарным.`);
   }
 
-  try {
-    new Function('DeepUpgrade', entryFile.text);
-  } catch (syntaxErr) {
-    throw new Error(`Синтаксическая ошибка в ${entryFileName}: ${syntaxErr.message}`);
-  }
+  // Note: Syntax validation via 'new Function' is intentionally omitted here because
+  // host page CSP forbids 'unsafe-eval'. Full evaluation occurs inside the sandboxed runner.html iframe.
 
   const name = manifest.name || originalFileName.replace(/\.zip$/i, '') || 'Unnamed Plugin';
   const desc = manifest.description || `ZIP-плагин (${Object.keys(files).length} файлов)`;
@@ -1441,21 +1438,21 @@ function reloadAllPlugins() {
   const plugins = getStoredPlugins();
   for (const p of plugins) {
     if (!p.enabled) continue;
+    duMountPluginToVfs(p);
+  }
+
+  // Dynamic code evaluation ('new Function') violates DeepSeek host page CSP ('unsafe-eval' prohibition).
+  // Delegate plugin evaluation and execution to the sandboxed runner.html iframe, which has its own sandbox CSP.
+  if (!sandboxIframe || !sandboxIframe.parentNode) {
+    initSandboxIframe();
+  }
+  if (sandboxIframe && sandboxIframe.contentWindow) {
     try {
-      const runner = new Function('DeepUpgrade', p.code);
-      runner(createPluginApi(p));
-      duMountPluginToVfs(p);
-    } catch (err) {
-      console.error(`[DeepUpgrade Plugin Error: ${p.name}]`, err);
-    }
-  }
-  if (typeof KNOWN_TOOL_NAMES !== 'undefined') {
-    for (const name of pluginTools.keys()) {
-      KNOWN_TOOL_NAMES.add(name);
-    }
-  }
-  if (typeof publishDirectiveToMainWorld === 'function') {
-    publishDirectiveToMainWorld(true);
+      sandboxIframe.contentWindow.postMessage({
+        type: 'DU_REGISTER_PLUGINS',
+        plugins: plugins.filter(p => p.enabled)
+      }, '*');
+    } catch (e) {}
   }
 }
 
@@ -1720,6 +1717,7 @@ function initSandboxIframe() {
       type: 'DU_SET_PERSISTENT_PACKAGES',
       packages: savedPackages
     }, '*');
+    reloadAllPlugins();
   };
   (document.body || document.documentElement).appendChild(sandboxIframe);
 
@@ -1741,6 +1739,38 @@ function initSandboxIframe() {
       handleVfsBoot(ev);
     } else if (ev.data && ev.data.type === 'DU_VFS_MUTATE') {
       handleVfsMutation(ev, ev.data);
+    } else if (ev.data && ev.data.type === 'DU_PLUGINS_REGISTERED') {
+      const { tools } = ev.data;
+      if (Array.isArray(tools)) {
+        for (const t of tools) {
+          pluginTools.set(t.name, {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters,
+            icon: t.icon,
+            execute: async (args) => {
+              const res = await runInSandbox({ tool: t.name, args });
+              return res.output || res;
+            }
+          });
+          if (typeof KNOWN_TOOL_NAMES !== 'undefined') KNOWN_TOOL_NAMES.add(t.name);
+        }
+        if (typeof publishDirectiveToMainWorld === 'function') {
+          publishDirectiveToMainWorld(true);
+        }
+      }
+    } else if (ev.data && ev.data.type === 'DU_INJECT_CSS') {
+      const { pluginId, css } = ev.data;
+      if (pluginId && css) {
+        const styleId = `du-plugin-style-${pluginId}`;
+        let styleEl = document.getElementById(styleId);
+        if (!styleEl) {
+          styleEl = document.createElement('style');
+          styleEl.id = styleId;
+          document.head.appendChild(styleEl);
+        }
+        styleEl.textContent = css;
+      }
     }
   });
 }

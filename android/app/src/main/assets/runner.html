@@ -3640,6 +3640,75 @@
     }
     // </du-posix-shell>
 
+    // 4b. SANDBOX PLUGIN RUNTIME (Exempt from host page CSP restrictions)
+    const sandboxPluginTools = new Map();
+
+    window.addEventListener('message', async (ev) => {
+      if (!ev.data || ev.data.type !== 'DU_REGISTER_PLUGINS') return;
+      sandboxPluginTools.clear();
+      const plugins = ev.data.plugins || [];
+      const registeredMeta = [];
+
+      for (const plugin of plugins) {
+        try {
+          const pluginFiles = plugin.files || {};
+          const getAsset = (relPath, format = 'auto') => {
+            const cleanPath = String(relPath || '').replace(/^[./\\]+/, '');
+            const entry = pluginFiles[cleanPath] || pluginFiles[relPath];
+            if (!entry) return null;
+            if (format === 'text') return entry.text || '';
+            if (format === 'base64') return entry.base64 || '';
+            return entry.isBinary ? entry.base64 : entry.text;
+          };
+
+          const requireModule = (relPath) => {
+            const cleanPath = String(relPath || '').replace(/^[./\\]+/, '');
+            const targetPath = cleanPath.endsWith('.js') ? cleanPath : cleanPath + '.js';
+            const entry = pluginFiles[targetPath] || pluginFiles[cleanPath];
+            if (!entry) throw new Error(`Cannot find module '${relPath}' in ZIP assets`);
+            const module = { exports: {} };
+            const fn = new Function('module', 'exports', 'require', 'DeepUpgrade', entry.text);
+            fn(module, module.exports, requireModule, api);
+            return module.exports;
+          };
+
+          const api = {
+            plugin,
+            files: pluginFiles,
+            getAsset,
+            getFile: getAsset,
+            require: requireModule,
+            injectCSS: (css) => {
+              window.parent.postMessage({ type: 'DU_INJECT_CSS', pluginId: plugin.id, css }, '*');
+            },
+            registerTool: (def) => {
+              if (!def || !def.name) return;
+              sandboxPluginTools.set(def.name, def);
+              registeredMeta.push({
+                name: def.name,
+                description: def.description || 'Custom plugin tool',
+                parameters: def.parameters || def.params || null,
+                icon: def.icon || 'plugin'
+              });
+            },
+            defineTool: (def) => api.registerTool(def),
+            tool: (def) => api.registerTool(def),
+            fetch: proxyFetch
+          };
+
+          const runner = new Function('DeepUpgrade', plugin.code);
+          runner(api);
+        } catch (err) {
+          console.error(`[DeepUpgrade Sandbox Plugin Error: ${plugin.name}]`, err);
+        }
+      }
+
+      window.parent.postMessage({
+        type: 'DU_PLUGINS_REGISTERED',
+        tools: registeredMeta
+      }, '*');
+    });
+
     // 5. MESSAGE HANDLER FOR CONTENT SCRIPT
     window.addEventListener('message', async (event) => {
       const { id, type, tool, code } = event.data;
@@ -3652,6 +3721,13 @@
       let output = '';
 
       try {
+        if (sandboxPluginTools.has(tool)) {
+          const pTool = sandboxPluginTools.get(tool);
+          const pRes = await pTool.execute(event.data.args || event.data);
+          output = typeof pRes === 'string' ? pRes : JSON.stringify(pRes, null, 2);
+          window.parent.postMessage({ id, success: true, output, execTimeMs: performance.now() - startTime }, '*');
+          return;
+        }
         if ((tool === 'bash' || tool === 'python' || tool === 'py' || tool === 'js') &&
             (typeof code !== 'string' || code.trim() === '')) {
           throw new Error(`Tool "${tool}" requires a non-empty "code" field (the tool block was not parsed correctly).`);
