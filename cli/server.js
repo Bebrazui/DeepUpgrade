@@ -39,16 +39,25 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 const VALUE_FLAGS = new Set([
   'token', 'cookie', 'base-url', 'timeout', 'threads', 'port', 'host', 'api-key',
-  'browser', 'profile', 'login-timeout', 'model', 'session'
+  'browser', 'profile', 'login-timeout', 'model', 'session', 'mode', 'account',
+  'transport', 'curl-path', 'impersonate', 'chrome-version', 'accept-language'
 ]);
 
 const HELP = `
-DeepUpgrade local API — OpenAI-совместимый сервер поверх direct API DeepSeek.
+DeepUpgrade local API — OpenAI-совместимый сервер поверх DeepSeek.
 
 Использование:
   node cli/server.js
   node cli/server.js --port 8787 --api-key secret
   node cli/server.js --token <token> --base-url https://chat.deepseek.com
+  node cli/server.js --mode browser --account <id>
+
+Режимы (--mode):
+  direct   Прямой HTTP API: PoW + ваши заголовки. Токен из --token/кэша/браузера.
+  browser  Через настоящий веб-клиент: запрос печатается в композер Chrome,
+           поэтому shumei/x-hif-* заголовки генерирует сама страница.
+           Нужен аккаунт из дашборда (--account). Один активный веб-чат
+           на аккаунт; локальные /v1/chats и /v1/models тоже работают.
 
 Маршруты:
   POST /v1/chat/completions     OpenAI Chat Completions (stream: true/false)
@@ -69,6 +78,9 @@ DeepUpgrade local API — OpenAI-совместимый сервер повер�
       --api-key <key>       Требовать Authorization: Bearer <key>
                             (или env DU_API_KEY).
       --model <name>        Модель по умолчанию (deepseek-chat).
+      --mode <direct|browser> Как отправлять запросы (по умолчанию direct).
+      --account <id>        Аккаунт дашборда для --mode browser.
+      --window              Показать окно браузера в режиме browser.
       --timeout <сек>       Таймаут запросов к DeepSeek, 0 = без таймаута.
       --threads <n>         Потоков для PoW.
   -t, --token <token>       Bearer-токен (или env DEEPSEEK_TOKEN).
@@ -77,10 +89,18 @@ DeepUpgrade local API — OpenAI-совместимый сервер повер�
       --login               Принудительно перечитать токен из браузера.
       --browser <name>      chrome | edge | brave | chromium | vivaldi | default.
       --profile <sel>       Профиль браузера.
+      --new-profile         Чистый временный профиль (вход в другой аккаунт).
       --login-timeout <сек> Сколько ждать входа (по умолчанию 180).
       --no-browser          Не открывать браузер.
       --no-cache            Не читать/не писать кэш токена.
       --verbose             Подробный лог запросов.
+      --transport <type>     native | tls (по умолчанию: native). tls повторяет
+                            браузерный TLS/HTTP2-отпечаток через curl_cffi.
+      --curl-path <path>     Бинарник curl-impersonate. Если не задан, TLS
+                            работает через Python-пакет curl_cffi.
+      --impersonate <ver>    Браузер для имитации (по умолчанию: chrome131).
+      --chrome-version <ver> Версия Chrome для User-Agent (по умолчанию: 131.0.0.0).
+      --accept-language <lang> Язык для заголовков (по умолчанию: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7).
   -h, --help                Эта справка.
 
 Чат в запросе:
@@ -106,7 +126,12 @@ function clientFromCtx(ctx) {
     token: ctx.token,
     cookie: ctx.cookie,
     timeoutMs: ctx.timeoutMs,
-    threads: ctx.threads
+    threads: ctx.threads,
+    transport: ctx.transport || 'native',
+    curlPath: ctx['curl-path'],
+    impersonate: ctx.impersonate || 'chrome131',
+    chromeVersion: ctx['chrome-version'] || '131.0.0.0',
+    acceptLanguage: ctx['accept-language'] || 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
   });
 }
 
@@ -201,7 +226,7 @@ function lastUserMessage(messages) {
  * user turn, a tool result, or a batch of parallel tool results. DeepSeek keeps
  * the earlier history server-side, so only this tail must be sent.
  */
-function pendingTurnText(messages) {
+function pendingTurnMessages(messages) {
   let lastAssistant = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i] && messages[i].role === 'assistant') {
@@ -209,10 +234,13 @@ function pendingTurnText(messages) {
       break;
     }
   }
-
-  const pending = messages
+  return messages
     .slice(lastAssistant + 1)
     .filter((m) => m && m.role !== 'system' && m.role !== 'developer');
+}
+
+function pendingTurnText(messages) {
+  const pending = pendingTurnMessages(messages);
   if (pending.length === 0) return '';
 
   const toolNames = new Map();
@@ -242,8 +270,9 @@ function pendingTurnText(messages) {
  * tool output); otherwise the whole conversation is sent as a transcript so
  * stateless clients still work.
  */
-function messagesToPrompt(messages, boundToSession) {
-  const system = extractSystem(messages);
+function messagesToPrompt(messages, boundToSession, options) {
+  const opts = options || {};
+  const system = opts.system !== undefined ? opts.system : extractSystem(messages);
   const turns = messages.filter((m) => m && m.role !== 'system' && m.role !== 'developer');
   const last = lastUserMessage(turns);
   const lastText = last ? contentText(last.content).trim() : '';
@@ -295,47 +324,80 @@ function modelSupportsThinking(model) {
   return name.includes('reasoner') || name.includes('reason') || name.includes('r1');
 }
 
+/*
+ * DeepSeek emits tool calls inline as DSML markup and is not consistent about
+ * its spelling. In practice it mixes all of:
+ *   - ASCII `|` with fullwidth `｜`
+ *   - one, two or more separators (`<|DSML||calls>`, `<||DSML||calls>`)
+ *   - spaces around every separator (`< | | DSML | | calls>`)
+ *   - `calls`, `function_calls` or `tool_calls`
+ *
+ * Harness clients only understand native `tool_calls`, so leaked markup ends up
+ * in the transcript as the model's answer. Every tag head is therefore rewritten
+ * to one canonical form first; the regexes below only parse that form.
+ */
+const DSML_TAG_HEAD_RE = /<\s*(\/?)\s*(?:[|｜]\s*)+DSML\s*(?:[|｜]\s*)+/gi;
+const DSML_START_RE = /<\s*\/?\s*(?:[|｜]\s*)+DSML/i;
+const DSML_CALLS_BLOCK_RE =
+  /<\|DSML\|\|(?:(?:function_|tool_)?calls)\s*>([\s\S]*?)<\/\|DSML\|\|(?:(?:function_|tool_)?calls)\s*>/i;
+const DSML_INVOKE_RE = /<\|DSML\|\|invoke\s*([^>]*)>([\s\S]*?)<\/\|DSML\|\|invoke\s*>/gi;
+const DSML_PARAMETER_RE = /<\|DSML\|\|parameter\s*([^>]*)>([\s\S]*?)<\/\|DSML\|\|parameter\s*>/gi;
+const ATTRIBUTE_RE = /([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+
 /**
  * Extracts DeepSeek DSML tool calls from completion text:
- * < | DSML | | calls >
- *   < | DSML | | invoke name="execute">
- *     < | DSML | | parameter name="code" string="true">...</ | DSML | | parameter>
- *   </ | DSML | | invoke>
- * </ | DSML | | calls>
+ * <|DSML||calls>
+ *   <|DSML||invoke name="execute">
+ *     <|DSML||parameter name="code" string="true">...</|DSML||parameter>
+ *   </|DSML||invoke>
+ * </|DSML||calls>
+ *
+ * Returns content before and after the block separately, so a streaming
+ * caller can flush the tail without repeating what it already sent.
  */
-function parseDsmlToolCalls(text) {
-  if (!text || typeof text !== 'string') return null;
-  const callsRegex = /<\s*\|\s*DSML\s*\|\s*\|\s*calls\s*>([\s\S]*?)<\s*\/\s*\|\s*DSML\s*\|\s*\|\s*calls\s*>/i;
-  const match = callsRegex.exec(text);
-  if (!match) return null;
+function normalizeDsml(text) {
+  return String(text == null ? '' : text)
+    .replace(DSML_TAG_HEAD_RE, (match, slash) => '<' + (slash || '') + '|DSML||');
+}
 
-  const contentBefore = text.slice(0, match.index).trim();
-  const contentAfter = text.slice(match.index + match[0].length).trim();
-  const cleanContent = [contentBefore, contentAfter].filter(Boolean).join('\n\n');
+/** Reads `name="x" string="true"` style attributes of a DSML tag. */
+function parseAttributes(source) {
+  const attrs = {};
+  ATTRIBUTE_RE.lastIndex = 0;
+  let match;
+  while ((match = ATTRIBUTE_RE.exec(source || '')) !== null) {
+    const value = match[2] !== undefined ? match[2]
+      : match[3] !== undefined ? match[3] : match[4];
+    attrs[match[1].toLowerCase()] = value;
+  }
+  return attrs;
+}
 
-  const block = match[1];
-  const invokeRegex = /<\s*\|\s*DSML\s*\|\s*\|\s*invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\s*\/\s*\|\s*DSML\s*\|\s*\|\s*invoke\s*>/gi;
-  const paramRegex = /<\s*\|\s*DSML\s*\|\s*\|\s*parameter\s+name=["']([^"']+)["'](?:\s+string=["']([^"']+)["'])?\s*>([\s\S]*?)<\s*\/\s*\|\s*DSML\s*\|\s*\|\s*parameter\s*>/gi;
+function argumentValue(raw, stringFlag) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (stringFlag === 'true') return text;
+  try { return JSON.parse(text); } catch (e) { return text; }
+}
 
+/** Parses canonical `<|DSML||invoke>` blocks into OpenAI tool calls. */
+function extractInvocations(block) {
   const toolCalls = [];
+  let index = 0;
+  DSML_INVOKE_RE.lastIndex = 0;
   let invokeMatch;
-  let idx = 0;
-  while ((invokeMatch = invokeRegex.exec(block)) !== null) {
-    const name = invokeMatch[1];
-    const invokeBody = invokeMatch[2];
+  while ((invokeMatch = DSML_INVOKE_RE.exec(block || '')) !== null) {
+    const name = String(parseAttributes(invokeMatch[1]).name || '').trim();
+    if (!name) continue;
     const args = {};
+    DSML_PARAMETER_RE.lastIndex = 0;
     let paramMatch;
-    while ((paramMatch = paramRegex.exec(invokeBody)) !== null) {
-      const pName = paramMatch[1];
-      const isString = paramMatch[2] === 'true';
-      let val = paramMatch[3].trim();
-      if (!isString) {
-        try { val = JSON.parse(val); } catch (e) {}
-      }
-      args[pName] = val;
+    while ((paramMatch = DSML_PARAMETER_RE.exec(invokeMatch[2])) !== null) {
+      const attrs = parseAttributes(paramMatch[1]);
+      if (!attrs.name) continue;
+      args[attrs.name] = argumentValue(paramMatch[2], attrs.string);
     }
     toolCalls.push({
-      id: `call_${Date.now().toString(36)}_${idx++}`,
+      id: `call_${Date.now().toString(36)}_${index++}`,
       type: 'function',
       function: {
         name,
@@ -343,11 +405,94 @@ function parseDsmlToolCalls(text) {
       }
     });
   }
+  return toolCalls;
+}
+
+function parseDsmlToolCalls(text) {
+  if (!text || typeof text !== 'string') return null;
+  const source = normalizeDsml(text);
+  const match = DSML_CALLS_BLOCK_RE.exec(source);
+
+  if (!match) {
+    // Some runs drop the <calls> wrapper and print bare invoke blocks.
+    if (!/<\|DSML\|\|invoke\b/i.test(source)) return null;
+    const toolCalls = extractInvocations(source);
+    if (!toolCalls.length) return null;
+    return {
+      cleanContent: source.replace(DSML_INVOKE_RE, '').trim(),
+      trailing: '',
+      toolCalls
+    };
+  }
+
+  const contentBefore = source.slice(0, match.index).trim();
+  const trailing = source.slice(match.index + match[0].length).trim();
+  const toolCalls = extractInvocations(match[1]);
 
   return {
-    cleanContent,
+    cleanContent: [contentBefore, trailing].filter(Boolean).join('\n\n'),
+    trailing,
     toolCalls: toolCalls.length > 0 ? toolCalls : null
   };
+}
+
+/**
+ * True while the buffer tail (starting at '<') can still grow into a DSML tag
+ * head, e.g. `<`, `<|`, `< | | DSML`. Keeps a split tag from being streamed
+ * out before it can be recognised.
+ */
+function isDsmlTagPrefix(tail) {
+  if (!tail || tail[0] !== '<') return false;
+  const rest = tail.slice(1).replace(/[\s|｜/]/g, '').toLowerCase();
+  return rest.length <= 4 && 'dsml'.startsWith(rest);
+}
+
+/**
+ * Renders OpenAI `tools` into the single DeepSeek prompt: the direct web API
+ * has no tool channel, so the model has to be told both the schemas and the
+ * DSML markup this server parses back into `tool_calls`.
+ */
+function renderToolsPrompt(tools) {
+  const specs = (Array.isArray(tools) ? tools : [])
+    .map((tool) => (tool && tool.function ? tool.function : tool))
+    .filter((spec) => spec && spec.name);
+
+  if (!specs.length) return '';
+
+  const lines = [
+    '[TOOLS]',
+    'You can call the tools below. To call one, answer with this block and nothing else:',
+    '<|DSML||calls>',
+    '<|DSML||invoke name="TOOL_NAME">',
+    '<|DSML||parameter name="ARG" string="true">VALUE</|DSML||parameter>',
+    '</|DSML||invoke>',
+    '</|DSML||calls>',
+    'Repeat the invoke block for several calls. Use string="false" for JSON, number and boolean arguments.',
+    'Never print this markup in prose or in reasoning, and never invent tool names.',
+    'Tool results come back as [TOOL RESULT ...] messages.',
+    'Available tools:'
+  ];
+
+  for (const spec of specs) {
+    const description = String(spec.description || '').replace(/\s+/g, ' ').trim();
+    lines.push(`- ${spec.name}${description ? ': ' + description : ''}`);
+    const parameters = spec.parameters || spec.input_schema;
+    if (parameters) lines.push(`  parameters: ${JSON.stringify(parameters)}`);
+  }
+
+  return lines.join('\n');
+}
+
+function appendToolsPrompt(prompt, tools) {
+  const section = renderToolsPrompt(tools);
+  return section ? `${prompt}\n\n${section}` : prompt;
+}
+
+/** Drops an unparsed DSML block so raw markup never reaches the client. */
+function stripUnparsedDsml(text) {
+  const match = DSML_START_RE.exec(text || '');
+  if (!match) return text;
+  return text.slice(0, match.index).trim();
 }
 
 function sseHeaders(res) {
@@ -368,6 +513,99 @@ function sseWrite(res, payload) {
 
 /* -------------------------------------------------------- completion flow --- */
 
+/** Lazily opens the warm browser session used by --mode browser. */
+async function openWebSession(ctx) {
+  if (ctx.web.session) return ctx.web.session;
+  const webSession = require('./lib/web-session');
+  ctx.web.session = await webSession.openSession(ctx.web.accountId, {
+    windowed: !!ctx.web.windowed
+  });
+  return ctx.web.session;
+}
+
+/**
+ * Adapts web-session's event callbacks to the async iterator shape used by the
+ * direct client, so the rest of the OpenAI server code stays unchanged.
+ */
+function webEventIterator(session, prompt, options) {
+  const opts = options || {};
+  const queue = [];
+  const waiters = [];
+  let finished = false;
+  let failure = null;
+
+  const settle = () => {
+    while (waiters.length) {
+      if (queue.length) {
+        waiters.shift().resolve({ done: false, value: queue.shift() });
+        continue;
+      }
+      if (failure) {
+        waiters.shift().reject(failure);
+        continue;
+      }
+      if (finished) {
+        waiters.shift().resolve({ done: true, value: { responseMessageId: null } });
+        continue;
+      }
+      break;
+    }
+  };
+
+  const push = (event) => {
+    if (finished) return;
+    queue.push(event);
+    settle();
+  };
+  const finish = (err) => {
+    if (finished) return;
+    finished = true;
+    failure = err || null;
+    settle();
+  };
+
+  if (opts.signal) {
+    if (opts.signal.aborted) finish(new Error('aborted'));
+    else opts.signal.addEventListener('abort', () => finish(new Error('aborted')), { once: true });
+  }
+
+  const run = session.send(prompt, {
+    onEvent: (event) => {
+      if (!event) return;
+      if (event.type === 'content') push({ type: 'content', text: event.delta });
+      else if (event.type === 'thinking') push({ type: 'thinking', text: event.delta });
+      else if (event.type === 'done') {
+        const result = event.result || {};
+        if (result.ok) {
+          push({ type: 'status', value: 'FINISHED' });
+          finish();
+        } else {
+          finish(new Error(result.error || 'Веб-клиент не вернул ответ'));
+        }
+      }
+    }
+  });
+
+  run.then((result) => {
+    if (finished) return;
+    if (result && result.ok) {
+      push({ type: 'status', value: 'FINISHED' });
+      finish();
+    } else {
+      finish(new Error((result && result.error) || 'Веб-клиент не вернул ответ'));
+    }
+  }, (err) => finish(err || new Error('Веб-клиент не вернул ответ')));
+
+  return {
+    next() {
+      if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
+      if (failure) return Promise.reject(failure);
+      if (finished) return Promise.resolve({ done: true, value: { responseMessageId: null } });
+      return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+    }
+  };
+}
+
 /**
  * Creates the session (unless given), fetches/solves PoW and opens the SSE
  * stream, forcing the first chunk to be read inside the auth-retry scope so a
@@ -375,6 +613,13 @@ function sseWrite(res, payload) {
  */
 async function startCompletion(ctx, args, config, options) {
   const opts = options || {};
+  if (ctx.web) {
+    const session = opts.session || ('web:' + ctx.web.accountId);
+    const web = await openWebSession(ctx);
+    const iterator = webEventIterator(web, opts.prompt, { signal: opts.signal });
+    const first = await iterator.next();
+    return { session, iterator, first, body: { prompt: opts.prompt } };
+  }
   return withAuthRetry(
     ctx, args, config, true,
     () => logLine('токен отвергнут — перечитываю из браузера'),
@@ -394,12 +639,14 @@ async function startCompletion(ctx, args, config, options) {
         parent_message_id: opts.parent === undefined || opts.parent === ''
           ? null
           : (/^\d+$/.test(String(opts.parent)) ? Number(opts.parent) : opts.parent),
-        model_type: null,
+        model_type: 'default',
         prompt: opts.prompt,
         ref_file_ids: [],
         thinking_enabled: !!opts.thinking
       };
       if (opts.search) body.search_enabled = true;
+      body.action = null;
+      body.preempt = false;
 
       const iterator = ds.completion(
         client, body, solved.powHeader, { signal: opts.signal }
@@ -412,6 +659,10 @@ async function startCompletion(ctx, args, config, options) {
 
 function completionId() {
   return 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
+}
+
+function promptDigest(text) {
+  return crypto.createHash('sha256').update(String(text)).digest('hex').slice(0, 16);
 }
 
 /* ---------------------------------------------------------------- routes --- */
@@ -463,27 +714,54 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
   let parent = (chat && chat.parent_message_id !== undefined)
     ? chat.parent_message_id
     : (body.parent_message_id !== undefined ? body.parent_message_id : null);
+  // In browser mode the page keeps the conversation, so the first request has
+  // to carry the transcript and every later one only the new tail.
+  let boundToSession = false;
 
-  // Explicitly started or seeded conversation when the request carries no chat/session hint.
-  if (!session && !wantsNewChat && state.activeSessionId) {
-    session = state.activeSessionId;
-    if (parent === null && state.activeParentMessageId !== null) parent = state.activeParentMessageId;
-  }
-
-  // If not bound to a local chat and no explicit session was passed, continue the
-  // DeepSeek session that belongs to this conversation.
-  if (!chat && !explicitSession && !wantsNewChat && convKey) {
-    const existing = state.conversationSessions.get(convKey);
-    if (existing && (affinity || turns.length > 1)) {
-      session = existing.sessionId;
-      parent = existing.parentMessageId;
+  if (ctx.web) {
+    session = 'web:' + ctx.web.accountId;
+    parent = null;
+    boundToSession = !!ctx.web.started;
+  } else {
+    // Explicitly started or seeded conversation when the request carries no chat/session hint.
+    // Only a bare single-turn request can be assumed to continue the active session: a
+    // transcript from a stateless client must be sent whole, or its history is silently lost.
+    if (!session && !wantsNewChat && state.activeSessionId && turns.length <= 1) {
+      session = state.activeSessionId;
+      if (parent === null && state.activeParentMessageId !== null) parent = state.activeParentMessageId;
     }
+
+    // If not bound to a local chat and no explicit session was passed, continue the
+    // DeepSeek session that belongs to this conversation.
+    if (!chat && !explicitSession && !wantsNewChat && convKey) {
+      const existing = state.conversationSessions.get(convKey);
+      if (existing && (affinity || turns.length > 1)) {
+        session = existing.sessionId;
+        parent = existing.parentMessageId;
+      }
+    }
+
+    boundToSession = !!session;
   }
 
-  const prompt = messagesToPrompt(body.messages, !!session);
-  if (!prompt || !prompt.trim()) {
+  // DeepSeek keeps the conversation on its side, so the system prompt and the
+  // tool schemas only have to enter a session once. Re-sending them on every
+  // turn (a tool result may be two lines) dominates the request and the tokens.
+  const systemText = extractSystem(body.messages);
+  const toolsSection = renderToolsPrompt(body.tools);
+  const systemSig = systemText ? promptDigest(systemText) : '';
+  const toolsSig = toolsSection ? promptDigest(toolsSection) : '';
+  const sentBefore = session ? state.promptCache.get(session) : null;
+  const includeSystem = !!systemSig && (!sentBefore || sentBefore.system !== systemSig);
+  const includeTools = !!toolsSig && (!sentBefore || sentBefore.tools !== toolsSig);
+
+  const basePrompt = messagesToPrompt(body.messages, boundToSession, {
+    system: includeSystem ? systemText : ''
+  });
+  if (!basePrompt || !basePrompt.trim()) {
     return sendError(res, 400, 'no user message with text content');
   }
+  const prompt = includeTools ? `${basePrompt}\n\n${toolsSection}` : basePrompt;
 
   const model = requestedModel;
   const id = completionId();
@@ -510,18 +788,48 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
     return mapUpstreamError(res, err);
   }
 
+  if (ctx.web) ctx.web.started = true;
+
+  // Remember what this session already carries, so the next turn can send only
+  // the new tool result / user message.
+  const sentNow = {
+    system: includeSystem ? systemSig : (sentBefore ? sentBefore.system : ''),
+    tools: includeTools ? toolsSig : (sentBefore ? sentBefore.tools : '')
+  };
+  if (sentNow.system || sentNow.tools) {
+    state.promptCache.set(started.session, sentNow);
+    if (state.promptCache.size > 200) {
+      state.promptCache.delete(state.promptCache.keys().next().value);
+    }
+  }
+
   const userText = contentText((lastUserMessage(body.messages) || {}).content);
+  // Only the tail after the last assistant message is actually new. Tool-loop
+  // turns carry the same user message again, so mirroring `userText` blindly
+  // used to duplicate it on every tool result.
+  const pendingMessages = pendingTurnMessages(body.messages);
+  const pendingUsers = pendingMessages
+    .filter((m) => m && m.role === 'user')
+    .map((m) => contentText(m.content))
+    .filter((text) => text.trim());
+  const pendingHasToolResult = pendingMessages.some((m) => m && m.role === 'tool');
   let chatForResponse = chat ? chat.id : null;
 
   const finalize = (content, thinkingText, messageId) => {
     if (chat) {
-      chatsStore.appendMessage(store, chat, { role: 'user', content: userText });
-      chatsStore.appendMessage(store, chat, {
-        role: 'assistant',
-        content,
-        thinking: thinkingText,
-        message_id: messageId
-      });
+      if (!pendingHasToolResult) {
+        for (const text of pendingUsers) {
+          chatsStore.appendMessage(store, chat, { role: 'user', content: text });
+        }
+      }
+      if (content || thinkingText) {
+        chatsStore.appendMessage(store, chat, {
+          role: 'assistant',
+          content,
+          thinking: thinkingText,
+          message_id: messageId
+        });
+      }
       chatsStore.updateChat(store, chat, {
         deepseek_session_id: started.session,
         parent_message_id: messageId === null || messageId === undefined
@@ -534,13 +842,17 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
         deepseek_session_id: started.session,
         parent_message_id: messageId === null || messageId === undefined ? null : messageId
       });
-      chatsStore.appendMessage(store, created2, { role: 'user', content: userText });
-      chatsStore.appendMessage(store, created2, {
-        role: 'assistant',
-        content,
-        thinking: thinkingText,
-        message_id: messageId
-      });
+      for (const text of pendingUsers.length ? pendingUsers : [userText]) {
+        if (text.trim()) chatsStore.appendMessage(store, created2, { role: 'user', content: text });
+      }
+      if (content || thinkingText) {
+        chatsStore.appendMessage(store, created2, {
+          role: 'assistant',
+          content,
+          thinking: thinkingText,
+          message_id: messageId
+        });
+      }
       chatForResponse = created2.id;
     }
     if (messageId !== null && messageId !== undefined) {
@@ -567,17 +879,32 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
   };
 
   const startedAt = Date.now();
+  const sentParts = [`prompt=${prompt.length}`];
+  if (systemSig && !includeSystem) sentParts.push('system=cached');
+  if (toolsSig && !includeTools) sentParts.push('tools=cached');
   logLine(`completion start model=${model} session=${started.session} ` +
-    `thinking=${thinking} stream=${stream} chat=${chat ? chat.id : '-'}`);
+    `thinking=${thinking} stream=${stream} chat=${chat ? chat.id : '-'} ` +
+    sentParts.join(' '));
 
   if (!stream) {
     const result = await collectIterator(started);
     const parsedDsml = parseDsmlToolCalls(result.content);
-    const finalContent = parsedDsml ? parsedDsml.cleanContent : result.content;
+    const tcCount = parsedDsml ? parsedDsml.toolCalls.length : 0;
+    logLine(`parseDsmlToolCalls result: toolCalls=${tcCount}`);
+    logLine(`parseDsmlToolCalls firstToolName=${tcCount > 0 ? parsedDsml.toolCalls[0].function.name : 'none'}`);
+    logLine(`parseDsmlToolCalls firstArgs=${tcCount > 0 ? parsedDsml.toolCalls[0].function.arguments : 'none'}`);
+    let finalContent = parsedDsml ? parsedDsml.cleanContent : result.content;
     const toolCalls = parsedDsml ? parsedDsml.toolCalls : null;
+    if (!parsedDsml && DSML_START_RE.test(result.content)) {
+      logLine('DSML markup was not parsed; dropping it from the reply');
+      finalContent = stripUnparsedDsml(result.content);
+    }
     const finishReason = toolCalls ? 'tool_calls' : 'stop';
 
     const extra = finalize(result.content, result.thinking, result.responseMessageId);
+    // DeepSeek only reports one running total, so it is the best value available
+    // for each OpenAI usage field (previously this was hardcoded to zero).
+    const tokens = result.tokenUsage || 0;
     logLine(`completion done ${Date.now() - startedAt} ms, ${result.content.length} chars` +
       (toolCalls ? ` (${toolCalls.length} tool calls)` : ''));
     return sendJson(res, 200, {
@@ -595,7 +922,7 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
         },
         finish_reason: finishReason
       }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage: { prompt_tokens: tokens, completion_tokens: tokens, total_tokens: tokens },
       x_deepseek: extra
     });
   }
@@ -609,7 +936,10 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
   let content = '';
   let thinkingText = '';
   let messageId = null;
+  let tokenUsage = 0;
   let finishReason = 'stop';
+  // Reply text without the DSML block, kept for the local chat mirror.
+  let storedContent = null;
 
   // Buffer for content to prevent raw DSML tags from leaking into stream
   // before we know whether it is a tool call or regular text.
@@ -633,7 +963,7 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
 
         if (!insideDsml) {
           // Check if a DSML block might be starting
-          const dsmlStartIdx = pendingContent.search(/<\s*\|\s*DSML/i);
+          const dsmlStartIdx = pendingContent.search(DSML_START_RE);
           if (dsmlStartIdx !== -1) {
             // Flush text before the tag
             if (dsmlStartIdx > 0) {
@@ -642,9 +972,9 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
             }
             insideDsml = true;
           } else {
-            // If the buffer ends with a partial '<', keep only the trailing potential tag
+            // Hold back a trailing '<' that may still become a split DSML tag.
             const partialIdx = pendingContent.lastIndexOf('<');
-            if (partialIdx !== -1 && partialIdx > pendingContent.length - 20) {
+            if (partialIdx !== -1 && isDsmlTagPrefix(pendingContent.slice(partialIdx))) {
               const safe = pendingContent.slice(0, partialIdx);
               if (safe) flushContent(safe);
               pendingContent = pendingContent.slice(partialIdx);
@@ -662,6 +992,8 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
         });
       } else if (event.type === 'message_id') {
         messageId = event.id;
+      } else if (event.type === 'usage') {
+        tokenUsage = Number(event.value) || 0;
       }
     };
 
@@ -683,6 +1015,9 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
     const parsedDsml = parseDsmlToolCalls(content);
     if (parsedDsml && parsedDsml.toolCalls) {
       finishReason = 'tool_calls';
+      storedContent = parsedDsml.cleanContent;
+      // Text that followed the block was held back with it; flush it now.
+      if (parsedDsml.trailing) flushContent(parsedDsml.trailing);
       // Emit delta tool_calls chunk for OpenAI streaming clients
       for (let i = 0; i < parsedDsml.toolCalls.length; i++) {
         const tc = parsedDsml.toolCalls[i];
@@ -706,8 +1041,14 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
         });
       }
     } else if (pendingContent) {
-      // Flush any remaining buffered plain text
-      flushContent(pendingContent);
+      if (insideDsml) {
+        // Unparseable tool markup: never leak raw DSML into the transcript.
+        logLine('DSML markup was not parsed; dropping it from the stream');
+        storedContent = stripUnparsedDsml(content);
+      } else {
+        // Flush any remaining buffered plain text
+        flushContent(pendingContent);
+      }
       pendingContent = '';
     }
   } catch (err) {
@@ -721,24 +1062,33 @@ async function handleChatCompletions(req, res, ctx, args, config, store, state) 
     });
   }
 
-  const extra = finalize(content, thinkingText, messageId);
+  const extra = finalize(storedContent !== null ? storedContent : content, thinkingText, messageId);
   sseWrite(res, {
     id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
     x_deepseek: extra
   });
+  // Send usage once in a final chunk before DONE (OpenAI-compatible streaming)
+  if (tokenUsage > 0) {
+    sseWrite(res, {
+      id, object: 'chat.completion.chunk', created, model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: tokenUsage, completion_tokens: tokenUsage, total_tokens: tokenUsage }
+    });
+  }
   if (!res.writableEnded && !res.destroyed) res.write('data: [DONE]\n\n');
   res.end();
   logLine(`completion stream done ${Date.now() - startedAt} ms, ${content.length} chars`);
 }
 
 async function collectIterator(started) {
-  const state = { content: '', thinking: '', responseMessageId: null };
+  const state = { content: '', thinking: '', responseMessageId: null, tokenUsage: 0 };
   const handle = (event) => {
     if (!event) return;
     if (event.type === 'content') state.content += event.text;
     else if (event.type === 'thinking') state.thinking += event.text;
     else if (event.type === 'message_id') state.responseMessageId = event.id;
+    else if (event.type === 'usage') state.tokenUsage = Number(event.value) || 0;
   };
   if (!started.first.done) handle(started.first.value);
   while (true) {
@@ -760,6 +1110,16 @@ function mapUpstreamError(res, err) {
   }
   if (err && err.status === 429) {
     return sendError(res, 429, err.message, 'rate_limit_error');
+  }
+  const message = String((err && err.message) || err || '');
+  if (/Токен не найден|не авторизован|разлогинен/i.test(message)) {
+    return sendError(res, 401, message, 'authentication_error');
+  }
+  if (/заблокирован|suspended/i.test(message)) {
+    return sendError(res, 403, message, 'account_suspended');
+  }
+  if (/hCaptcha|Send failed|muted/i.test(message)) {
+    return sendError(res, 429, message, 'account_limited');
   }
   const status = (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600)
     ? err.status
@@ -785,6 +1145,10 @@ async function handleChats(req, res, ctx, method, segments, store, state) {
   }
 
   if (segments[0] === 'import') {
+    if (ctx.web) {
+      return sendError(res, 501,
+        'chat import is not available in browser mode', 'not_implemented');
+    }
     if (method !== 'POST') return sendError(res, 405, 'method not allowed');
     const body = await readBody(req);
     const sessionId = body && (body.session_id || body.chat_session_id);
@@ -879,33 +1243,54 @@ async function main() {
   const apiKey = String(args['api-key'] || process.env.DU_API_KEY || '');
   const config = args['no-cache'] ? null : loadConfig();
 
+  const mode = String(args.mode || process.env.DU_MODE || 'direct').toLowerCase();
+  if (mode !== 'direct' && mode !== 'browser') {
+    throw new Error(`Неизвестный режим: ${args.mode}. Используйте direct или browser.`);
+  }
+  const accountId = String(args.account || process.env.DU_WEB_ACCOUNT || '');
+  if (mode === 'browser' && !accountId) {
+    throw new Error('Для --mode browser нужен --account <id> (id аккаунта из дашборда).');
+  }
+
   const ctx = {
     baseUrl: String(args['base-url'] || ds.DEFAULT_BASE_URL).replace(/\/+$/, ''),
     token: ds.normalizeToken(args.token || process.env.DEEPSEEK_TOKEN || ''),
     cookie: String(args.cookie || process.env.DEEPSEEK_COOKIE || ''),
     timeoutMs: Number(args.timeout) > 0 ? Number(args.timeout) * 1000 : 0,
-    threads: args.threads === undefined ? undefined : Number(args.threads)
+    threads: args.threads === undefined ? undefined : Number(args.threads),
+    transport: args.transport || 'native',
+    'curl-path': args['curl-path'],
+    impersonate: args.impersonate,
+    'chrome-version': args['chrome-version'],
+    'accept-language': args['accept-language'],
+    web: mode === 'browser'
+      ? { accountId, windowed: !!args.window, started: false, session: null }
+      : null
   };
   ctx.explicitToken = !!ctx.token;
 
-  if (args.login) {
-    ctx.token = '';
-    ctx.explicitToken = false;
-    if (config) {
-      const { clearCachedAuth } = require('./lib/config');
-      clearCachedAuth(config);
+  // Browser mode authenticates through the page itself, so the token cache
+  // and the direct API browser handshake are not involved at all.
+  if (!ctx.web) {
+    if (args.login) {
+      ctx.token = '';
+      ctx.explicitToken = false;
+      if (config) {
+        const { clearCachedAuth } = require('./lib/config');
+        clearCachedAuth(config);
+      }
     }
-  }
 
-  if (!ctx.token && config) await applyCachedAuth(ctx, config);
+    if (!ctx.token && config) await applyCachedAuth(ctx, config);
 
-  if (!ctx.token && !args['no-browser']) {
-    await authenticateFromBrowser(ctx, args, config, true);
-  }
+    if (!ctx.token && !args['no-browser']) {
+      await authenticateFromBrowser(ctx, args, config, true);
+    }
 
-  if (!ctx.token) {
-    throw new Error('Нужен токен: --token, DEEPSEEK_TOKEN, кэш или браузер ' +
-      '(уберите --no-browser).');
+    if (!ctx.token) {
+      throw new Error('Нужен токен: --token, DEEPSEEK_TOKEN, кэш или браузер ' +
+        '(уберите --no-browser).');
+    }
   }
 
   const store = chatsStore.loadChats();
@@ -913,6 +1298,8 @@ async function main() {
     defaultModel: args.model ? String(args.model) : 'deepseek-chat',
     // Cache for conversation threads to reuse DeepSeek session & parent_message_id
     conversationSessions: new Map(), // convKey -> { sessionId, parentMessageId, lastUsed }
+    // session id -> digests of the system prompt and tool schemas it already has
+    promptCache: new Map(),
     activeSessionId: args.session ? String(args.session) : null,
     activeParentMessageId: null
   };
@@ -971,9 +1358,11 @@ async function main() {
         ok: true,
         service: 'deepupgrade-local-api',
         model: state.defaultModel,
-        token: ctx.fromCache ? 'cached' : 'provided',
+        mode: ctx.web ? 'browser' : 'direct',
+        account: ctx.web ? ctx.web.accountId : null,
+        token: ctx.web ? 'browser' : (ctx.fromCache ? 'cached' : 'provided'),
         chats: Object.keys(store.chats).length,
-        base_url: ctx.baseUrl
+        base_url: ctx.web ? 'browser://web-client' : ctx.baseUrl
       });
     }
 
@@ -996,6 +1385,10 @@ async function main() {
     }
 
     if (segments[0] === 'v1' && segments[1] === 'deepseek' && segments[2] === 'chats') {
+      if (ctx.web) {
+        return sendError(res, 501,
+          'account chat APIs are not available in browser mode', 'not_implemented');
+      }
       return route(() => handleDeepseekChats(res, ctx, method, segments.slice(3), url));
     }
 
@@ -1015,8 +1408,14 @@ async function main() {
   const actualPort = server.address().port;
   logLine(`DeepUpgrade local API слушает http://${host}:${actualPort}`);
   logLine(`  OpenAI base URL: http://${host}:${actualPort}/v1`);
-  logLine(`  token: ${redact(ctx.token)}${ctx.fromCache ? ' (кэш)' : ''}`);
-  logLine(`  cache: ${config ? configPath() : '(отключён)'}`);
+  if (ctx.web) {
+    logLine(`  mode: browser (настоящий веб-клиент, аккаунт ${ctx.web.accountId})`);
+    logLine('  один активный веб-чат на аккаунт; браузер поднимется на первом запросе');
+  } else {
+    logLine('  mode: direct (PoW + прямой HTTP API)');
+    logLine(`  token: ${redact(ctx.token)}${ctx.fromCache ? ' (кэш)' : ''}`);
+    logLine(`  cache: ${config ? configPath() : '(отключён)'}`);
+  }
   logLine(`  local API key: ${apiKey ? 'required' : 'not set (только localhost)'}`);
   logLine('  Ctrl+C — остановить.');
 
@@ -1039,5 +1438,8 @@ if (require.main === module) {
 module.exports = {
   messagesToPrompt,
   modelSupportsThinking,
-  contentText
+  contentText,
+  parseDsmlToolCalls,
+  renderToolsPrompt,
+  appendToolsPrompt
 };

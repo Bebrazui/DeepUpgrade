@@ -18,11 +18,14 @@
  */
 
 const { solveChallenge, buildPowHeader } = require('./pow');
+const { TlsClient } = require('./tls-client');
 
 const DEFAULT_BASE_URL = 'https://chat.deepseek.com';
 const DEFAULT_CLIENT_VERSION = '2.7.0';
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const DEFAULT_CHROME_VERSION = '131.0.0.0';
+const DEFAULT_ACCEPT_LANGUAGE = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7';
 
 function createClient(options) {
   const opts = options || {};
@@ -31,28 +34,47 @@ function createClient(options) {
     ? Number(opts.timeoutMs) || 0
     : (Number(opts.timeoutSec) > 0 ? Number(opts.timeoutSec) * 1000 : 0);
 
+  // Auto-detect Chrome version if not specified
+  const chromeVersion = opts.chromeVersion || DEFAULT_CHROME_VERSION;
+  const userAgent = opts.userAgent || DEFAULT_USER_AGENT.replace('131.0.0.0', chromeVersion);
+  
   return {
     baseUrl,
     token: String(opts.token || ''),
     cookie: String(opts.cookie || ''),
     timeoutMs,
     threads: opts.threads,
-    userAgent: opts.userAgent || DEFAULT_USER_AGENT,
-    clientVersion: opts.clientVersion || DEFAULT_CLIENT_VERSION
+    userAgent,
+    chromeVersion,
+    clientVersion: opts.clientVersion || DEFAULT_CLIENT_VERSION,
+    acceptLanguage: opts.acceptLanguage || DEFAULT_ACCEPT_LANGUAGE,
+    transport: opts.transport || 'native' // 'native' or 'tls'
   };
 }
 
 function buildHeaders(client, extra) {
   const headers = {
-    accept: '*/*',
+    'user-agent': client.userAgent,
+    'sec-ch-ua': `"Chromium";v="${client.chromeVersion}", "Google Chrome";v="${client.chromeVersion}"`,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'accept-language': client.acceptLanguage,
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-dest': 'empty',
+    'priority': 'u=1, i',
+    'accept': '*/*',
     'content-type': 'application/json',
     authorization: `Bearer ${client.token}`,
     'x-client-platform': 'web',
     'x-client-version': client.clientVersion,
-    'x-client-locale': 'en',
+    'x-client-locale': 'ru',
+    // The web client sends its bundle id and local UTC offset on every call;
+    // a request without them is visibly not the web app.
+    'x-client-bundle-id': 'com.deepseek.chat',
+    'x-client-timezone-offset': String(-new Date().getTimezoneOffset() * 60),
     origin: client.baseUrl,
-    referer: client.baseUrl + '/',
-    'user-agent': client.userAgent
+    referer: client.baseUrl + '/'
   };
   if (client.cookie) headers.cookie = client.cookie;
   return Object.assign(headers, extra || {});
@@ -113,6 +135,12 @@ async function requestJson(client, pathname, body, options) {
   const method = opts.method || (body === undefined ? 'GET' : 'POST');
   const url = client.baseUrl + pathname + buildQuery(opts.query);
 
+  // Use TLS transport if configured
+  if (client.transport === 'tls') {
+    return await requestJsonTls(client, pathname, body, opts);
+  }
+
+  // Default native fetch
   const init = {
     method,
     headers: buildHeaders(client, opts.extraHeaders),
@@ -129,6 +157,43 @@ async function requestJson(client, pathname, body, options) {
   const json = payload.json;
   if (json && json.data && json.data.biz_data !== undefined) return json.data.biz_data;
   return json;
+}
+
+async function requestJsonTls(client, pathname, body, options) {
+  const opts = options || {};
+  const method = opts.method || (body === undefined ? 'GET' : 'POST');
+  const url = client.baseUrl + pathname + buildQuery(opts.query);
+
+  const tlsClient = new TlsClient({
+    curlPath: client.curlPath,
+    impersonate: client.impersonate || 'chrome131',
+    timeoutMs: client.timeoutMs,
+    userAgent: client.userAgent,
+    chromeVersion: client.chromeVersion,
+    acceptLanguage: client.acceptLanguage
+  });
+
+  const headers = buildHeaders(client, opts.extraHeaders);
+  // Remove Node-specific headers that curl_cffi doesn't need
+  delete headers['content-length'];
+  
+  const response = await tlsClient.request({
+    method,
+    url,
+    headers,
+    body: body !== undefined && method !== 'GET' ? JSON.stringify(body) : undefined,
+    origin: client.baseUrl,
+    token: client.token,
+    cookie: client.cookie
+  });
+
+  const payload = await response.json();
+  if (!response.ok) throw apiError(pathname, response, { json: payload, text: response.text });
+  if (payload && payload.code !== undefined && payload.code !== 0) {
+    throw deepseekError(pathname, payload, response.text);
+  }
+  if (payload && payload.data && payload.data.biz_data !== undefined) return payload.data.biz_data;
+  return payload;
 }
 
 function extractChallenge(json) {
@@ -190,6 +255,7 @@ async function solvePoW(challenge, options) {
  *   {type:'thinking', text}
  *   {type:'message_id', id}
  *   {type:'status',   value}
+ *   {type:'usage',    value}
  * and returns the final state
  *   {content, thinking, responseMessageId, finished}
  *
@@ -200,7 +266,18 @@ async function solvePoW(challenge, options) {
  */
 async function* completion(client, body, powHeader, options) {
   const opts = options || {};
-  const headers = buildHeaders(client, { 'x-ds-pow-response': powHeader });
+  // The web app refers to the chat it is answering in; the bare origin looks
+  // like a request assembled outside the app.
+  const extra = { 'x-ds-pow-response': powHeader };
+  if (body && body.chat_session_id) {
+    extra.referer = `${client.baseUrl}/a/chat/s/${body.chat_session_id}`;
+  }
+  const headers = buildHeaders(client, extra);
+  
+  if (client.transport === 'tls') {
+    return yield* completionTls(client, body, headers, opts);
+  }
+
   const res = await fetch(client.baseUrl + '/api/v0/chat/completion', {
     method: 'POST',
     headers,
@@ -213,9 +290,49 @@ async function* completion(client, body, powHeader, options) {
     throw apiError('/api/v0/chat/completion', res, payload);
   }
 
-  const state = { content: '', thinking: '', responseMessageId: null, finished: false };
+  // A 200 with JSON instead of SSE means the server refused the turn
+  // (muted account, invalid PoW, ...); surface it instead of streaming nothing.
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    const payload = await safeReadJson(res);
+    if (payload.json) throw deepseekError('/api/v0/chat/completion', payload.json, payload.text);
+    throw apiError('/api/v0/chat/completion', res, payload);
+  }
+
   const reader = res.body.getReader();
+  return yield* streamReader(reader);
+}
+
+async function* completionTls(client, body, headers, options) {
+  const tlsClient = new TlsClient({
+    curlPath: client.curlPath,
+    impersonate: client.impersonate || 'chrome131',
+    timeoutMs: client.timeoutMs,
+    userAgent: client.userAgent,
+    chromeVersion: client.chromeVersion,
+    acceptLanguage: client.acceptLanguage
+  });
+
+  const tlsHeaders = { ...headers };
+  delete tlsHeaders['content-length'];
+
+  const child = tlsClient.spawn({
+    method: 'POST',
+    url: client.baseUrl + '/api/v0/chat/completion',
+    headers: tlsHeaders,
+    body: JSON.stringify(body),
+    origin: client.baseUrl,
+    token: client.token,
+    cookie: client.cookie,
+    stream: true
+  });
+
+  return yield* streamChildProcess(child);
+}
+
+async function* streamReader(reader) {
   const decoder = new TextDecoder();
+  const state = { content: '', thinking: '', responseMessageId: null, finished: false };
   let buffer = '';
 
   const apply = (event, inheritedPath, out) => {
@@ -228,13 +345,20 @@ async function* completion(client, body, powHeader, options) {
       out.push({ type: 'message_id', id: event.response_message_id });
     }
 
+    // DeepSeek sends the running token count inside a BATCH as
+    // {p:'accumulated_token_usage', v:<number>}; surface it so callers can
+    // report OpenAI-style usage instead of always returning zeros.
+    if (p.includes('accumulated_token_usage')) {
+      const tokens = Number(v);
+      if (Number.isFinite(tokens)) out.push({ type: 'usage', value: tokens });
+      return;
+    }
+
     if (p === 'response/status') {
       if (v === 'FINISHED') state.finished = true;
       out.push({ type: 'status', value: v });
       return;
     }
-    // Other status-ish paths (quasi_status, search_status, …) may carry a
-    // string like "FINISHED" that must never be appended to the answer.
     if (p.includes('status') || p === 'response/search') return;
 
     if (event.o === 'BATCH' && Array.isArray(v)) {
@@ -309,13 +433,53 @@ async function* completion(client, body, powHeader, options) {
       for (const ev of handleLine(line)) yield ev;
     }
   }
-  if (buffer.trim()) {
-    const trimmed = buffer.replace(/\r$/, '');
-    if (trimmed.startsWith('data:')) {
-      const rawText = trimmed.slice(5).trim();
-      if (rawText) yield { type: 'raw', text: rawText };
+
+  return state;
+}
+
+async function* streamChildProcess(child) {
+  // Wrap the child's stdout in the reader interface streamReader expects.
+  const chunks = [];
+  let ended = false;
+  let notify = null;
+  let stderr = '';
+
+  const wake = () => {
+    if (notify) {
+      const resume = notify;
+      notify = null;
+      resume();
     }
-    for (const ev of handleLine(buffer)) yield ev;
+  };
+
+  child.stdout.on('data', (chunk) => { chunks.push(chunk); wake(); });
+  child.stdout.on('error', () => { ended = true; wake(); });
+  child.stdout.on('end', () => { ended = true; wake(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  const exited = new Promise((resolve) => {
+    child.once('close', (code) => resolve(code));
+    child.once('error', () => resolve(-1));
+  });
+
+  const reader = {
+    read: async () => {
+      while (!chunks.length && !ended) {
+        await new Promise((resolve) => { notify = resolve; });
+      }
+      if (!chunks.length) return { done: true };
+      return { done: false, value: chunks.shift() };
+    }
+  };
+
+  const state = yield* streamReader(reader);
+
+  const code = await exited;
+  if (code !== 0 && code !== null) {
+    throw new Error(stderr.trim() || `TLS-транспорт завершился с кодом ${code}`);
+  }
+  if (!state.content && !state.thinking && !state.finished && stderr.trim()) {
+    throw new Error(stderr.trim());
   }
 
   return state;

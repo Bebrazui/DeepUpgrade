@@ -817,6 +817,15 @@ window.addEventListener('message', async (ev) => {
 
 // Setup Sandbox Iframe (Universal for Chrome Extension and Android WebView)
 let sandboxIframe = null;
+let isSandboxReady = false;
+const sandboxQueue = [];
+function flushSandboxQueue() {
+  isSandboxReady = true;
+  while (sandboxQueue.length > 0) {
+    const fn = sandboxQueue.shift();
+    try { fn(); } catch (e) { console.warn('[DeepUpgrade] Sandbox queue dispatch error:', e); }
+  }
+}
 const pendingCalls = new Map();
 // File reads requested from the sandbox (DU_GET_FILE -> DU_GET_FILE_RESULT).
 const pendingFileRequests = new Map();
@@ -860,6 +869,29 @@ function escapeAttr(str) {
 // Maps file key / name -> { name, path, type, size, isPicture }
 const stagedAttachments = new Map();
 
+// Files that live in the durable VFS (uploaded through the file manager or
+// left over from an earlier session). The model must know about them too,
+// otherwise it looks for an attachment that was never mentioned.
+let duStoreAssets = new Map();
+let duStoreAssetsCheckedAt = 0;
+
+async function refreshStoreAssets() {
+  const now = Date.now();
+  if (now - duStoreAssetsCheckedAt < 2000) return;
+  duStoreAssetsCheckedAt = now;
+  const store = duVfsStore();
+  if (!store) return;
+  try {
+    const files = await store.listAll();
+    const next = new Map();
+    for (const file of files) {
+      if (!file || !file.path || !file.path.startsWith('/added/')) continue;
+      next.set(file.path, { type: 'application/octet-stream', size: file.size || 0 });
+    }
+    duStoreAssets = next;
+  } catch (e) { /* listing failed - keep the previous list */ }
+}
+
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'bmp', 'ico', 'avif', 'tiff', 'jfif', 'apng', 'pjpeg', 'pjp']);
 
 function isImageFile(filename, mimeType) {
@@ -880,17 +912,596 @@ function formatBytes(bytes) {
 }
 
 function buildAttachedAssetsDirective() {
-  if (stagedAttachments.size === 0) return '';
+  if (stagedAttachments.size === 0 && duStoreAssets.size === 0) return '';
   const lines = [];
+  const seen = new Set();
   for (const info of stagedAttachments.values()) {
+    if (seen.has(info.path)) continue;
+    seen.add(info.path);
     lines.push(`- ${info.path} (${info.type || 'application/octet-stream'}, ${formatBytes(info.size)})`);
   }
+  for (const [path, info] of duStoreAssets) {
+    if (seen.has(path)) continue;
+    if (lines.length >= 20) break;
+    seen.add(path);
+    lines.push(`- ${path} (${info.type || 'application/octet-stream'}, ${formatBytes(info.size)})`);
+  }
+  if (lines.length === 0) return '';
   return `\n\n[ATTACHED ASSETS AVAILABLE IN VFS]:\n${lines.join('\n')}\n(You can access or inspect these files in python, js, or shell tools)`;
 }
 
 window.__DU_GET_SYSTEM_DIRECTIVE__ = function() {
   return `${buildSystemDirective()}${buildAttachedAssetsDirective()}`;
 };
+
+// --- Context Limit Configuration ---
+const DU_CONTEXT_LIMIT_KEY = 'du_context_limit';
+const DU_DEFAULT_CONTEXT_LIMIT = 16000; // 16 KB default
+
+function getContextLimit() {
+  try {
+    const raw = localStorage.getItem(DU_CONTEXT_LIMIT_KEY);
+    if (raw === null) return DU_DEFAULT_CONTEXT_LIMIT;
+    const num = parseInt(raw, 10);
+    return isNaN(num) ? DU_DEFAULT_CONTEXT_LIMIT : num;
+  } catch (e) {
+    return DU_DEFAULT_CONTEXT_LIMIT;
+  }
+}
+
+function setContextLimit(val) {
+  try {
+    localStorage.setItem(DU_CONTEXT_LIMIT_KEY, String(val));
+  } catch (e) {}
+}
+
+// --- JavaScript Plugins Engine & ZIP Unpacker ---
+const DU_PLUGINS_KEY = 'du_js_plugins';
+const pluginTools = new Map();
+const pluginHooks = {
+  onBeforeSend: [],
+  onToolResult: []
+};
+
+function duBytesToBase64(bytes) {
+  let binary = '';
+  const len = bytes.byteLength;
+  const chunk = 0x8000;
+  for (let i = 0; i < len; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, len)));
+  }
+  return btoa(binary);
+}
+
+async function duInflateRaw(compressedBytes) {
+  const ds = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  writer.write(compressedBytes);
+  writer.close();
+  const reader = ds.readable.getReader();
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  let totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+  let res = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    res.set(c, offset);
+    offset += c.length;
+  }
+  return res;
+}
+
+async function duUnpackZip(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  const bytes = new Uint8Array(arrayBuffer);
+  const len = bytes.length;
+
+  let eocdOffset = -1;
+  for (let i = len - 22; i >= Math.max(0, len - 65557); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset === -1) {
+    throw new Error('Некорректный ZIP-архив: сигнатура EOCD не найдена.');
+  }
+
+  const totalEntries = view.getUint16(eocdOffset + 10, true);
+  const cdOffset = view.getUint32(eocdOffset + 16, true);
+
+  const files = {};
+  let cur = cdOffset;
+  const textDecoder = new TextDecoder('utf-8');
+
+  for (let i = 0; i < totalEntries; i++) {
+    const sig = view.getUint32(cur, true);
+    if (sig !== 0x02014b50) {
+      throw new Error(`Повреждён Central Directory на записи ${i}`);
+    }
+    const compression = view.getUint16(cur + 10, true);
+    const compSize = view.getUint32(cur + 20, true);
+    const uncompSize = view.getUint32(cur + 24, true);
+    const fileNameLen = view.getUint16(cur + 28, true);
+    const extraLen = view.getUint16(cur + 30, true);
+    const commentLen = view.getUint16(cur + 32, true);
+    const localHeaderOffset = view.getUint32(cur + 42, true);
+
+    const fileNameBytes = bytes.subarray(cur + 46, cur + 46 + fileNameLen);
+    let fileName = textDecoder.decode(fileNameBytes).replace(/\\/g, '/');
+    cur += 46 + fileNameLen + extraLen + commentLen;
+
+    if (fileName.endsWith('/')) continue;
+    fileName = fileName.replace(/^\/+/, '');
+
+    const localSig = view.getUint32(localHeaderOffset, true);
+    if (localSig !== 0x04034b50) {
+      throw new Error(`Повреждён локальный заголовок для ${fileName}`);
+    }
+    const localNameLen = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLen = view.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+    const compressedData = bytes.subarray(dataStart, dataStart + compSize);
+
+    let uncompressedBytes;
+    if (compression === 0) {
+      uncompressedBytes = compressedData;
+    } else if (compression === 8) {
+      uncompressedBytes = await duInflateRaw(compressedData);
+    } else {
+      throw new Error(`Неподдерживаемый метод сжатия (${compression}) для ${fileName}`);
+    }
+
+    let text = null;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(uncompressedBytes);
+    } catch (e) {
+      text = null;
+    }
+
+    files[fileName] = {
+      name: fileName,
+      size: uncompSize,
+      isBinary: text === null,
+      text: text,
+      base64: text === null ? duBytesToBase64(uncompressedBytes) : null
+    };
+  }
+
+  return files;
+}
+
+function duNormalizeZipEntries(rawFiles) {
+  const keys = Object.keys(rawFiles);
+  if (keys.length === 0) return rawFiles;
+
+  const firstSlash = keys[0].indexOf('/');
+  if (firstSlash > 0) {
+    const commonPrefix = keys[0].slice(0, firstSlash + 1);
+    const allShare = keys.every(k => k.startsWith(commonPrefix));
+    if (allShare) {
+      const stripped = {};
+      for (const [k, v] of Object.entries(rawFiles)) {
+        const newKey = k.slice(commonPrefix.length);
+        if (newKey) {
+          v.name = newKey;
+          stripped[newKey] = v;
+        }
+      }
+      return stripped;
+    }
+  }
+  return rawFiles;
+}
+
+async function duInstallPluginFromZip(arrayBuffer, originalFileName = 'plugin.zip') {
+  const rawFiles = await duUnpackZip(arrayBuffer);
+  const files = duNormalizeZipEntries(rawFiles);
+  if (Object.keys(files).length === 0) {
+    throw new Error('Архив пуст.');
+  }
+
+  let manifest = {};
+  const manifestFile = files['plugin.json'] || files['manifest.json'] || files['package.json'];
+  if (manifestFile && manifestFile.text) {
+    try {
+      manifest = JSON.parse(manifestFile.text);
+    } catch (e) {
+      console.warn('[DeepUpgrade] Ошибка парсинга plugin.json:', e);
+    }
+  }
+
+  let entryFileName = manifest.main;
+  if (!entryFileName || !files[entryFileName]) {
+    const candidates = ['index.js', 'main.js', 'plugin.js'];
+    entryFileName = candidates.find(c => files[c]) || Object.keys(files).find(k => k.endsWith('.js') && !k.includes('/'));
+    if (!entryFileName) {
+      entryFileName = Object.keys(files).find(k => k.endsWith('.js'));
+    }
+  }
+
+  if (!entryFileName || !files[entryFileName]) {
+    throw new Error('В архиве не найден исполняемый JavaScript-файл (.js). Добавьте index.js или укажите "main" в plugin.json.');
+  }
+
+  const entryFile = files[entryFileName];
+  if (!entryFile.text) {
+    throw new Error(`Файл точки входа ${entryFileName} пуст или является бинарным.`);
+  }
+
+  try {
+    new Function('DeepUpgrade', entryFile.text);
+  } catch (syntaxErr) {
+    throw new Error(`Синтаксическая ошибка в ${entryFileName}: ${syntaxErr.message}`);
+  }
+
+  const name = manifest.name || originalFileName.replace(/\.zip$/i, '') || 'Unnamed Plugin';
+  const desc = manifest.description || `ZIP-плагин (${Object.keys(files).length} файлов)`;
+  const version = manifest.version || '1.0.0';
+  const pluginId = 'plug_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+
+  const serializableFiles = {};
+  for (const [k, v] of Object.entries(files)) {
+    serializableFiles[k] = {
+      name: k,
+      size: v.size,
+      isBinary: v.isBinary,
+      text: v.text,
+      base64: v.base64
+    };
+  }
+
+  const newPlugin = {
+    id: pluginId,
+    name,
+    desc,
+    version,
+    entryFile: entryFileName,
+    code: entryFile.text,
+    files: serializableFiles,
+    enabled: true,
+    createdAt: Date.now()
+  };
+
+  const allPlugins = getStoredPlugins();
+  const existingIdx = allPlugins.findIndex(p => p.name === name);
+  if (existingIdx !== -1) {
+    newPlugin.id = allPlugins[existingIdx].id;
+    allPlugins[existingIdx] = newPlugin;
+  } else {
+    allPlugins.push(newPlugin);
+  }
+
+  saveStoredPlugins(allPlugins);
+  reloadAllPlugins();
+  duMountPluginToVfs(newPlugin);
+  return newPlugin;
+}
+
+function duMountPluginToVfs(plugin) {
+  if (!plugin || !plugin.files) return;
+  const store = typeof duVfsStore === 'function' ? duVfsStore() : null;
+  for (const [relPath, file] of Object.entries(plugin.files)) {
+    const vfsPath = `/plugins/${plugin.id}/${relPath}`;
+    const content = file.isBinary ? (file.base64 || '') : (file.text || '');
+    const encoding = file.isBinary ? 'base64' : 'utf8';
+    if (store && store.writeFileQueued) {
+      store.writeFileQueued(vfsPath, content, encoding).catch(() => {});
+    }
+    if (sandboxIframe && sandboxIframe.contentWindow) {
+      try {
+        sandboxIframe.contentWindow.postMessage({
+          type: 'DU_STORE_ATTACHMENT',
+          path: vfsPath,
+          data: content,
+          isBinary: file.isBinary
+        }, '*');
+      } catch (e) {}
+    }
+  }
+}
+
+function getStoredPlugins() {
+  try {
+    const raw = localStorage.getItem(DU_PLUGINS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveStoredPlugins(plugins) {
+  try {
+    localStorage.setItem(DU_PLUGINS_KEY, JSON.stringify(plugins));
+  } catch (e) {
+    console.warn('[DeepUpgrade] Failed to save plugins to localStorage:', e);
+  }
+}
+
+function createPluginApi(plugin) {
+  const pluginFiles = plugin.files || {};
+
+  const getAsset = (relPath, format = 'auto') => {
+    const cleanPath = String(relPath || '').replace(/^[./\\]+/, '');
+    const entry = pluginFiles[cleanPath] || pluginFiles[relPath];
+    if (!entry) return null;
+    if (format === 'text') return entry.text || '';
+    if (format === 'base64') return entry.base64 || '';
+    if (format === 'dataurl') {
+      const ext = cleanPath.split('.').pop().toLowerCase();
+      const mime = {
+        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+        svg: 'image/svg+xml', gif: 'image/gif', webp: 'image/webp',
+        json: 'application/json', css: 'text/css', html: 'text/html',
+        js: 'text/javascript'
+      }[ext] || 'application/octet-stream';
+      return `data:${mime};base64,${entry.base64 || ''}`;
+    }
+    if (!entry.isBinary) return entry.text;
+    return entry.base64;
+  };
+
+  const requireModule = (relPath) => {
+    const cleanPath = String(relPath || '').replace(/^[./\\]+/, '');
+    const targetPath = cleanPath.endsWith('.js') ? cleanPath : cleanPath + '.js';
+    const entry = pluginFiles[targetPath] || pluginFiles[cleanPath];
+    if (!entry) {
+      throw new Error(`[Plugin ${plugin.name}] Cannot find module '${relPath}' in ZIP assets`);
+    }
+    const module = { exports: {} };
+    const fn = new Function('module', 'exports', 'require', 'DeepUpgrade', entry.text);
+    fn(module, module.exports, requireModule, api);
+    return module.exports;
+  };
+
+  const injectCSS = (pathOrCSS) => {
+    let cssText = pathOrCSS;
+    const cleanPath = String(pathOrCSS || '').replace(/^[./\\]+/, '');
+    if (pluginFiles[cleanPath] && pluginFiles[cleanPath].text) {
+      cssText = pluginFiles[cleanPath].text;
+    }
+    const styleId = `du-plugin-style-${plugin.id}`;
+    let styleEl = document.getElementById(styleId);
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = styleId;
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent = cssText;
+    return styleEl;
+  };
+
+  const api = {
+    plugin: {
+      id: plugin.id,
+      name: plugin.name,
+      version: plugin.version || '1.0.0',
+      description: plugin.desc || ''
+    },
+    files: pluginFiles,
+    getAsset,
+    getFile: getAsset,
+    require: requireModule,
+    injectCSS,
+    registerTool: (def) => {
+      if (!def || !def.name || typeof def.execute !== 'function') {
+        throw new Error('Plugin tool must provide "name" and "execute" function');
+      }
+      pluginTools.set(def.name, {
+        name: def.name,
+        description: def.description || 'Custom plugin tool',
+        parameters: def.parameters || def.params || null,
+        icon: def.icon || 'plugin',
+        execute: def.execute,
+        pluginId: plugin.id
+      });
+      if (typeof KNOWN_TOOL_NAMES !== 'undefined' && KNOWN_TOOL_NAMES.add) {
+        KNOWN_TOOL_NAMES.add(def.name);
+      }
+    },
+    defineTool: (def) => api.registerTool(def),
+    tool: (def) => api.registerTool(def),
+    http: createHttpClient(),
+    fetch: duPrivilegedFetch,
+    unregisterTool: (name) => {
+      pluginTools.delete(name);
+      if (typeof KNOWN_TOOL_NAMES !== 'undefined' && KNOWN_TOOL_NAMES.delete) {
+        KNOWN_TOOL_NAMES.delete(name);
+      }
+    },
+    onBeforeSend: (fn) => {
+      if (typeof fn === 'function') pluginHooks.onBeforeSend.push(fn);
+    },
+    onToolResult: (fn) => {
+      if (typeof fn === 'function') pluginHooks.onToolResult.push(fn);
+    },
+    storage: {
+      get: (key, fallback) => {
+        try {
+          const val = localStorage.getItem(`du_plug_${plugin.id}_${key}`);
+          return val !== null ? JSON.parse(val) : fallback;
+        } catch (e) { return fallback; }
+      },
+      set: (key, val) => {
+        try {
+          localStorage.setItem(`du_plug_${plugin.id}_${key}`, JSON.stringify(val));
+        } catch (e) {}
+      }
+    }
+  };
+  return api;
+}
+
+async function duPrivilegedFetch(url, options = {}) {
+  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'DU_FETCH',
+          url,
+          options,
+          responseType: options.responseType || 'json'
+        }, (res) => {
+          if (chrome.runtime.lastError || !res) {
+            duFallbackFetch(url, options).then(resolve).catch(reject);
+            return;
+          }
+          if (!res.ok && res.error) {
+            reject(new Error(res.error));
+            return;
+          }
+          resolve({
+            ok: res.ok,
+            status: res.status,
+            statusText: res.statusText,
+            headers: res.headers || {},
+            data: res.data,
+            text: async () => res.text,
+            json: async () => (typeof res.data === 'string' ? JSON.parse(res.data) : res.data),
+            base64: res.base64
+          });
+        });
+      } catch (err) {
+        duFallbackFetch(url, options).then(resolve).catch(reject);
+      }
+    });
+  }
+  return duFallbackFetch(url, options);
+}
+
+async function duFallbackFetch(url, options = {}) {
+  const fetchOpts = { ...options };
+  if (fetchOpts.body && typeof fetchOpts.body === 'object') {
+    fetchOpts.body = JSON.stringify(fetchOpts.body);
+  }
+  const resp = await fetch(url, fetchOpts);
+  const text = await resp.text();
+  let data = text;
+  try { data = JSON.parse(text); } catch (e) {}
+  const headers = {};
+  if (resp.headers && resp.headers.forEach) {
+    resp.headers.forEach((v, k) => { headers[k] = v; });
+  }
+  return {
+    ok: resp.ok,
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+    data,
+    text: async () => text,
+    json: async () => data
+  };
+}
+
+function createHttpClient() {
+  const request = async (url, options = {}) => {
+    let finalUrl = url;
+    if (options.params && typeof options.params === 'object') {
+      const q = new URLSearchParams();
+      for (const [k, v] of Object.entries(options.params)) {
+        if (v !== undefined && v !== null) q.append(k, String(v));
+      }
+      const qs = q.toString();
+      if (qs) finalUrl += (finalUrl.includes('?') ? '&' : '?') + qs;
+    }
+    const headers = { 'Accept': 'application/json, text/plain, */*', ...(options.headers || {}) };
+    const res = await duPrivilegedFetch(finalUrl, { ...options, headers });
+    return res;
+  };
+
+  const get = async (url, params = null, options = {}) => {
+    const res = await request(url, { ...options, method: 'GET', params });
+    if (!res.ok) {
+      throw new Error(`HTTP GET ${url} failed with status ${res.status}: ${res.statusText || ''}`);
+    }
+    return res.data;
+  };
+
+  const post = async (url, body = null, options = {}) => {
+    const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+    const res = await request(url, { ...options, method: 'POST', body, headers });
+    if (!res.ok) {
+      throw new Error(`HTTP POST ${url} failed with status ${res.status}: ${res.statusText || ''}`);
+    }
+    return res.data;
+  };
+
+  return { request, get, post, fetch: duPrivilegedFetch };
+}
+
+function reloadAllPlugins() {
+  pluginTools.clear();
+  pluginHooks.onBeforeSend = [];
+  pluginHooks.onToolResult = [];
+
+  const plugins = getStoredPlugins();
+  for (const p of plugins) {
+    if (!p.enabled) continue;
+    try {
+      const runner = new Function('DeepUpgrade', p.code);
+      runner(createPluginApi(p));
+      duMountPluginToVfs(p);
+    } catch (err) {
+      console.error(`[DeepUpgrade Plugin Error: ${p.name}]`, err);
+    }
+  }
+  if (typeof KNOWN_TOOL_NAMES !== 'undefined') {
+    for (const name of pluginTools.keys()) {
+      KNOWN_TOOL_NAMES.add(name);
+    }
+  }
+  if (typeof publishDirectiveToMainWorld === 'function') {
+    publishDirectiveToMainWorld(true);
+  }
+}
+
+function buildPluginToolsDirective() {
+  if (pluginTools.size === 0) return '';
+  const blocks = [];
+  for (const [name, def] of pluginTools) {
+    let block = `- "${name}": ${def.description || 'Custom JS Plugin Tool'}`;
+    const params = def.parameters;
+    if (params) {
+      const paramLines = [];
+      const exampleObj = { tool: name };
+
+      if (params.type === 'object' && params.properties) {
+        const req = new Set(params.required || []);
+        for (const [pName, pSchema] of Object.entries(params.properties)) {
+          const isReq = req.has(pName) ? 'обязательно' : 'опционально';
+          const pType = pSchema.type || 'string';
+          const pDesc = pSchema.description ? `: ${pSchema.description}` : '';
+          paramLines.push(`    - ${pName} (${pType}, ${isReq})${pDesc}`);
+          exampleObj[pName] = pSchema.default !== undefined ? pSchema.default : (pType === 'number' ? 0 : pType === 'boolean' ? true : `value_${pName}`);
+        }
+      } else if (typeof params === 'object') {
+        for (const [pName, pVal] of Object.entries(params)) {
+          if (typeof pVal === 'string') {
+            paramLines.push(`    - ${pName}: ${pVal}`);
+            exampleObj[pName] = `value_${pName}`;
+          } else if (typeof pVal === 'object' && pVal) {
+            const isReq = pVal.required ? 'обязательно' : 'опционально';
+            const pType = pVal.type || 'string';
+            const pDesc = pVal.description ? `: ${pVal.description}` : '';
+            paramLines.push(`    - ${pName} (${pType}, ${isReq})${pDesc}`);
+            exampleObj[pName] = pVal.default !== undefined ? pVal.default : (pType === 'number' ? 0 : `value_${pName}`);
+          }
+        }
+      }
+
+      if (paramLines.length > 0) {
+        block += '\n  Параметры:\n' + paramLines.join('\n');
+        block += `\n  Пример вызова: {"tool": "${name}", ${Object.entries(exampleObj).filter(([k]) => k !== 'tool').map(([k, v]) => `"${k}": ${JSON.stringify(v)}`).join(', ')}}`;
+      }
+    }
+    blocks.push(block);
+  }
+  return `\n\n[AVAILABLE JS PLUGIN TOOLS]:\n` + blocks.join('\n\n') + '\n(You can invoke any of these custom tools using the standard ```json:tool schema)';
+}
 
 /**
  * The directive for one turn.
@@ -900,6 +1511,7 @@ window.__DU_GET_SYSTEM_DIRECTIVE__ = function() {
 function buildTurnDirective(isFirstTurn) {
   return (isFirstTurn ? buildSystemDirective() : '')
     + buildSkillsDirective()
+    + buildPluginToolsDirective()
     + buildAttachedAssetsDirective();
 }
 
@@ -915,14 +1527,16 @@ function publishDirectiveToMainWorld(force) {
   try {
     const signature = JSON.stringify({
       skills: getAllSkills().map(s => [s.id, s.name, s.desc, activeSkills.includes(s.id)]),
-      assets: [...stagedAttachments.values()].map(a => a.path)
+      assets: [...stagedAttachments.values()].map(a => a.path),
+      store: [...duStoreAssets.keys()],
+      plugins: [...pluginTools.keys()]
     });
     if (!force && signature === duDirectiveSignature) return;
     duDirectiveSignature = signature;
     localStorage.setItem(DU_DIRECTIVE_KEY, JSON.stringify({
       ts: Date.now(),
       system: buildSystemDirective(),
-      skills: buildSkillsDirective(),
+      skills: buildSkillsDirective() + buildPluginToolsDirective(),
       assets: buildAttachedAssetsDirective()
     }));
   } catch (e) { /* storage full or blocked - the composer prefix still works */ }
@@ -1098,6 +1712,7 @@ function initSandboxIframe() {
 
   sandboxIframe.style.display = 'none';
   sandboxIframe.onload = () => {
+    flushSandboxQueue();
     syncSkillsToVfs();
     // Send persistent packages to sandbox
     const savedPackages = JSON.parse(localStorage.getItem('du_persistent_packages') || '[]');
@@ -1122,6 +1737,7 @@ function initSandboxIframe() {
       for (const p of ev.data.packages) current.add(p);
       localStorage.setItem('du_persistent_packages', JSON.stringify([...current]));
     } else if (ev.data && ev.data.type === 'DU_VFS_BOOT') {
+      flushSandboxQueue();
       handleVfsBoot(ev);
     } else if (ev.data && ev.data.type === 'DU_VFS_MUTATE') {
       handleVfsMutation(ev, ev.data);
@@ -1311,7 +1927,7 @@ function runInSandbox(toolObj) {
 
   // Otherwise browser/sandbox iframe execution
   return new Promise((resolve) => {
-    if (!sandboxIframe || !sandboxIframe.contentWindow) {
+    if (!sandboxIframe || !sandboxIframe.parentNode) {
       initSandboxIframe();
     }
     const id = Math.random().toString(36).slice(2);
@@ -1329,18 +1945,27 @@ function runInSandbox(toolObj) {
       resolve(res);
     });
 
-    try {
-      if (!sandboxIframe.parentNode) {
-        (document.body || document.documentElement).appendChild(sandboxIframe);
+    const dispatchRun = () => {
+      try {
+        if (!sandboxIframe.parentNode) {
+          (document.body || document.documentElement).appendChild(sandboxIframe);
+        }
+        sandboxIframe.contentWindow.postMessage({
+          id,
+          type: 'DU_RUN',
+          ...toolObj
+        }, '*');
+      } catch(err) {
+        pendingCalls.delete(id);
+        clearTimeout(timeout);
+        resolve({ id, success: false, output: `Sandbox dispatch error: ${err.message}` });
       }
-      sandboxIframe.contentWindow.postMessage({
-        id,
-        type: 'DU_RUN',
-        ...toolObj
-      }, '*');
-    } catch(err) {
-      pendingCalls.delete(id);
-      resolve({ id, success: false, output: `Sandbox dispatch error: ${err.message}` });
+    };
+
+    if (isSandboxReady && sandboxIframe && sandboxIframe.contentWindow) {
+      dispatchRun();
+    } else {
+      sandboxQueue.push(dispatchRun);
     }
   });
 }
@@ -1388,7 +2013,11 @@ function hashText(str) {
  */
 function getToolTurnKey(block) {
   let scope = '';
-  for (const bubble of document.querySelectorAll('.fbb737a4')) {
+  let bubbles = document.querySelectorAll('.fbb737a4');
+  if (bubbles.length === 0) {
+    bubbles = document.querySelectorAll('.ds-message:not(:has(.ds-markdown)), [data-virtual-list-item-key]:not(:has(.ds-markdown))');
+  }
+  for (const bubble of bubbles) {
     if (bubble.contains(block)) continue;
     if (bubble.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING) {
       // textContent (not innerText) so hidden silent replies still count.
@@ -1420,7 +2049,11 @@ function getToolBlockKey(block, blockHash) {
  * is history and must never run again.
  */
 function isLatestAssistantBlock(block) {
-  for (const bubble of document.querySelectorAll('.fbb737a4')) {
+  let bubbles = document.querySelectorAll('.fbb737a4');
+  if (bubbles.length === 0) {
+    bubbles = document.querySelectorAll('.ds-message:not(:has(.ds-markdown)), [data-virtual-list-item-key]:not(:has(.ds-markdown))');
+  }
+  for (const bubble of bubbles) {
     if (bubble.contains(block)) continue;
     if (block.compareDocumentPosition(bubble) & Node.DOCUMENT_POSITION_FOLLOWING) return false;
   }
@@ -1485,6 +2118,32 @@ function markExecuted(turnKey, blockKey, output) {
 // </du-tool-dedupe>
 
 let allowExecution = false;
+
+// The page was loaded at this moment. A tool call may only run when the user
+// sent a message AFTER the page was loaded - otherwise it is chat history.
+const DU_PAGE_LOAD_TS = Date.now();
+
+/**
+ * The interceptor (MAIN world) sees every outgoing request and stamps
+ * 'du_user_message_ts' there. The composer hook is not reliable - the send
+ * button is not always inside the hooked element - so this is the fallback
+ * that decides whether a tool call may run.
+ */
+function refreshAllowExecution() {
+  try {
+    const ts = Number(localStorage.getItem('du_user_message_ts') || 0);
+    if (ts && ts > DU_PAGE_LOAD_TS) {
+      allowExecution = true;
+      return;
+    }
+    const activeSess = sessionStorage.getItem('du_active_agent_session');
+    const activeTime = Number(sessionStorage.getItem('du_active_agent_time') || 0);
+    const currSess = (location.pathname.match(/\/s\/([a-zA-Z0-9_-]+)/) || [])[1] || 'root';
+    if (activeSess && activeSess === currSess && Date.now() - activeTime < 3600000) {
+      allowExecution = true;
+    }
+  } catch (e) {}
+}
 
 // Clipboard Sanitizer: only clean user prompt is copied
 document.addEventListener('copy', (e) => {
@@ -1569,16 +2228,20 @@ function preemptiveHide() {
  * leftover "[ATTACHED ASSETS AVAILABLE IN VFS]:" block stayed visible.
  *
  * Everything before the "[USER REQUEST]:" marker belongs to us: hide it and
- * keep only the user's own text.
+ * keep only the user's own text. Also unclamp any collapsible container that
+ * DeepSeek introduced because of the directive's length, so the user prompt
+ * is never hidden or truncated behind an expand button.
  */
 function hideInjectedDirectiveBlocks() {
-  const bubbles = document.querySelectorAll('.fbb737a4');
+  const bubbles = document.querySelectorAll('.fbb737a4, div[class*="message"], .ds-message');
   bubbles.forEach((bubble) => {
     const text = bubble.textContent || '';
-    const hasDirective = text.includes('[SYSTEM CAPABILITY:')
+    const hasDirective = text.includes('[USER REQUEST]:') || (
+      text.includes('[SYSTEM CAPABILITY:')
       || text.includes('[SYSTEM INSTRUCTION:')
       || text.includes('[AVAILABLE SKILLS (Loaded in VFS)]:')
-      || text.includes('[ATTACHED ASSETS AVAILABLE IN VFS]:');
+      || text.includes('[ATTACHED ASSETS AVAILABLE IN VFS]:')
+    );
     if (!hasDirective) return;
 
     let target = bubble.querySelector('[data-du-user-request="1"]');
@@ -1617,6 +2280,21 @@ function hideInjectedDirectiveBlocks() {
       }
       el = el.parentElement;
     }
+
+    // If DeepSeek wrapped the long prompt in a collapsible text container,
+    // unclamp it and hide the expand/collapse toggle button so the user's prompt
+    // stays fully visible without an awkward "v" arrow or truncated 0px height.
+    bubble.querySelectorAll('.ds-collapsible-text, [class*="collapsible"]').forEach((c) => {
+      c.style.setProperty('max-height', 'none', 'important');
+      c.style.setProperty('-webkit-line-clamp', 'unset', 'important');
+      c.style.setProperty('height', 'auto', 'important');
+      c.style.setProperty('overflow', 'visible', 'important');
+    });
+    bubble.querySelectorAll('button, [class*="collapse"], [class*="expand"], .ds-collapsible-text__action').forEach((btn) => {
+      if (btn.querySelector('svg') || btn.textContent.includes('v') || btn.classList.contains('ds-collapsible-text__action')) {
+        btn.style.setProperty('display', 'none', 'important');
+      }
+    });
   });
 }
 
@@ -1835,7 +2513,14 @@ function findTextNodeWith(element, pattern) {
 
 // <du-send-path>
 function findDeepSeekInput() {
-  const nodes = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]'));
+  const allNodes = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]'));
+  if (allNodes.length === 0) return null;
+
+  const nodes = allNodes.filter((el) => {
+    if (el.matches && el.matches('.du-textarea, .du-input, [class*="du-"]')) return false;
+    if (el.closest && el.closest('[role="dialog"], .ds-modal, .du-native-skills-panel, .du-native-files-panel, .du-native-config-panel')) return false;
+    return true;
+  });
   if (nodes.length === 0) return null;
   if (nodes.length === 1) return nodes[0];
 
@@ -2161,7 +2846,10 @@ function setInputValueVerified(inputEl, text, job) {
 }
 
 function lastUserMessageText() {
-  const bubbles = document.querySelectorAll('.fbb737a4');
+  let bubbles = document.querySelectorAll('.fbb737a4');
+  if (bubbles.length === 0) {
+    bubbles = document.querySelectorAll('.ds-message:not(:has(.ds-markdown)), [data-virtual-list-item-key]:not(:has(.ds-markdown))');
+  }
   if (bubbles.length === 0) return '';
   const last = bubbles[bubbles.length - 1];
   return normalizeForMatch(last.innerText || last.textContent || '');
@@ -2236,11 +2924,11 @@ async function dispatchSilentReply(text) {
           text: raw
         }, '*');
 
-        // Fallback timer if MAIN world doesn't answer in 4s
+        // Fallback timer if MAIN world doesn't answer in 10s
         setTimeout(() => {
           window.removeEventListener('message', onMsg);
           resolve({ success: false, error: 'Network bridge timeout' });
-        }, 4000);
+        }, 10000);
       });
 
       if (networkResult.success) {
@@ -2511,6 +3199,29 @@ if (typeof window.__DU_SETTINGS__ !== 'undefined') {
   });
 }
 
+let duLastComposerValue = '';
+
+/**
+ * Detect "the message was sent" by watching the composer.
+ *
+ * The send button is not always inside the element the send hook listens to,
+ * so the hook alone missed a lot of sends and every tool call was rejected as
+ * chat history. DeepSeek clears the composer when the message goes out, which
+ * is a signal that works for every way of sending.
+ */
+function watchComposerSend() {
+  try {
+    const inputEl = findDeepSeekInput();
+    if (!inputEl) return;
+    const value = readInputValue(inputEl);
+    if (duLastComposerValue.trim() && !value.trim()) {
+      allowExecution = true;
+      publishDirectiveToMainWorld(true);
+    }
+    duLastComposerValue = value;
+  } catch (e) {}
+}
+
 function hookInput() {
   const inputEl = findDeepSeekInput();
   if (!inputEl || inputEl.hasAttribute('data-du-hooked')) return;
@@ -2523,6 +3234,11 @@ function hookInput() {
 
     if (isAgentEnabled) {
       allowExecution = true;
+      try {
+        const sessId = (location.pathname.match(/\/s\/([a-zA-Z0-9_-]+)/) || [])[1] || 'root';
+        sessionStorage.setItem('du_active_agent_session', sessId);
+        sessionStorage.setItem('du_active_agent_time', String(Date.now()));
+      } catch (e) {}
       const attachedDirective = buildAttachedAssetsDirective();
       
       // OpenCode Architecture: Check if this is the very first turn of the session
@@ -2554,9 +3270,15 @@ function hookInput() {
       }
     } else {
       allowExecution = false;
+      try {
+        sessionStorage.removeItem('du_active_agent_session');
+        sessionStorage.removeItem('du_active_agent_time');
+      } catch (e) {}
       stagedAttachments.clear();
       // Plain normal message without any agent directives
     }
+
+    watchComposerSend();
   };
 
   inputEl.addEventListener('keydown', (e) => {
@@ -2582,6 +3304,11 @@ const KNOWN_TOOL_NAMES = new Set([
   'write', 'edit', 'read', 'glob', 'grep', 'bash', 'python', 'py', 'js',
   'question', 'ask', 'todowrite', 'todo', 'install_skill', 'add_skill'
 ]);
+
+// Initial load of JS plugins
+if (typeof reloadAllPlugins === 'function') {
+  reloadAllPlugins();
+}
 
 /**
  * Extract every balanced `{...}` block from a model response.
@@ -3241,29 +3968,32 @@ async function executeToolBlock(block, codeText, toolObj, alreadyComplete, lates
     }
   }
 
-  const blockHash = 'du_' + codeText.replace(/\s+/g, '').slice(0, 80);
+  const blockHash = 'du_' + hashText(codeText.replace(/\s+/g, ''));
   const turnKey = getToolTurnKey(block);
   const blockKey = `${turnKey}|${blockHash}`;
 
   block.setAttribute('data-du-rendered', 'true');
   const toolWidget = renderOpenCode1to1(block, toolObj);
 
-  // A malformed block must never reach the sandbox: writing an empty file and
-  // reporting success is worse than showing a visible parse error.
-  if (toolObj.__parseError) {
-    console.warn('[DeepUpgrade] Tool parse error:', toolObj.__parseError, '\nRaw block:\n' + codeText);
-    setOpenCodeOutput(toolWidget, `⚠️ ${toolObj.__parseError}\n\nИнструмент не выполнен, чтобы не повредить файлы.`);
-    return;
-  }
-
   // Auto-execution requires the user to have sent a message in this page
   // session (allowExecution). Agent mode alone must not re-run tool calls that
   // were already in chat history when the page loaded.
   const isAutoExecutionEligible = allowExecution && isAgentEnabled;
 
+  // A malformed block must never reach the sandbox: writing an empty file and
+  // reporting success is worse than showing a visible parse error.
+  if (toolObj.__parseError) {
+    console.warn('[DeepUpgrade] Tool parse error:', toolObj.__parseError, '\nRaw block:\n' + codeText);
+    setOpenCodeOutput(toolWidget, `⚠️ ${toolObj.__parseError}\n\nИнструмент не выполнен, чтобы не повредить файлы.`);
+    if (isAutoExecutionEligible) {
+      await sendSilentReply(`[SANDBOX ERROR]: Tool invocation parsing failed: ${toolObj.__parseError}\nPlease fix your tool call syntax and try again.`);
+    }
+    return;
+  }
+
   if (!isAutoExecutionEligible) {
     setOpenCodeOutput(toolWidget, isAgentEnabled
-      ? 'Не выполнено: вызов найден в истории чата. Отправьте сообщение, чтобы запустить агента.'
+      ? 'Не выполнено: это сообщение из истории чата. Отправьте новое сообщение, чтобы запустить агента.'
       : 'Не выполнено: включите Agent, чтобы разрешить выполнение инструментов.');
     return;
   }
@@ -3299,31 +4029,61 @@ async function executeToolBlock(block, codeText, toolObj, alreadyComplete, lates
     return;
   }
 
-  const res = await runInSandbox(toolObj);
-  const outputStr = typeof res.output === 'string' ? res.output : '';
+  let outputStr = '';
+  let isSuccess = true;
+
+  if (pluginTools.has(toolObj.tool)) {
+    const pTool = pluginTools.get(toolObj.tool);
+    try {
+      const pRes = await pTool.execute(toolObj.args || toolObj);
+      outputStr = typeof pRes === 'string' ? pRes : JSON.stringify(pRes, null, 2);
+    } catch (pErr) {
+      isSuccess = false;
+      outputStr = `Plugin Tool Error (${toolObj.tool}): ${pErr && pErr.message || pErr}`;
+    }
+  } else {
+    const res = await runInSandbox(toolObj);
+    isSuccess = res.success !== false;
+    outputStr = typeof res.output === 'string' ? res.output : '';
+  }
+
+  // Notify registered onToolResult plugin hooks
+  for (const hook of pluginHooks.onToolResult) {
+    try { hook(toolObj.tool, outputStr); } catch (e) {}
+  }
+
   setOpenCodeOutput(toolWidget, outputStr || '(no output)');
 
-  // Record what the sandbox actually returned. If this length is 0 the model
-  // text was extracted fine but the tool produced no output; the send log
-  // then shows whether the empty part is on the sandbox or on the send side.
+  // Record what was actually returned.
   markExecuted(turnKey, blockKey, outputStr);
   duSendLog('tool-output', {
     tool: toolObj.tool,
-    success: res.success !== false,
+    success: isSuccess,
     outLen: outputStr.length,
     preview: outputStr.slice(0, 60)
   });
   if (outputStr.trim() === '') {
-    duSendLog('tool-output-EMPTY', { tool: toolObj.tool, note: 'sandbox returned no output' });
+    duSendLog('tool-output-EMPTY', { tool: toolObj.tool, note: 'tool returned no output' });
+  }
+
+  // Apply configurable Context Limit to prevent Context Length Exceeded & DOM freeze
+  const maxChars = getContextLimit();
+  let effectiveOutput = outputStr;
+  if (maxChars > 0 && outputStr.length > maxChars) {
+    effectiveOutput = outputStr.slice(0, maxChars) +
+      `\n\n... [ВЫВОД ОБРЕЗАН: показано ${maxChars} из ${outputStr.length} симв. Лимит настраивается во вкладке DeepUpgrade]`;
   }
 
   // Autonomous Multi-Turn ReAct loop:
   // Allow the agent to call multiple tools sequentially if needed, or conclude when finished
-  const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${outputStr}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
-  sendSilentReply(reply);
+  const reply = `[SANDBOX OUTPUT (${toolObj.tool})]:\n${effectiveOutput}\n\nContinue with your next tool call if more steps are needed, or provide your final answer.`;
+  await sendSilentReply(reply);
 }
 
 function processToolCalls() {
+  // A tool call may only run when the user sent a message in this page
+  // session. The interceptor knows that for sure.
+  refreshAllowExecution();
   cleanAndUnifyChat();
 
   // Collect every tool call of the latest answers, in document order.
@@ -3461,6 +4221,70 @@ function updateSidebarTodoList(todos) {
 }
 
 // <du-tool-card>
+function getToolIcon(toolName, customIcon) {
+  if (customIcon) {
+    if (typeof customIcon === 'string' && customIcon.trim().startsWith('<svg')) {
+      return customIcon;
+    }
+    const c = String(customIcon).toLowerCase();
+    if (c === 'globe' || c === 'web' || c === 'fetch' || c === 'http') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
+    }
+    if (c === 'terminal' || c === 'bash' || c === 'cmd' || c === 'shell') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
+    }
+    if (c === 'edit' || c === 'pencil') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+    }
+    if (c === 'search' || c === 'find') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
+    }
+    if (c === 'calc' || c === 'calculator') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="16" y1="14" x2="16" y2="18"/><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/></svg>`;
+    }
+    if (c === 'code' || c === 'js' || c === 'python') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`;
+    }
+    if (c === 'database' || c === 'db') {
+      return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>`;
+    }
+    return `<span>${escapeHtml(customIcon)}</span>`;
+  }
+
+  const t = (toolName || '').toLowerCase();
+  if (t === 'edit') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+  }
+  if (t === 'write') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>`;
+  }
+  if (t === 'read') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
+  }
+  if (t === 'glob' || t === 'grep') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
+  }
+  if (t === 'todowrite' || t === 'todo') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`;
+  }
+  if (t === 'question' || t === 'ask') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+  }
+  if (t === 'python' || t === 'py') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`;
+  }
+  if (t === 'js') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`;
+  }
+  if (t.includes('web') || t.includes('http') || t.includes('fetch') || t.includes('search')) {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
+  }
+  if (t === 'bash' || t === 'sh' || t === 'cmd' || t === 'terminal') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
+  }
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>`;
+}
+
 function toolCardFileName(path) {
   return (path || 'file').split('/').filter(Boolean).pop() || path || 'file';
 }
@@ -3478,24 +4302,51 @@ function toolCardPending(text) {
 function toolCardStreamingContent(toolObj) {
   const tool = (toolObj && toolObj.tool) || '';
   const path = (toolObj && toolObj.path) || '';
-  if (tool === 'write') return { label: `Запись: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём содержимого файла…')}` };
-  if (tool === 'edit') return { label: `Правка: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём правки…')}` };
-  if (tool === 'read') return { label: `Чтение: ${toolCardFileName(path)}`, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Чтение файла…')}` };
-  if (tool === 'python' || tool === 'py') return { label: 'Python', inputHtml: toolCardPending('Приём кода…') };
-  if (tool === 'js') return { label: 'JavaScript', inputHtml: toolCardPending('Приём кода…') };
-  if (tool === 'glob') return { label: `Поиск файлов: ${(toolObj && toolObj.pattern) || '*'}`, inputHtml: toolCardPending('Приём шаблона…') };
-  if (tool === 'grep') return { label: `Поиск в коде: ${(toolObj && toolObj.pattern) || ''}`, inputHtml: toolCardPending('Приём шаблона…') };
-  if (tool === 'todowrite' || tool === 'todo') return { label: 'План выполнения', inputHtml: toolCardPending('Обновление плана…') };
-  return { label: 'Терминал', inputHtml: toolCardPending('Приём команды…') };
+  const customTool = (typeof pluginTools !== 'undefined' && pluginTools.get) ? pluginTools.get(tool) : null;
+  const iconHtml = getToolIcon(tool, customTool ? customTool.icon : null);
+
+  if (customTool) {
+    return {
+      label: customTool.name,
+      iconHtml,
+      inputHtml: toolCardPending('Выполнение плагина…')
+    };
+  }
+  if (tool === 'write') return { label: `Запись: ${toolCardFileName(path)}`, iconHtml, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём содержимого файла…')}` };
+  if (tool === 'edit') return { label: `Правка: ${toolCardFileName(path)}`, iconHtml, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Приём правки…')}` };
+  if (tool === 'read') return { label: `Чтение: ${toolCardFileName(path)}`, iconHtml, inputHtml: `<div class="du-diff-file-tag">${escapeHtml(path)}</div>${toolCardPending('Чтение файла…')}` };
+  if (tool === 'python' || tool === 'py') return { label: 'Python', iconHtml, inputHtml: toolCardPending('Приём кода…') };
+  if (tool === 'js') return { label: 'JavaScript', iconHtml, inputHtml: toolCardPending('Приём кода…') };
+  if (tool === 'glob') return { label: `Поиск файлов: ${(toolObj && toolObj.pattern) || '*'}`, iconHtml, inputHtml: toolCardPending('Приём шаблона…') };
+  if (tool === 'grep') return { label: `Поиск в коде: ${(toolObj && toolObj.pattern) || ''}`, iconHtml, inputHtml: toolCardPending('Приём шаблона…') };
+  if (tool === 'todowrite' || tool === 'todo') return { label: 'План выполнения', iconHtml, inputHtml: toolCardPending('Обновление плана…') };
+  return { label: 'Терминал', iconHtml, inputHtml: toolCardPending('Приём команды…') };
 }
 
 function toolCardContent(toolObj, streaming) {
   if (streaming) return toolCardStreamingContent(toolObj);
 
+  const toolName = (toolObj && toolObj.tool) || '';
+  const customTool = (typeof pluginTools !== 'undefined' && pluginTools.get) ? pluginTools.get(toolName) : null;
+  const iconHtml = getToolIcon(toolName, customTool ? customTool.icon : null);
+
   let label = 'Терминал';
   let inputContent = '';
 
-  if (toolObj.tool === 'todowrite' || toolObj.tool === 'todo') {
+  if (customTool) {
+    label = customTool.name;
+    let argsText = '';
+    try {
+      const copy = { ...toolObj };
+      delete copy.tool;
+      delete copy.__parseError;
+      argsText = Object.keys(copy).length > 0 ? JSON.stringify(copy, null, 2) : '';
+    } catch (e) {
+      argsText = '';
+    }
+    inputContent = `<div class="du-diff-file-tag">JS PLUGIN: ${escapeHtml(customTool.name)}</div>`
+      + (argsText ? toolCardCode(argsText) : '<div style="opacity:0.7;font-size:12px;">Вызов инструмента</div>');
+  } else if (toolObj.tool === 'todowrite' || toolObj.tool === 'todo') {
     const rawTodos = toolObj.todos || [];
     const todos = Array.isArray(rawTodos) ? rawTodos : [];
     label = 'План выполнения';
@@ -3550,7 +4401,7 @@ function toolCardContent(toolObj, streaming) {
     inputContent = toolCardCode(toolObj.code);
   }
 
-  return { label, inputHtml: inputContent };
+  return { label, iconHtml, inputHtml: inputContent };
 }
 
 function toolCardKey(toolObj) {
@@ -3559,7 +4410,20 @@ function toolCardKey(toolObj) {
 }
 
 function applyToolCardContent(root, toolObj, streaming) {
-  const { label, inputHtml } = toolCardContent(toolObj || {}, streaming);
+  const { label, iconHtml, inputHtml } = toolCardContent(toolObj || {}, streaming);
+  let iconEl = root.querySelector('.opencode-tool-icon');
+  if (!iconEl) {
+    const btn = root.querySelector('.opencode-tool-header-btn');
+    if (btn) {
+      iconEl = document.createElement('span');
+      iconEl.className = 'opencode-tool-icon';
+      btn.insertBefore(iconEl, btn.firstChild);
+    }
+  }
+  if (iconEl && iconHtml && iconEl.__duIcon !== iconHtml) {
+    iconEl.__duIcon = iconHtml;
+    iconEl.innerHTML = iconHtml;
+  }
   const textEl = root.querySelector('.opencode-tool-text');
   if (textEl && textEl.textContent !== label) textEl.textContent = label;
   const inputEl = root.querySelector('.opencode-terminal-input');
@@ -3577,6 +4441,7 @@ function createToolCard() {
   root.setAttribute('data-running', 'true');
   root.innerHTML = `
     <button class="opencode-tool-header-btn" type="button">
+      <span class="opencode-tool-icon"></span>
       <span class="opencode-tool-text"></span>
       <svg class="opencode-tool-caret" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
@@ -4090,11 +4955,13 @@ async function duDeleteFile(path) {
   }
 }
 
-// --- Native Settings Tab: Skills + Files Integration ---
+// --- Native Settings Tab: Skills + Files + DeepUpgrade Integration ---
 let isSkillsTabActive = false;
 let isFilesTabActive = false;
+let isConfigTabActive = false;
 let duSkillsNavBtn = null;
 let duFilesNavBtn = null;
+let duConfigNavBtn = null;
 
 function injectSkillsSettingsButton() {
   const settingsNav = document.querySelector('.d316d158');
@@ -4152,20 +5019,49 @@ function injectSkillsSettingsButton() {
     duFilesNavBtn = btn;
   }
 
+  if (!settingsNav.querySelector('.du-config-nav-btn')) {
+    const btn = document.createElement('div');
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('tabindex', '0');
+    btn.className = 'ds-button ds-button--outlinedNeutral ds-button--borderless ds-button--capsule ds-button--m ds-button--icon-relative-m ds-button--min-width _266abb8 du-config-nav-btn';
+    btn.style.cssText = '--dsl-button-text-color: var(--dsw-alias-label-primary); --dsl-button-padding: 0 10px 0 8px; --dsl-button-border-radius: 12px; --dsl-button-icon-gap: 8px; cursor: pointer;';
+
+    btn.innerHTML = `
+    <div class="ds-button__background"></div>
+    <div class="ds-button__icon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+    </div>
+    <span class="ds-button__content">DeepUpgrade</span>
+  `;
+
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      activateConfigTab(btn, settingsNav);
+    };
+
+    settingsNav.appendChild(btn);
+    duConfigNavBtn = btn;
+  }
+
   // When clicking any original DeepSeek tab, restore the original content
-  const origTabs = settingsNav.querySelectorAll('div[role="button"]:not(.du-skills-nav-btn):not(.du-files-nav-btn)');
+  const origTabs = settingsNav.querySelectorAll('div[role="button"]:not(.du-skills-nav-btn):not(.du-files-nav-btn):not(.du-config-nav-btn)');
   origTabs.forEach(t => {
     if (t.getAttribute('data-du-tab-bound') === 'true') return;
     t.setAttribute('data-du-tab-bound', 'true');
     t.addEventListener('click', () => {
       deactivateSkillsTab(duSkillsNavBtn, settingsNav);
       deactivateFilesTab(duFilesNavBtn, settingsNav);
+      deactivateConfigTab(duConfigNavBtn, settingsNav);
     }, { capture: true });
   });
 }
 
 function activateSkillsTab(skillsBtn, settingsNav) {
   if (duFilesNavBtn) deactivateFilesTab(duFilesNavBtn, settingsNav);
+  if (duConfigNavBtn) deactivateConfigTab(duConfigNavBtn, settingsNav);
   isSkillsTabActive = true;
 
   // Un-highlight other tabs, highlight Skills
@@ -4199,6 +5095,7 @@ function deactivateSkillsTab(skillsBtn, settingsNav) {
 
 function activateFilesTab(filesBtn, settingsNav) {
   if (duSkillsNavBtn) deactivateSkillsTab(duSkillsNavBtn, settingsNav);
+  if (duConfigNavBtn) deactivateConfigTab(duConfigNavBtn, settingsNav);
   isFilesTabActive = true;
 
   settingsNav.querySelectorAll('div[role="button"]').forEach(t => {
@@ -4225,6 +5122,421 @@ function deactivateFilesTab(filesBtn, settingsNav) {
     Array.from(contentArea.children).forEach(ch => {
       ch.style.removeProperty('display');
     });
+  }
+}
+
+function activateConfigTab(configBtn, settingsNav) {
+  if (duSkillsNavBtn) deactivateSkillsTab(duSkillsNavBtn, settingsNav);
+  if (duFilesNavBtn) deactivateFilesTab(duFilesNavBtn, settingsNav);
+  isConfigTabActive = true;
+
+  settingsNav.querySelectorAll('div[role="button"]').forEach(t => {
+    t.classList.remove('_699d482');
+    t.style.removeProperty('--dsl-button-color');
+  });
+  configBtn.classList.add('_699d482');
+  configBtn.style.setProperty('--dsl-button-color', 'var(--dsw-alias-interactive-bg-hover)');
+
+  renderNativeConfigContent();
+}
+
+function deactivateConfigTab(configBtn, settingsNav) {
+  isConfigTabActive = false;
+  if (configBtn) {
+    configBtn.classList.remove('_699d482');
+    configBtn.style.removeProperty('--dsl-button-color');
+  }
+
+  const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
+  if (contentArea) {
+    const customPanel = contentArea.querySelector('.du-native-config-panel');
+    if (customPanel) customPanel.remove();
+    Array.from(contentArea.children).forEach(ch => {
+      ch.style.removeProperty('display');
+    });
+  }
+}
+
+function renderNativeConfigContent() {
+  const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
+  if (!contentArea) return;
+
+  // Hide original settings items (Theme, Language, Voice)
+  Array.from(contentArea.children).forEach(ch => {
+    if (!ch.classList.contains('du-native-config-panel')) {
+      ch.style.display = 'none';
+    }
+  });
+
+  let panel = contentArea.querySelector('.du-native-config-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.className = 'du-native-config-panel du-native-skills-panel';
+    contentArea.appendChild(panel);
+  }
+
+  const currentLimit = getContextLimit();
+  const plugins = getStoredPlugins();
+
+  panel.innerHTML = `
+    <div class="du-native-skills-container">
+      <div class="du-native-header-row">
+        <div>
+          <div class="du-native-title">DeepUpgrade Settings</div>
+          <div class="du-native-sub">Управление лимитом контекста и JavaScript-плагинами</div>
+        </div>
+        <span class="du-native-badge">${plugins.filter(p => p.enabled).length} плагинов акт.</span>
+      </div>
+
+      <!-- Section: Context Limit -->
+      <div class="du-native-add-box" style="margin-top: 0;">
+        <div class="du-native-add-header">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+            <line x1="6" y1="6" x2="6.01" y2="6"></line>
+            <line x1="6" y1="18" x2="6.01" y2="18"></line>
+          </svg>
+          <span class="du-native-add-title">Ограничение контекста вывода (Tool Context Limit)</span>
+        </div>
+        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin: 6px 0 12px;">
+          Максимальное число символов вывода одного инструмента, отправляемое в LLM. Предотвращает ошибку Context Overflow и зависание браузера при больших выводах.
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+          ${[
+            { label: '8 KB (8 тыс.)', val: 8000 },
+            { label: '16 KB (Рекомендуется)', val: 16000 },
+            { label: '32 KB (32 тыс.)', val: 32000 },
+            { label: '64 KB (64 тыс.)', val: 64000 },
+            { label: 'Без лимита', val: 0 }
+          ].map(p => `
+            <button class="du-limit-pill" data-val="${p.val}" type="button" style="padding: 6px 12px; border-radius: 8px; border: 1px solid ${currentLimit === p.val ? '#3b82f6' : 'rgba(255,255,255,0.1)'}; background: ${currentLimit === p.val ? 'rgba(59,130,246,0.2)' : 'rgba(0,0,0,0.2)'}; color: ${currentLimit === p.val ? '#60a5fa' : 'inherit'}; cursor: pointer; font-size: 12px; font-weight: ${currentLimit === p.val ? '600' : '400'};">
+              ${p.label}
+            </button>
+          `).join('')}
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span style="font-size: 12.5px; color: var(--dsw-alias-label-secondary, #cbd5e1);">Точный лимит символов:</span>
+          <input class="du-input du-custom-limit-input" type="number" min="0" max="1000000" step="1000" value="${currentLimit}" style="width: 140px; padding: 6px 10px;" />
+          <span class="du-limit-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">✓ Сохранено</span>
+        </div>
+      </div>
+
+      <!-- Section: JS Plugins -->
+      <div class="du-native-skills-list" style="margin-top: 8px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+          <div style="font-size: 14px; font-weight: 600;">Установленные JS-плагины</div>
+          <button class="du-btn-primary du-load-sample-plugin-btn" type="button" style="padding: 4px 10px; font-size: 11px;">+ Загрузить пример плагина</button>
+        </div>
+        ${plugins.length === 0 ? `
+          <div class="du-skills-empty-state" style="padding: 24px; text-align: center;">
+            <div class="du-empty-text" style="font-size: 14px; font-weight: 500;">Нет установленных JS-плагинов</div>
+            <div class="du-empty-hint" style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Перетащите ZIP-архив с плагином ниже для установки.</div>
+          </div>
+        ` : plugins.map(p => {
+          const fileKeys = p.files ? Object.keys(p.files) : [];
+          const assetCount = fileKeys.length;
+          return `
+          <div class="du-native-skill-row" style="flex-direction: column; align-items: stretch; gap: 8px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <div class="du-native-skill-info">
+                <div class="du-native-skill-title" style="display: flex; align-items: center; gap: 6px;">
+                  <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: ${p.enabled ? '#10b981' : '#71717a'}; flex-shrink: 0;"></span>
+                  <span class="du-skill-main-name" style="font-weight: 600;">${escapeHtml(p.name)}</span>
+                  <span style="font-size: 11px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.08); color: #94a3b8;">v${escapeHtml(p.version || '1.0.0')}</span>
+                </div>
+                <div class="du-native-skill-desc" style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${escapeHtml(p.desc || 'ZIP-плагин')}</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 3px;">
+                  Точка входа: <code>${escapeHtml(p.entryFile || 'index.js')}</code> • ${assetCount > 0 ? `${assetCount} файл(ов)/ассет(ов)` : 'Одиночный скрипт'}
+                </div>
+              </div>
+              <div class="du-native-skill-controls" style="display: flex; align-items: center; gap: 8px;">
+                <button class="du-toggle-files-btn" data-plugin-id="${p.id}" type="button" style="background: none; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; color: inherit; padding: 4px 8px; font-size: 11px; cursor: pointer;">
+                  Файлы (${assetCount})
+                </button>
+                <label class="du-switch">
+                  <input type="checkbox" data-plugin-id="${p.id}" ${p.enabled ? 'checked' : ''}>
+                  <span class="du-slider"></span>
+                </label>
+                <button class="du-native-del-btn" data-del-plugin="${p.id}" title="Удалить плагин">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M2 4h12M5.333 4V2.667a1.333 1.333 0 011.334-1.334h2.666a1.333 1.333 0 011.334 1.334V4m2 0v9.333a1.333 1.333 0 01-1.334 1.334H4.667a1.333 1.333 0 01-1.334-1.334V4h9.334z"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <!-- Collapsible files list -->
+            <div class="du-plugin-files-box" id="files_${p.id}" style="display: none; margin-top: 6px; background: rgba(0,0,0,0.25); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1;">Файлы и ассеты архива:</div>
+              <div style="display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto;">
+                ${fileKeys.length === 0 ? `
+                  <div style="font-size: 11px; color: #64748b;">(Нет прикрепленных файлов)</div>
+                ` : fileKeys.map(fk => {
+                  const f = p.files[fk];
+                  const sizeKb = f && f.size ? (f.size / 1024).toFixed(1) + ' KB' : '0 KB';
+                  return `
+                    <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; font-family: monospace; padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,0.03);">
+                      <span>${fk === p.entryFile ? '⚡ ' : '📄 '}${escapeHtml(fk)}</span>
+                      <span style="color: #64748b; font-size: 10.5px;">${f && f.isBinary ? 'Binary • ' : ''}${sizeKb}</span>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </div>
+          </div>
+          `;
+        }).join('')}
+      </div>
+
+      <!-- Install Plugin from ZIP -->
+      <div class="du-native-add-box du-zip-dropzone" style="margin-top: 14px; border: 2px dashed rgba(255,255,255,0.2); border-radius: 12px; padding: 22px 16px; text-align: center; cursor: pointer; transition: all 0.2s ease;">
+        <input type="file" class="du-zip-file-input" accept=".zip" style="display: none;" />
+        <div style="display: flex; justify-content: center; margin-bottom: 8px;">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+        </div>
+        <div style="font-size: 13.5px; font-weight: 600; color: var(--dsw-alias-label-primary, #f1f5f9);">
+          Перетащите сюда ZIP-архив с плагином или нажмите для выбора
+        </div>
+        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin-top: 5px;">
+          Поддерживаются многофайловые скрипты, манифест <code>plugin.json</code> и ассеты (CSS, HTML, изображения, JSON).
+        </div>
+        <div class="du-zip-status" style="font-size: 12px; margin-top: 10px; font-weight: 500; display: none;"></div>
+      </div>
+    </div>
+  `;
+
+  // Bind Context Limit Pills & Input
+  const limitInput = panel.querySelector('.du-custom-limit-input');
+  const limitStatus = panel.querySelector('.du-limit-status');
+  const showSaved = () => {
+    if (limitStatus) {
+      limitStatus.style.display = 'inline';
+      setTimeout(() => { limitStatus.style.display = 'none'; }, 2000);
+    }
+  };
+
+  panel.querySelectorAll('.du-limit-pill').forEach(btn => {
+    btn.onclick = () => {
+      const val = parseInt(btn.getAttribute('data-val'), 10);
+      setContextLimit(val);
+      if (limitInput) limitInput.value = val;
+      panel.querySelectorAll('.du-limit-pill').forEach(p => {
+        const pVal = parseInt(p.getAttribute('data-val'), 10);
+        p.style.border = pVal === val ? '1px solid #3b82f6' : '1px solid rgba(255,255,255,0.1)';
+        p.style.background = pVal === val ? 'rgba(59,130,246,0.2)' : 'rgba(0,0,0,0.2)';
+        p.style.color = pVal === val ? '#60a5fa' : 'inherit';
+        p.style.fontWeight = pVal === val ? '600' : '400';
+      });
+      showSaved();
+    };
+  });
+
+  if (limitInput) {
+    limitInput.onchange = () => {
+      const val = Math.max(0, parseInt(limitInput.value, 10) || 0);
+      setContextLimit(val);
+      showSaved();
+    };
+  }
+
+  // Bind Plugin Toggles
+  panel.querySelectorAll('input[type="checkbox"][data-plugin-id]').forEach(chk => {
+    chk.onchange = () => {
+      const pid = chk.getAttribute('data-plugin-id');
+      const allPlugins = getStoredPlugins();
+      const p = allPlugins.find(item => item.id === pid);
+      if (p) {
+        p.enabled = chk.checked;
+        saveStoredPlugins(allPlugins);
+        reloadAllPlugins();
+        renderNativeConfigContent();
+      }
+    };
+  });
+
+  // Toggle Files View
+  panel.querySelectorAll('.du-toggle-files-btn').forEach(btn => {
+    btn.onclick = () => {
+      const pid = btn.getAttribute('data-plugin-id');
+      const box = panel.querySelector(`#files_${pid}`);
+      if (box) {
+        box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      }
+    };
+  });
+
+  // Delete Plugin
+  panel.querySelectorAll('.du-native-del-btn[data-del-plugin]').forEach(btn => {
+    btn.onclick = () => {
+      const pid = btn.getAttribute('data-del-plugin');
+      let allPlugins = getStoredPlugins();
+      const p = allPlugins.find(item => item.id === pid);
+      if (!confirm(`Удалить плагин "${p ? p.name : pid}"?`)) return;
+      allPlugins = allPlugins.filter(item => item.id !== pid);
+      saveStoredPlugins(allPlugins);
+      reloadAllPlugins();
+      renderNativeConfigContent();
+    };
+  });
+
+  // ZIP Drag & Drop / Upload
+  const dropzone = panel.querySelector('.du-zip-dropzone');
+  const zipInput = panel.querySelector('.du-zip-file-input');
+  const zipStatus = panel.querySelector('.du-zip-status');
+
+  const setStatus = (msg, isError = false) => {
+    if (!zipStatus) return;
+    zipStatus.style.display = 'block';
+    zipStatus.style.color = isError ? '#ef4444' : '#10b981';
+    zipStatus.textContent = msg;
+  };
+
+  const handleZipFile = async (file) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      setStatus('Ошибка: выберите архив с расширением .zip', true);
+      return;
+    }
+    try {
+      setStatus('Распаковка архива и проверка плагина...');
+      const ab = await file.arrayBuffer();
+      const installed = await duInstallPluginFromZip(ab, file.name);
+      setStatus(`✓ Плагин "${installed.name}" успешно установлен!`);
+      setTimeout(() => renderNativeConfigContent(), 800);
+    } catch (err) {
+      console.error('[DeepUpgrade ZIP Install Error]', err);
+      setStatus(`Ошибка установки: ${err.message}`, true);
+    }
+  };
+
+  if (dropzone && zipInput) {
+    dropzone.onclick = (e) => {
+      if (e.target !== zipInput) zipInput.click();
+    };
+
+    dropzone.ondragover = (e) => {
+      e.preventDefault();
+      dropzone.style.borderColor = '#3b82f6';
+      dropzone.style.background = 'rgba(59,130,246,0.1)';
+    };
+
+    dropzone.ondragleave = (e) => {
+      e.preventDefault();
+      dropzone.style.borderColor = 'rgba(255,255,255,0.2)';
+      dropzone.style.background = 'transparent';
+    };
+
+    dropzone.ondrop = (e) => {
+      e.preventDefault();
+      dropzone.style.borderColor = 'rgba(255,255,255,0.2)';
+      dropzone.style.background = 'transparent';
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      handleZipFile(file);
+    };
+
+    zipInput.onchange = (e) => {
+      const file = e.target.files && e.target.files[0];
+      handleZipFile(file);
+      zipInput.value = '';
+    };
+  }
+
+  // Load Sample Plugin Button
+  const sampleBtn = panel.querySelector('.du-load-sample-plugin-btn');
+  if (sampleBtn) {
+    sampleBtn.onclick = () => {
+      const samplePlugin = {
+        id: 'plug_calc_sample',
+        name: 'calc_pro',
+        version: '1.0.0',
+        desc: 'Математический калькулятор с ассетом справки (help.json)',
+        entryFile: 'index.js',
+        code: `// Калькулятор с загрузкой ассета справки
+const helpData = JSON.parse(DeepUpgrade.getAsset('help.json') || '{}');
+
+DeepUpgrade.registerTool({
+  name: "calc",
+  description: "Вычисляет математическое выражение в браузере или возвращает справку. Аргументы: { expr: string }",
+  execute: async (args) => {
+    const expr = args.expr || args.command || args.expression || '';
+    if (!expr || expr === 'help') {
+      return "Справка по калькулятору (из help.json):\\n" + JSON.stringify(helpData, null, 2);
+    }
+    try {
+      const res = Function('"use strict"; return (' + expr + ')')();
+      return "Результат: " + res;
+    } catch(err) {
+      return "Ошибка вычисления: " + err.message;
+    }
+  }
+});`,
+        files: {
+          'plugin.json': {
+            name: 'plugin.json',
+            size: 140,
+            isBinary: false,
+            text: JSON.stringify({
+              name: 'calc_pro',
+              version: '1.0.0',
+              description: 'Математический калькулятор с ассетом справки (help.json)',
+              main: 'index.js'
+            }, null, 2)
+          },
+          'index.js': {
+            name: 'index.js',
+            size: 750,
+            isBinary: false,
+            text: `// Калькулятор с загрузкой ассета справки
+const helpData = JSON.parse(DeepUpgrade.getAsset('help.json') || '{}');
+
+DeepUpgrade.registerTool({
+  name: "calc",
+  description: "Вычисляет математическое выражение в браузере или возвращает справку. Аргументы: { expr: string }",
+  execute: async (args) => {
+    const expr = args.expr || args.command || args.expression || '';
+    if (!expr || expr === 'help') {
+      return "Справка по калькулятору (из help.json):\\n" + JSON.stringify(helpData, null, 2);
+    }
+    try {
+      const res = Function('"use strict"; return (' + expr + ')')();
+      return "Результат: " + res;
+    } catch(err) {
+      return "Ошибка вычисления: " + err.message;
+    }
+  }
+});`
+          },
+          'help.json': {
+            name: 'help.json',
+            size: 180,
+            isBinary: false,
+            text: JSON.stringify({
+              operators: ['+', '-', '*', '/', '%', '**'],
+              functions: ['Math.sqrt', 'Math.sin', 'Math.cos', 'Math.pow'],
+              examples: ['2 * (10 + 5)', 'Math.sqrt(256)', '2 ** 8']
+            }, null, 2)
+          }
+        },
+        enabled: true,
+        createdAt: Date.now()
+      };
+
+      const allPlugins = getStoredPlugins();
+      const existingIdx = allPlugins.findIndex(p => p.id === samplePlugin.id || p.name === samplePlugin.name);
+      if (existingIdx !== -1) {
+        allPlugins[existingIdx] = samplePlugin;
+      } else {
+        allPlugins.push(samplePlugin);
+      }
+      saveStoredPlugins(allPlugins);
+      reloadAllPlugins();
+      duMountPluginToVfs(samplePlugin);
+      renderNativeConfigContent();
+    };
   }
 }
 
@@ -4731,6 +6043,9 @@ function findComposerCard(input) {
     start = typeof findDeepSeekInput === 'function' ? findDeepSeekInput() : null;
   }
   if (!start) return null;
+  if (start.closest && start.closest('[role="dialog"], .ds-modal, .du-native-skills-panel, .du-native-files-panel, .du-native-config-panel')) {
+    return null;
+  }
   if (!start.matches || !start.matches('textarea, input, [contenteditable="true"]')) {
     start = start.querySelector('textarea, input, [contenteditable="true"]') || start;
   }
@@ -4743,6 +6058,9 @@ function findComposerCard(input) {
   let el = start.parentElement;
   let roundedOnly = null;
   for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+    if (el.closest && el.closest('[role="dialog"], .ds-modal, .du-native-skills-panel, .du-native-files-panel, .du-native-config-panel')) {
+      return null;
+    }
     const cs = window.getComputedStyle(el);
     const radius = parseFloat(cs.borderTopLeftRadius) || 0;
     if (radius < 12) continue;
@@ -4812,6 +6130,9 @@ function syncProjectBarGeometry(bar, card) {
 // </du-project-plate>
 
 function injectProjectSelector() {
+  // Purge any rogue plates that leaked into modal dialogs or settings panels
+  document.querySelectorAll('[role="dialog"] .du-project-top-bar, .du-native-config-panel .du-project-top-bar, .du-native-skills-panel .du-project-top-bar, .du-native-files-panel .du-project-top-bar').forEach((node) => node.remove());
+
   const card = findComposerCard();
   if (!card) return;
 
@@ -5001,7 +6322,9 @@ const observer = new MutationObserver(() => {
   hookInput();
   hookAttachmentElements();
   processToolCalls();
-  publishDirectiveToMainWorld(false);
+  watchComposerSend();
+  // The durable store may hold files the model should know about.
+  refreshStoreAssets().then(() => publishDirectiveToMainWorld(false));
   injectSkillsSettingsButton();
   injectAgentToggleButton();
   injectProjectSelector();

@@ -38,6 +38,18 @@
     }
   }
 
+  /**
+   * Remember that a real user message went out.
+   *
+   * The content script only sees the composer, and the send button is not
+   * always inside the element it hooks - so "a message was sent" was often
+   * never detected and every tool call was rejected as chat history.
+   * The interceptor sees the actual request, so it is the reliable place.
+   */
+  function markUserMessageSent() {
+    try { localStorage.setItem('du_user_message_ts', String(Date.now())); } catch (e) {}
+  }
+
   function isInternalDeepSeekRequest(url, parsedBody) {
     const u = String(url || '').toLowerCase();
     if (u.includes('telemetry') || u.includes('generate_title') || u.includes('session_title')) return true;
@@ -60,11 +72,13 @@
    * Returns the new prompt, or null when the body must stay untouched.
    */
   function buildAgentPrompt(parsedBody) {
-    if (isInternalDeepSeekRequest('', parsedBody)) {
-      return null;
-    }
     const rawPrompt = String(parsedBody.prompt || '').trim();
     if (!rawPrompt) return null;
+
+    // Never mutate DeepSeek's internal title generation or suggestion prompts!
+    if (rawPrompt.startsWith('Generate the session title') || rawPrompt.includes('JSON array of human messages')) {
+      return null;
+    }
 
     // Agent switch is shared with the content script through the page's
     // localStorage: content.js writes the flag, this MAIN-world script
@@ -76,6 +90,8 @@
     const hasDirectiveAlready = rawPrompt.includes('[SYSTEM CAPABILITY:') || rawPrompt.includes('[SYSTEM INSTRUCTION:');
     const isSandboxOutput = rawPrompt.startsWith('[SANDBOX OUTPUT');
     const isFirstTurn = !parsedBody.parent_message_id && !window.__DU_NETWORK_CONTEXT__.lastParentMessageId;
+
+    if (!isSandboxOutput) markUserMessageSent();
 
     const shared = readSharedDirective();
 
@@ -307,43 +323,56 @@
       throw new Error(`HTTP ${response.status}: ${errText}`);
     }
 
-    // Inform user in console that LLM accepted and is generating
-    console.log('%c[DeepUpgrade Direct API] 📡 Сервер принял запрос, чтение потока ответа...', 'color: #a855f7; font-weight: bold;');
+    try {
+      window.postMessage({
+        type: 'DU_OUTGOING_PROMPT',
+        prompt: promptText,
+        transport: 'direct_api',
+        ts: Date.now()
+      }, '*');
+    } catch (e) {}
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
+    // Process stream in background so response_message_id and visual sync stay updated
+    // without blocking the send job on the full model completion.
+    (async () => {
+      try {
+        console.log('%c[DeepUpgrade Direct API] 📡 Сервер принял запрос, чтение потока ответа...', 'color: #a855f7; font-weight: bold;');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      fullText += chunk;
-      
-      // Real-time harvest of newly generated response_message_id for seamless linear branching!
-      if (chunk.includes('response_message_id')) {
-        const idMatch = chunk.match(/"response_message_id"\s*:\s*(\d+)/);
-        if (idMatch) {
-          window.__DU_NETWORK_CONTEXT__.lastParentMessageId = parseInt(idMatch[1], 10);
-          console.log('%c[DeepUpgrade Direct API] 🔗 Следующий parent_message_id обновлен на:', 'color: #38bdf8;', window.__DU_NETWORK_CONTEXT__.lastParentMessageId);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          fullText += chunk;
+
+          // Real-time harvest of newly generated response_message_id for seamless linear branching!
+          if (chunk.includes('response_message_id')) {
+            const idMatch = chunk.match(/"response_message_id"\s*:\s*(\d+)/);
+            if (idMatch) {
+              window.__DU_NETWORK_CONTEXT__.lastParentMessageId = parseInt(idMatch[1], 10);
+              console.log('%c[DeepUpgrade Direct API] 🔗 Следующий parent_message_id обновлен на:', 'color: #38bdf8;', window.__DU_NETWORK_CONTEXT__.lastParentMessageId);
+            }
+          }
+
+          if (typeof onChunk === 'function') onChunk(chunk);
         }
+
+        console.log('%c[DeepUpgrade Direct API] 🏁 Ответ модели полностью получен по сети!', 'color: #4ade80; font-weight: bold;');
+
+        // Trigger visual sync on DeepSeek page so UI updates message list
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('du_network_message_finished', { detail: { sessionId } }));
+          const activeNav = document.querySelector('div[class*="active"][class*="session"], div[aria-selected="true"]');
+          if (activeNav) activeNav.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }, 100);
+      } catch (streamErr) {
+        console.warn('[DeepUpgrade Direct API] Background stream read error:', streamErr);
       }
+    })();
 
-      if (typeof onChunk === 'function') onChunk(chunk);
-    }
-
-    console.log('%c[DeepUpgrade Direct API] 🏁 Ответ модели полностью получен по сети!', 'color: #4ade80; font-weight: bold;');
-
-    // Trigger visual sync on DeepSeek page so UI updates message list
-    setTimeout(() => {
-      // Dispatch soft navigation / history sync event
-      window.dispatchEvent(new CustomEvent('du_network_message_finished', { detail: { sessionId } }));
-      // Also trigger a gentle click on active session in sidebar if present
-      const activeNav = document.querySelector('div[class*="active"][class*="session"], div[aria-selected="true"]');
-      if (activeNav) activeNav.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    }, 100);
-
-    return fullText;
+    return { success: true, mode: 'direct_api' };
   };
 
   // Bridge: Handle Direct Network Send requests from content script
@@ -464,6 +493,15 @@
                 init.body = newBodyStr;
               }
             }
+
+            try {
+              window.postMessage({
+                type: 'DU_OUTGOING_PROMPT',
+                prompt: parsedBody.prompt,
+                transport: 'fetch',
+                ts: Date.now()
+              }, '*');
+            } catch (e) {}
           }
 
           // If this request has prompt or content or session
@@ -578,6 +616,14 @@
               capturedAt: new Date().toISOString()
             };
           }
+          try {
+            window.postMessage({
+              type: 'DU_OUTGOING_PROMPT',
+              prompt: parsedBody.prompt,
+              transport: 'xhr',
+              ts: Date.now()
+            }, '*');
+          } catch (e) {}
         }
       } catch (e) {
         console.warn('[DeepUpgrade Sniffer] XHR body rewrite failed:', e);

@@ -41,7 +41,8 @@ const VALUE_FLAGS = new Set([
   'prompt', 'token', 'token-file', 'session', 'parent', 'challenge', 'threads',
   'har', 'cookie', 'cookie-file', 'base-url', 'timeout', 'save', 'system',
   'browser', 'profile', 'login-timeout', 'debug-port',
-  'chat', 'chat-history', 'import-chat'
+  'chat', 'chat-history', 'import-chat',
+  'transport', 'curl-path', 'impersonate', 'chrome-version', 'accept-language'
 ]);
 const ALIASES = {
   p: 'prompt',
@@ -119,6 +120,8 @@ DeepUpgrade Direct API CLI — посмотреть и повторить HTTP-�
       --browser <name>      chrome | edge | brave | chromium | vivaldi | default.
       --profile <sel>       Профиль браузера: номер, имя каталога, имя или email.
                             Без флага CLI спросит, если профилей несколько.
+      --new-profile         Открыть чистый временный профиль (для входа
+                            в другой аккаунт). Работает вместе с --login.
       --login-timeout <сек> Сколько ждать входа в аккаунт (по умолчанию 180).
       --keep-browser        Не закрывать браузер после получения токена.
       --no-browser          Не открывать браузер автоматически.
@@ -136,6 +139,15 @@ DeepUpgrade Direct API CLI — посмотреть и повторить HTTP-�
       --import-chat <id>    Импортировать чат аккаунта в локальные.
       --dry-run             Получить PoW и показать запрос, но не отправлять.
       --thinking            thinking_enabled=true.
+
+Транспорт и TLS:
+      --transport <type>     native | tls (по умолчанию: native). tls повторяет
+                            браузерный TLS/HTTP2-отпечаток через curl_cffi.
+      --curl-path <path>     Бинарник curl-impersonate. Если не задан, TLS
+                            работает через Python-пакет curl_cffi.
+      --impersonate <ver>    Браузер для имитации (по умолчанию: chrome131).
+      --chrome-version <ver> Версия Chrome для User-Agent (по умолчанию: 131.0.0.0).
+      --accept-language <lang> Язык для заголовков (по умолчанию: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7).
       --search              search_enabled=true.
       --system <текст>      Добавить [SYSTEM INSTRUCTION: ...] перед запросом.
       --threads <n>         Потоков для PoW (по умолчанию до 8).
@@ -227,7 +239,12 @@ function createContext(args) {
     session: args.session ? String(args.session) : '',
     parent: args.parent === undefined ? null : args.parent,
     threads: args.threads === undefined ? undefined : Number(args.threads),
-    timeoutMs: Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec * 1000 : 0
+    timeoutMs: Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec * 1000 : 0,
+    transport: args.transport || 'native',
+    'curl-path': args['curl-path'],
+    impersonate: args.impersonate,
+    'chrome-version': args['chrome-version'],
+    'accept-language': args['accept-language']
   };
 
   if (args.har) {
@@ -253,7 +270,12 @@ function clientFromCtx(ctx) {
     token: ctx.token,
     cookie: ctx.cookie,
     timeoutMs: ctx.timeoutMs,
-    threads: ctx.threads
+    threads: ctx.threads,
+    transport: ctx.transport || 'native',
+    curlPath: ctx['curl-path'],
+    impersonate: ctx.impersonate || 'chrome131',
+    chromeVersion: ctx['chrome-version'] || '131.0.0.0',
+    acceptLanguage: ctx['accept-language'] || 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
   });
 }
 
@@ -358,12 +380,15 @@ async function runOnce(ctx, prompt, opts) {
     parent_message_id: ctx.parent === null || ctx.parent === '' ? null : (
       /^\d+$/.test(String(ctx.parent)) ? Number(ctx.parent) : ctx.parent
     ),
-    model_type: null,
+    model_type: 'default',
     prompt,
     ref_file_ids: [],
     thinking_enabled: !!opts.thinking
   };
   if (opts.search) body.search_enabled = true;
+  // Fields the web client always sends, in its order.
+  body.action = null;
+  body.preempt = false;
 
   const snapshot = requestSnapshot(ctx, body, powHeader);
 
@@ -698,9 +723,23 @@ async function main() {
   if (jsonMode) stdout.write(JSON.stringify(result, null, 2) + '\n');
 }
 
+/** Turns the common server refusals into a readable line instead of raw JSON. */
+function formatError(err) {
+  const message = String((err && err.message) || err || '');
+  if (/user is muted/i.test(message)) {
+    const match = message.match(/"mute_until":\s*([\d.]+)/);
+    const until = match ? new Date(Number(match[1]) * 1000) : null;
+    const when = until && !Number.isNaN(until.getTime())
+      ? ` до ${until.toLocaleString('ru-RU')}` : '';
+    return `аккаунт DeepSeek замьючен${when} (biz_code=5, user is muted).\n` +
+      'Транспорт и токен в порядке — сервер временно не принимает сообщения.';
+  }
+  return err && err.stack ? err.stack : message;
+}
+
 if (require.main === module) {
   main().catch((err) => {
-    process.stderr.write('\nОшибка: ' + (err && err.stack ? err.stack : String(err)) + '\n');
+    process.stderr.write('\nОшибка: ' + formatError(err) + '\n');
     process.exitCode = 1;
   });
 }
