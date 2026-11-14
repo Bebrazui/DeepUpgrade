@@ -163,12 +163,21 @@ async function main() {
     r = await out('echo ${MISSING:-fallback}');
     check('default expansion', r.ok && r.text.trim() === 'fallback', r.text);
 
+    r = await out('echo $BASH_VERSION');
+    check('BASH_VERSION is set', r.ok && r.text.includes('5.2'), r.text);
+
     console.log('quoting');
     r = await out("echo 'a;b' > /t/semi.txt; cat /t/semi.txt");
     check('semicolon inside quotes is literal', r.ok && r.text.trim() === 'a;b', r.text);
 
     r = await out("printf '%s\\n' a b");
     check('printf repeats the format', r.ok && r.text === 'a\nb', r.text);
+
+    r = await out("printf '%-8s OK\\n' ls cat");
+    check('printf width specifier and left-align', r.ok && r.text === 'ls       OK\ncat      OK', r.text);
+
+    r = await out("printf 'fixed\\n' a b c");
+    check('printf without specifiers stops cleanly without loop', r.ok && r.text === 'fixed', r.text);
 
     r = await out('echo -n noeol; echo x');
     check('echo -n drops the newline', r.ok && r.text.trim() === 'noeolx', r.text);
@@ -291,6 +300,10 @@ async function main() {
 
     r = await out('my_cmd() { echo foo; }; type my_cmd');
     check('type recognizes functions', r.ok && r.text.includes('is a function'), r.text);
+
+    console.log('agent probe loop');
+    r = await out("echo '--- builtins check ---'; for c in ls cat grep sed awk curl wget find head tail sort tr cut wc mkdir cp mv rm touch chmod date whoami id env echo printf; do if command -v $c >/dev/null 2>&1; then printf '%-8s OK\\n' $c; else printf '%-8s MISSING\\n' $c; fi; done");
+    check('agent builtins loop succeeds with OK for all', r.ok && !r.text.includes('MISSING') && r.text.includes('ls       OK') && r.text.includes('printf   OK'), r.text);
 
     console.log('errors');
     r = await out('cat /nope/missing.txt');

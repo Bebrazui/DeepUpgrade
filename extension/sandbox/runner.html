@@ -778,6 +778,10 @@
             USER: 'alex',
             LOGNAME: 'alex',
             SHELL: '/bin/bash',
+            BASH: '/bin/bash',
+            BASH_VERSION: '5.2.15(1)-release',
+            OSTYPE: 'linux-gnu',
+            MACHTYPE: 'x86_64-pc-linux-gnu',
             PATH: '/usr/local/bin:/usr/bin:/bin',
             TERM: 'xterm-256color',
             LANG: 'C.UTF-8',
@@ -1873,41 +1877,88 @@
 
         case 'printf': {
           if (args.length === 0) return ok('');
-          let format = args[0];
+          const format = args[0];
           const values = args.slice(1);
           let vi = 0;
           let out = '';
           let guard = 0;
+          const specRe = /%([-+ 0#]*)(\d+)?(?:\.(\d+))?([%sdifuxXcb])/g;
           do {
+            const prevVi = vi;
+            let lastIdx = 0;
             let chunk = '';
-            for (let i = 0; i < format.length; i++) {
-              const ch = format[i];
-              if (ch === '\\') {
-                const seq = format.slice(i, i + 2);
-                chunk += shellUnescape(seq);
-                i++;
+            specRe.lastIndex = 0;
+            let match;
+            while ((match = specRe.exec(format)) !== null) {
+              chunk += shellUnescape(format.slice(lastIdx, match.index));
+              lastIdx = specRe.lastIndex;
+
+              const [, flags, width, precision, type] = match;
+              if (type === '%') {
+                chunk += '%';
                 continue;
               }
-              if (ch === '%') {
-                const spec = format[i + 1];
-                if (spec === '%') { chunk += '%'; i++; continue; }
-                if (spec === 's' || spec === 'd' || spec === 'i' || spec === 'f' || spec === 'c' || spec === 'b') {
-                  const raw = values[vi++] ?? '';
-                  if (spec === 'd' || spec === 'i') chunk += String(parseInt(raw, 10) || 0);
-                  else if (spec === 'f') chunk += String(parseFloat(raw) || 0);
-                  else if (spec === 'c') chunk += String(raw).slice(0, 1);
-                  else if (spec === 'b') chunk += shellUnescape(String(raw));
-                  else chunk += String(raw);
-                  i++;
-                  continue;
+
+              const raw = values[vi++] ?? '';
+              let val = '';
+              if (type === 's') {
+                val = String(raw);
+                if (precision !== undefined) val = val.slice(0, parseInt(precision, 10));
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, ' ');
                 }
-                chunk += ch;
-                continue;
+              } else if (type === 'c') {
+                val = String(raw).slice(0, 1);
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, ' ');
+                }
+              } else if (type === 'b') {
+                val = shellUnescape(String(raw));
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, ' ');
+                }
+              } else if (type === 'd' || type === 'i' || type === 'u') {
+                let num = parseInt(raw, 10);
+                if (Number.isNaN(num)) num = 0;
+                val = String(num);
+                if (flags.includes('+') && num >= 0) val = '+' + val;
+                else if (flags.includes(' ') && num >= 0) val = ' ' + val;
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  const padChar = (!flags.includes('-') && flags.includes('0')) ? '0' : ' ';
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, padChar);
+                }
+              } else if (type === 'x' || type === 'X') {
+                let num = parseInt(raw, 10);
+                if (Number.isNaN(num)) num = 0;
+                val = (num >>> 0).toString(16);
+                if (type === 'X') val = val.toUpperCase();
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  const padChar = (!flags.includes('-') && flags.includes('0')) ? '0' : ' ';
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, padChar);
+                }
+              } else if (type === 'f') {
+                let num = parseFloat(raw);
+                if (Number.isNaN(num)) num = 0;
+                val = (precision !== undefined) ? num.toFixed(parseInt(precision, 10)) : String(num);
+                if (flags.includes('+') && num >= 0) val = '+' + val;
+                else if (flags.includes(' ') && num >= 0) val = ' ' + val;
+                if (width !== undefined) {
+                  const w = parseInt(width, 10);
+                  const padChar = (!flags.includes('-') && flags.includes('0')) ? '0' : ' ';
+                  val = flags.includes('-') ? val.padEnd(w, ' ') : val.padStart(w, padChar);
+                }
               }
-              chunk += ch;
+              chunk += val;
             }
+            chunk += shellUnescape(format.slice(lastIdx));
             out += chunk;
             guard++;
+            if (vi === prevVi) break;
           } while (vi < values.length && guard < 10000);
           return ok(out);
         }
@@ -2110,6 +2161,11 @@
             if (vfsStatNorm(norm)) continue;
             await vfsWriteTextNorm(norm, '');
           }
+          return ok('');
+        }
+
+        case 'chmod':
+        case 'chown': {
           return ok('');
         }
 
@@ -2904,6 +2960,7 @@
     const SHELL_COMMANDS = new Set([
       'echo', 'printf', 'cat', 'ls', 'pwd', 'cd', 'mkdir', 'rmdir', 'rm', 'cp', 'mv',
       'touch', 'head', 'tail', 'wc', 'grep', 'sed', 'sort', 'uniq', 'tr', 'find', 'tree',
+      'chmod', 'chown',
       'basename', 'dirname', 'realpath', 'test', '[', 'export', 'unset', 'set', 'env',
       'printenv', 'which', 'command', 'type', 'seq', 'expr', 'date', 'sleep', 'curl',
       'python', 'python3', 'uname', 'whoami', 'hostname', 'id', 'clear', 'more', 'less',
