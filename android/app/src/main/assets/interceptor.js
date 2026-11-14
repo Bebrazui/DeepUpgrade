@@ -95,24 +95,58 @@
 
     const shared = readSharedDirective();
 
+    // Check if the conversation has already received the system directive.
+    // If turn 1 was sent with Agent mode OFF and the user enables Agent mode on turn 2,
+    // the model has never received the system instructions. We must inject them now.
+    function hasSystemDirectiveInDom() {
+      try {
+        const bubbles = document.querySelectorAll('.fbb737a4, div[class*="message"], .ds-message');
+        for (const b of bubbles) {
+          const text = b.textContent || '';
+          if (text.includes('[SYSTEM CAPABILITY:') || text.includes('[SYSTEM INSTRUCTION:')) {
+            return true;
+          }
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    const sessionId = parsedBody.chat_session_id || getCurrentChatSessionId() || 'new';
+    const systemAlreadySent = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('du_sys_sent_' + sessionId) === '1') || hasSystemDirectiveInDom();
+    const shouldInjectSystem = isFirstTurn || !systemAlreadySent;
+
     if (isAgentActive && !isSandboxOutput && shared) {
       const markerIdx = rawPrompt.indexOf('[USER REQUEST]:');
       const userText = markerIdx !== -1
         ? rawPrompt.slice(markerIdx + '[USER REQUEST]:'.length).trim()
         : rawPrompt;
-      // The full system prompt only goes with the first message; the skill
-      // list and the attached assets go with every message, so a skill
-      // installed mid-conversation is applied right away.
-      const head = ((isFirstTurn ? shared.system : '') + shared.skills + shared.assets).trim();
+
+      const includeSystem = shouldInjectSystem && !hasDirectiveAlready;
+      if (includeSystem) {
+        try {
+          if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem('du_sys_sent_' + sessionId, '1');
+          }
+        } catch (e) {}
+      }
+
+      // Inject system prompt if it has not been sent to this chat yet.
+      // The skill list and attached assets always go with every active agent message.
+      const head = ((includeSystem ? shared.system : '') + shared.skills + shared.assets).trim();
       if (head) {
-        console.log(`[DeepUpgrade Sniffer] Directive attached (skills=${(shared.skills.match(/\n- /g) || []).length}, assets=${(shared.assets.match(/\n- /g) || []).length})`);
+        console.log(`[DeepUpgrade Sniffer] Directive attached (system=${includeSystem}, skills=${(shared.skills.match(/\n- /g) || []).length}, assets=${(shared.assets.match(/\n- /g) || []).length})`);
         return `${head}\n\n[USER REQUEST]: ${userText}`;
       }
       return null;
     }
 
-    if (isAgentActive && isFirstTurn && !hasDirectiveAlready && !isSandboxOutput) {
-      console.log('%c[DeepUpgrade Sniffer] 🛡️ Применяем агентский системный промпт (первое сообщение сессии)!', 'color: #3b82f6; font-weight: bold;');
+    if (isAgentActive && shouldInjectSystem && !hasDirectiveAlready && !isSandboxOutput) {
+      console.log('%c[DeepUpgrade Sniffer] 🛡️ Применяем агентский системный промпт!', 'color: #3b82f6; font-weight: bold;');
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.setItem('du_sys_sent_' + sessionId, '1');
+        }
+      } catch (e) {}
       const getSysDirective = window.__DU_GET_SYSTEM_DIRECTIVE__ || (() => {
         return `[SYSTEM INSTRUCTION: OPENCODE AUTONOMOUS AGENT ACTIVE]\nYou are DeepUpgrade, an autonomous AI software engineer with direct access to an in-browser WebAssembly sandbox (POSIX Shell, VFS /, Python 3, JS Runner).\n\nTOOL USAGE MATRIX:\n- "write": MUST be used whenever creating or completely writing any file. Never use bash echo or python open.\n- "edit": Surgical string replacement in existing files (exact old_str match).\n- "read": Read file contents with line offset/limit.\n- "glob": Search files by pattern.\n- "grep": Search file contents.\n- "bash": Running shell commands, git, directory inspections.\n- "python": Data analysis, computing, generating charts.\n- "js": Async network and API requests.\n- "question": Interactive user clarification options.\n- "todowrite": Create/update structured task list when task has multiple steps (todos: [{content, status}]).\n- "install_skill": Register persistent workflows.\n\nEXECUTION PROTOCOL:\n1. Call ONLY ONE \`\`\`json:tool block per response.\n2. STOP immediately after closing the tool block and wait for [SANDBOX OUTPUT].\n3. No conversational filler before tools. Directly invoke the tool.\n\n`;
       });
