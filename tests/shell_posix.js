@@ -305,6 +305,38 @@ async function main() {
     r = await out("echo '--- builtins check ---'; for c in ls cat grep sed awk curl wget find head tail sort tr cut wc mkdir cp mv rm touch chmod date whoami id env echo printf; do if command -v $c >/dev/null 2>&1; then printf '%-8s OK\\n' $c; else printf '%-8s MISSING\\n' $c; fi; done");
     check('agent builtins loop succeeds with OK for all', r.ok && !r.text.includes('MISSING') && r.text.includes('ls       OK') && r.text.includes('printf   OK'), r.text);
 
+    console.log('advanced bash features');
+    r = await out('if [[ "abc" == a* ]]; then echo glob-match OK; fi');
+    check('[[ ]] pattern matching', r.ok && r.text.trim() === 'glob-match OK', r.text);
+
+    r = await out('if [[ 5 -gt 3 && "x" != "y" ]]; then echo logic OK; fi');
+    check('[[ ]] compound logic', r.ok && r.text.trim() === 'logic OK', r.text);
+
+    r = await out('arr=(one two three); echo count=${#arr[@]} second=${arr[1]}; arr+=(four); echo after-append=${arr[*]}');
+    check('indexed arrays and append', r.ok && r.text.includes('count=3 second=two') && r.text.includes('after-append=one two three four'), r.text);
+
+    r = await out('declare -A m; m[a]=1; m[b]=2; echo m[a]=${m[a]} keys=${!m[*]}');
+    check('associative arrays', r.ok && r.text.includes('m[a]=1') && r.text.includes('keys=a b'), r.text);
+
+    r = await out("diff <(echo -e 'a\\nb') <(echo -e 'a\\nc') | head -2");
+    check('process substitution <(...)', r.ok && r.text.includes('--- /tmp/.procsub_') && r.text.includes('+++ /tmp/.procsub_'), r.text);
+
+    r = await out("for ((i=0;i<3;i++)); do printf '%d ' $i; done");
+    check('C-style for loop', r.ok && r.text.trim() === '0 1 2', r.text);
+
+    r = await out("s='Hello World'; echo len=${#s} sub=${s:6:5} upper=${s^^} replace=${s/World/Bash}");
+    check('parameter expansion string ops', r.ok && r.text.includes('len=11') && r.text.includes('sub=World') && r.text.includes('upper=HELLO WORLD') && r.text.includes('replace=Hello Bash'), r.text);
+
+    r = await out("grep -o 'o' <<< 'foo' | wc -l");
+    check('here-string <<< and grep -o', r.ok && r.text.trim() === '2', r.text);
+
+    r = await out('f(){ local v=inner; echo in=$v; }; v=outer; f; echo out=$v');
+    check('local variable scoping', r.ok && r.text.includes('in=inner') && r.text.includes('out=outer'), r.text);
+
+    const fullAdvancedScript = `echo '=== advanced bash features ==='; echo '--- [[ ]] ---'; if [[ "abc" == a* ]]; then echo 'glob-match OK'; fi; if [[ 5 -gt 3 && "x" != "y" ]]; then echo 'logic OK'; fi; echo '--- arrays ---'; arr=(one two three); echo "count=\${#arr[@]} second=\${arr[1]}"; arr+=(four); echo "after-append=\${arr[*]}"; echo '--- assoc arrays ---'; declare -A m; m[a]=1; m[b]=2; echo "m[a]=\${m[a]} keys=\${!m[*]}"; echo '--- process substitution ---'; diff <(echo -e 'a\\nb') <(echo -e 'a\\nc') | head -2; echo '--- C-style loop ---'; for ((i=0;i<3;i++)); do printf '%d ' $i; done; echo; echo '--- string ops ---'; s='Hello World'; echo "len=\${#s}"; echo "sub=\${s:6:5}"; echo "upper=\${s^^}"; echo "replace=\${s/World/Bash}"; echo '--- here-string ---'; grep -o 'o' <<< 'foo' | wc -l; echo '--- functions & local ---'; f(){ local v=inner; echo "in=$v"; }; v=outer; f; echo "out=$v"`;
+    r = await out(fullAdvancedScript);
+    check('full advanced bash script executes cleanly', r.ok && r.text.includes('glob-match OK') && r.text.includes('logic OK') && r.text.includes('count=3 second=two') && r.text.includes('after-append=one two three four') && r.text.includes('m[a]=1') && r.text.includes('0 1 2') && r.text.includes('len=11') && r.text.includes('sub=World') && r.text.includes('upper=HELLO WORLD') && r.text.includes('replace=Hello Bash') && r.text.includes('in=inner\nout=outer'), r.text);
+
     console.log('errors');
     r = await out('cat /nope/missing.txt');
     check('missing file fails with status', !r.ok && /No such file/.test(r.text), r.text);

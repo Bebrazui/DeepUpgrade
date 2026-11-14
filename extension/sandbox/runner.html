@@ -760,7 +760,7 @@
     // This is a real (small) POSIX shell: lexer -> parser -> executor over the
     // one shared VFS.
 
-    const SHELL_OPS = ['&&', '||', '2>>', '2>&1', '2>', '&>', '>>', '<<-', '<<', '>', '<', '|', ';', '&', '()', '(', ')'];
+    const SHELL_OPS = ['&&', '||', '2>>', '2>&1', '2>', '&>', '>>', '<<<', '<<-', '<<', '>', '<', '|', ';', '&', '()', '(', ')'];
 
     function shellState() {
       if (!window.__DU_SHELL_STATE) {
@@ -771,6 +771,10 @@
           pid: 4242,
           positional: [],
           functions: new Map(),
+          arrays: new Map(),
+          assocArrays: new Map(),
+          localStack: [],
+          procSubSeq: 0,
           loopSignal: null,
           returnSignal: null,
           env: {
@@ -1084,7 +1088,7 @@
           continue;
         }
 
-        if (ch === '$' && src[i + 1] === '(') {
+        if ((ch === '$' || ch === '<' || ch === '>') && src[i + 1] === '(') {
           const inner = shellReadBalanced(src, i + 1);
           add('bare', src.slice(i, inner.end + 1));
           i = inner.end + 1;
@@ -1163,6 +1167,13 @@
               i += 2;
               continue;
             }
+            if (t.value === '<<<' ) {
+              const target = tokens[i + 1];
+              if (!target || target.type !== 'word') { i++; continue; }
+              redirs.push({ op: '<<<', target });
+              i += 2;
+              continue;
+            }
             if (t.value === '<<' || t.value === '<<-') {
               redirs.push({ op: t.value, heredoc: t.heredoc || '' });
               i++;
@@ -1180,7 +1191,13 @@
         skipSeparators();
         while (i < tokens.length) {
           if (endWords.some((w) => peekWord(w))) break;
-          list.push(parseAndOr());
+          const prevI = i;
+          const cmd = parseAndOr();
+          if (i === prevI) {
+            i++;
+          } else {
+            list.push(cmd);
+          }
           skipSeparators();
         }
         return list;
@@ -1215,6 +1232,47 @@
           matchWord('fi');
           const redirs = parseRedirs();
           return { type: 'if', clauses, elseBody, redirs };
+        }
+
+        // 2b. [[ ... ]] extended test
+        if (peekWord('[[')) {
+          i++;
+          const exprTokens = [];
+          while (i < tokens.length && !peekWord(']]')) {
+            exprTokens.push(tokens[i++]);
+          }
+          if (peekWord(']]')) i++;
+          const redirs = parseRedirs();
+          return { type: 'extended_test', tokens: exprTokens, redirs };
+        }
+
+        // 3a. C-style for loop: for ((i=0; i<3; i++)); do body; done
+        if (peekWord('for') && tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].value === '(' &&
+            tokens[i + 2] && tokens[i + 2].type === 'op' && tokens[i + 2].value === '(') {
+          i += 3;
+          let arith = '';
+          while (i < tokens.length) {
+            if (tokens[i].type === 'op' && tokens[i].value === ')' && tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].value === ')') {
+              i += 2;
+              break;
+            }
+            arith += (tokens[i].raw || tokens[i].value || '') + ' ';
+            i++;
+          }
+          skipSeparators();
+          matchWord('do');
+          const body = parseCompoundList(['done']);
+          matchWord('done');
+          const redirs = parseRedirs();
+          const parts = arith.split(';').map((s) => s.trim());
+          return {
+            type: 'for_arith',
+            init: parts[0] || '',
+            cond: parts[1] || '1',
+            step: parts[2] || '',
+            body,
+            redirs
+          };
         }
 
         // 3. for: for var [in items...]; do body; done
@@ -1301,7 +1359,22 @@
           }
         }
 
-        // 7. Simple command
+        // 7. Array assignment: arr=(one two three) or arr+=(four)
+        if (tokens[i] && tokens[i].type === 'word' && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(tokens[i].raw) &&
+            tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].value === '(') {
+          const isAppend = tokens[i].raw.includes('+=');
+          const arrName = tokens[i].raw.replace(/\+?=$/, '');
+          i += 2;
+          const elements = [];
+          while (i < tokens.length && !(tokens[i].type === 'op' && tokens[i].value === ')')) {
+            elements.push(tokens[i++]);
+          }
+          if (peekOp(')')) i++;
+          const redirs = parseRedirs();
+          return { type: 'array_assign', name: arrName, append: isAppend, elements, redirs };
+        }
+
+        // 8. Simple command
         const words = [];
         const redirs = [];
         while (i < tokens.length) {
@@ -1317,6 +1390,13 @@
               const target = tokens[i + 1];
               if (!target || target.type !== 'word') { i++; continue; }
               redirs.push({ op: t.value, target });
+              i += 2;
+              continue;
+            }
+            if (t.value === '<<<') {
+              const target = tokens[i + 1];
+              if (!target || target.type !== 'word') { i++; continue; }
+              redirs.push({ op: '<<<', target });
               i += 2;
               continue;
             }
@@ -1366,6 +1446,79 @@
     // --- expansion ---
 
     function shellLookup(spec, state) {
+      // 1. Array length: ${#arr[@]} or ${#arr[*]}
+      const arrLen = /^#([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(spec);
+      if (arrLen) {
+        const arr = state.arrays && state.arrays.get(arrLen[1]);
+        return String(arr ? arr.length : 0);
+      }
+
+      // 2. String length: ${#var}
+      if (spec.startsWith('#') && !spec.includes('[')) {
+        const name = spec.slice(1);
+        return String((state.env[name] ?? '').length);
+      }
+
+      // 3. Assoc array keys: ${!m[*]} or ${!m[@]}
+      const assocKeys = /^!([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(spec);
+      if (assocKeys) {
+        const assoc = state.assocArrays && state.assocArrays.get(assocKeys[1]);
+        if (assoc) return Array.from(assoc.keys()).join(' ');
+        const arr = state.arrays && state.arrays.get(assocKeys[1]);
+        if (arr) return arr.map((_, idx) => idx).join(' ');
+        return '';
+      }
+
+      // 4. Array / Assoc elements: ${arr[1]}, ${m[a]}, ${arr[*]}
+      const elemMatch = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]$/.exec(spec);
+      if (elemMatch) {
+        const name = elemMatch[1];
+        const key = elemMatch[2];
+        if (key === '@' || key === '*') {
+          const arr = state.arrays && state.arrays.get(name);
+          if (arr) return arr.join(' ');
+          const assoc = state.assocArrays && state.assocArrays.get(name);
+          if (assoc) return Array.from(assoc.values()).join(' ');
+          return '';
+        }
+        const assoc = state.assocArrays && state.assocArrays.get(name);
+        if (assoc && assoc.has(key)) return assoc.get(key);
+        const arr = state.arrays && state.arrays.get(name);
+        if (arr) {
+          const idx = parseInt(key, 10);
+          return !Number.isNaN(idx) ? (arr[idx] ?? '') : '';
+        }
+        return '';
+      }
+
+      // 5. Substring: ${s:6:5}
+      const subMatch = /^([A-Za-z_][A-Za-z0-9_]*):(\d+)(?::(\d+))?$/.exec(spec);
+      if (subMatch) {
+        const val = state.env[subMatch[1]] ?? '';
+        const offset = parseInt(subMatch[2], 10);
+        const len = subMatch[3] !== undefined ? parseInt(subMatch[3], 10) : undefined;
+        return len !== undefined ? val.slice(offset, offset + len) : val.slice(offset);
+      }
+
+      // 6. Case conversion: ${s^^} or ${s,,}
+      if (spec.endsWith('^^')) {
+        return (state.env[spec.slice(0, -2)] ?? '').toUpperCase();
+      }
+      if (spec.endsWith(',,')) {
+        return (state.env[spec.slice(0, -2)] ?? '').toLowerCase();
+      }
+
+      // 7. Search & Replace: ${s/World/Bash} or ${s//World/Bash}
+      const repMatch = /^([A-Za-z_][A-Za-z0-9_]*)\/(\/)?([^/]+)\/(.*)$/.exec(spec);
+      if (repMatch) {
+        const val = state.env[repMatch[1]] ?? '';
+        const isAll = !!repMatch[2];
+        const pat = repMatch[3];
+        const rep = repMatch[4];
+        return isAll ? val.replaceAll(pat, rep) : val.replace(pat, rep);
+      }
+
+      // 8. Standard variable lookup with fallback ${VAR:-default}
       const m = /^([A-Za-z_0-9#@*]+)(:?-)(.*)$/.exec(spec);
       const name = m ? m[1] : spec;
       const fallback = m ? m[3] : null;
@@ -1458,24 +1611,51 @@
     }
 
     async function shellExpandWord(token, state, depth) {
+      if (token.parts && token.parts.length === 1 && token.parts[0].kind === 'bare') {
+        const raw = token.parts[0].text;
+        if ((raw.startsWith('<(') || raw.startsWith('>(')) && raw.endsWith(')')) {
+          const innerCmd = raw.slice(2, -1);
+          const captured = await runShellScript(innerCmd, { depth: (depth || 0) + 1 });
+          state.procSubSeq = (state.procSubSeq || 0) + 1;
+          const seq = state.procSubSeq;
+          const subPath = `/tmp/.procsub_${seq}`;
+          await vfsWriteTextNorm(subPath, captured.stdout);
+          return [subPath];
+        }
+      }
+
       const parts = token.parts || [];
       let text = '';
       let sawBare = false;
       for (const part of parts) {
-        if (part.kind === 'single') { text += part.text; continue; }
-        if (part.kind === 'double') { text += await shellExpandVars(part.text, state, depth); continue; }
+        if (part.kind === 'single') {
+          text += part.text.replace(/ /g, '\uE000').replace(/\t/g, '\uE001').replace(/\n/g, '\uE002').replace(/\r/g, '\uE003');
+          continue;
+        }
+        if (part.kind === 'double') {
+          const exp = await shellExpandVars(part.text, state, depth);
+          text += exp.replace(/ /g, '\uE000').replace(/\t/g, '\uE001').replace(/\n/g, '\uE002').replace(/\r/g, '\uE003');
+          continue;
+        }
         sawBare = true;
         text += await shellExpandVars(part.text, state, depth);
       }
+
+      const unmask = (s) => s.replace(/\uE000/g, ' ').replace(/\uE001/g, '\t').replace(/\uE002/g, '\n').replace(/\uE003/g, '\r');
 
       if (sawBare && text.startsWith('~') && (text === '~' || text.startsWith('~/'))) {
         text = (state.env.HOME || '/') + text.slice(1);
       }
 
-      if (!sawBare) return [text];
+      if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]+\])?=/.test(text)) {
+        return [unmask(text)];
+      }
 
-      const fields = text.split(/[ \t\n]+/).filter((f) => f.length > 0);
-      if (fields.length === 0) return [];
+      if (!sawBare) return [unmask(text)];
+
+      const rawFields = text.split(/[ \t\n]+/).filter((f) => f.length > 0);
+      if (rawFields.length === 0) return [];
+      const fields = rawFields.map(unmask);
       const expanded = [];
       for (const field of fields) expanded.push(...shellGlob(field, state.cwd));
       return expanded;
@@ -2270,6 +2450,24 @@
             const rows = input.text.split('\n');
             let fileMatches = 0;
             for (let idx = 0; idx < rows.length; idx++) {
+              if (flags.has('o')) {
+                if (!flags.has('v')) {
+                  const gFlags = (re.flags || '').includes('g') ? re.flags : (re.flags || '') + 'g';
+                  const globalRe = new RegExp(re.source, gFlags);
+                  let m;
+                  while ((m = globalRe.exec(rows[idx])) !== null) {
+                    if (m[0].length === 0) { globalRe.lastIndex++; continue; }
+                    fileMatches++;
+                    if (!flags.has('c') && !flags.has('q') && !flags.has('l')) {
+                      let line = m[0];
+                      if (flags.has('n')) line = `${idx + 1}:${line}`;
+                      if (showName) line = `${input.name}:${line}`;
+                      lines.push(line);
+                    }
+                  }
+                }
+                continue;
+              }
               const hits = re.test(rows[idx]);
               if (flags.has('v') ? !hits : hits) {
                 fileMatches++;
@@ -2952,6 +3150,38 @@
           return { stdout: '', stderr: '', status: 0 };
         }
 
+        case 'declare': {
+          if (args.includes('-A')) {
+            const name = args.filter((a) => !a.startsWith('-')).pop();
+            if (name) {
+              state.assocArrays = state.assocArrays || new Map();
+              if (!state.assocArrays.has(name)) state.assocArrays.set(name, new Map());
+            }
+          }
+          return ok('');
+        }
+
+        case 'local': {
+          for (const arg of args) {
+            const eq = arg.indexOf('=');
+            if (eq !== -1) {
+              const k = arg.slice(0, eq);
+              const v = arg.slice(eq + 1);
+              if (state.localStack && state.localStack.length > 0) {
+                const frame = state.localStack[state.localStack.length - 1];
+                if (!frame.has(k)) frame.set(k, state.env[k]);
+              }
+              state.env[k] = v;
+            } else {
+              if (state.localStack && state.localStack.length > 0) {
+                const frame = state.localStack[state.localStack.length - 1];
+                if (!frame.has(arg)) frame.set(arg, state.env[arg]);
+              }
+            }
+          }
+          return ok('');
+        }
+
         default:
           return fail(`${name}: command not found`, 127);
       }
@@ -2968,8 +3198,8 @@
       // extended toolset
       'jq', 'awk', 'cut', 'base64', 'sha256sum', 'xxd', 'stat', 'du', 'df', 'nl',
       'tee', 'xargs', 'wget',
-      // control flow
-      'return', 'break', 'continue'
+      // control flow & declarations
+      'return', 'break', 'continue', 'declare', 'local'
     ]);
 
     async function shellRunCompoundList(list, io) {
@@ -3003,6 +3233,11 @@
 
       for (const redir of (command.redirs || [])) {
         if (redir.op === '2>&1') { mergeStderr = true; continue; }
+        if (redir.op === '<<<') {
+          const target = await shellExpandWord(redir.target, state, io.depth);
+          input = (target.length > 0 ? target.join(' ') : '') + '\n';
+          continue;
+        }
         if (redir.op === '<<' || redir.op === '<<-') { input = redir.heredoc || ''; continue; }
         const target = (await shellExpandWord(redir.target, state, io.depth));
         const targetPath = target.length > 0 ? target[0] : '';
@@ -3019,7 +3254,90 @@
 
       let result = { stdout: '', stderr: '', status: 0 };
 
-      if (command.type === 'block') {
+      if (command.type === 'array_assign') {
+        state.arrays = state.arrays || new Map();
+        const vals = [];
+        for (const el of command.elements) {
+          const exp = await shellExpandWord(el, state, io.depth);
+          vals.push(...exp);
+        }
+        if (command.append) {
+          const existing = state.arrays.get(command.name) || [];
+          existing.push(...vals);
+          state.arrays.set(command.name, existing);
+        } else {
+          state.arrays.set(command.name, vals);
+        }
+        return { stdout: '', stderr: '', status: 0 };
+      } else if (command.type === 'extended_test') {
+        const testArgs = [];
+        for (const t of command.tokens) {
+          if (t.type === 'op') {
+            testArgs.push(t.value);
+          } else if (t.type === 'word') {
+            const parts = t.parts || [];
+            let text = '';
+            for (const part of parts) {
+              if (part.kind === 'single') { text += part.text; }
+              else if (part.kind === 'double') { text += await shellExpandVars(part.text, state, io.depth); }
+              else { text += await shellExpandVars(part.text, state, io.depth); }
+            }
+            testArgs.push(text);
+          }
+        }
+
+        const evalClause = (sub) => {
+          if (sub.length === 1) return sub[0] !== '' && sub[0] !== '0';
+          if (sub.length === 2) {
+            if (sub[0] === '-z') return sub[1] === '';
+            if (sub[0] === '-n') return sub[1] !== '';
+            if (sub[0] === '-f') return !vfsStatNorm(shellResolvePath(state.cwd, sub[1]))?.isDir && !!vfsStatNorm(shellResolvePath(state.cwd, sub[1]));
+            if (sub[0] === '-d') return !!vfsStatNorm(shellResolvePath(state.cwd, sub[1]))?.isDir;
+            if (sub[0] === '!') return !evalClause(sub.slice(1));
+          }
+          if (sub.length === 3) {
+            const [left, op, right] = sub;
+            if (op === '==' || op === '=') {
+              const re = globToRegExp(right);
+              return re.test(left);
+            }
+            if (op === '!=') {
+              const re = globToRegExp(right);
+              return !re.test(left);
+            }
+            const nl = parseInt(left, 10);
+            const nr = parseInt(right, 10);
+            if (op === '-eq') return nl === nr;
+            if (op === '-ne') return nl !== nr;
+            if (op === '-lt') return nl < nr;
+            if (op === '-le') return nl <= nr;
+            if (op === '-gt') return nl > nr;
+            if (op === '-ge') return nl >= nr;
+          }
+          return false;
+        };
+
+        const orGroups = [];
+        let cur = [];
+        for (const a of testArgs) {
+          if (a === '||') { orGroups.push(cur); cur = []; }
+          else cur.push(a);
+        }
+        orGroups.push(cur);
+
+        const orResult = orGroups.some((group) => {
+          const andGroups = [];
+          let sub = [];
+          for (const a of group) {
+            if (a === '&&') { andGroups.push(sub); sub = []; }
+            else sub.push(a);
+          }
+          andGroups.push(sub);
+          return andGroups.every((clause) => evalClause(clause));
+        });
+
+        result = { stdout: '', stderr: '', status: orResult ? 0 : 1 };
+      } else if (command.type === 'block') {
         result = await shellRunCompoundList(command.body, io);
       } else if (command.type === 'if') {
         let executed = false;
@@ -3040,6 +3358,52 @@
         if (!executed && command.elseBody) {
           result = await shellRunCompoundList(command.elseBody, io);
         }
+      } else if (command.type === 'for_arith') {
+        let out = '';
+        let err = '';
+        let status = 0;
+        if (command.init) {
+          await runShellScript(command.init, { depth: (io.depth || 0) + 1 });
+        }
+        while (true) {
+          if (state.exit !== null || state.returnSignal !== null) break;
+          if (command.cond) {
+            let condExpr = command.cond;
+            condExpr = condExpr.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (_, v) => state.env[v] ?? '0');
+            const evalRes = safeBigIntEval(condExpr);
+            if (evalRes === '0' || evalRes === 'false' || evalRes === '') break;
+          }
+          const bodyRes = await shellRunCompoundList(command.body, io);
+          out += bodyRes.stdout;
+          err += bodyRes.stderr;
+          status = bodyRes.status;
+
+          if (state.loopSignal) {
+            const sig = state.loopSignal;
+            if (sig.type === 'continue') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; }
+              else break;
+            } else if (sig.type === 'break') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; }
+              break;
+            }
+          }
+          if (command.step) {
+            const step = command.step.trim();
+            if (step.endsWith('++')) {
+              const v = step.slice(0, -2).trim();
+              state.env[v] = String((parseInt(state.env[v], 10) || 0) + 1);
+            } else if (step.endsWith('--')) {
+              const v = step.slice(0, -2).trim();
+              state.env[v] = String((parseInt(state.env[v], 10) || 0) - 1);
+            } else {
+              await runShellScript(step, { depth: (io.depth || 0) + 1 });
+            }
+          }
+        }
+        result = { stdout: out, stderr: err, status };
       } else if (command.type === 'while' || command.type === 'until') {
         let out = '';
         let err = '';
@@ -3117,9 +3481,21 @@
         }
 
         let commandIndex = 0;
-        while (commandIndex < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[commandIndex])) {
-          const eq = argv[commandIndex].indexOf('=');
-          state.env[argv[commandIndex].slice(0, eq)] = argv[commandIndex].slice(eq + 1);
+        while (commandIndex < argv.length && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]+\])?=/.test(argv[commandIndex])) {
+          const item = argv[commandIndex];
+          const eq = item.indexOf('=');
+          const lhs = item.slice(0, eq);
+          const rhs = item.slice(eq + 1);
+          const bracket = lhs.indexOf('[');
+          if (bracket !== -1) {
+            const arrName = lhs.slice(0, bracket);
+            const key = lhs.slice(bracket + 1, -1);
+            state.assocArrays = state.assocArrays || new Map();
+            if (!state.assocArrays.has(arrName)) state.assocArrays.set(arrName, new Map());
+            state.assocArrays.get(arrName).set(key, rhs);
+          } else {
+            state.env[lhs] = rhs;
+          }
           commandIndex++;
         }
         if (commandIndex >= argv.length) {
@@ -3132,12 +3508,20 @@
             const prevReturn = state.returnSignal;
             state.positional = argv.slice(commandIndex + 1);
             state.returnSignal = null;
+            state.localStack = state.localStack || [];
+            const localFrame = new Map();
+            state.localStack.push(localFrame);
             try {
               result = await shellRunCommand(func, input, io);
               if (state.returnSignal !== null) {
                 result.status = state.returnSignal.status;
               }
             } finally {
+              state.localStack.pop();
+              for (const [k, oldVal] of localFrame) {
+                if (oldVal === undefined) delete state.env[k];
+                else state.env[k] = oldVal;
+              }
               state.positional = prevPositional;
               state.returnSignal = prevReturn;
             }
