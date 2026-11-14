@@ -17,6 +17,9 @@
     "default_popup": "ui/popup.html",
     "default_title": "DeepUpgrade Settings"
   },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://chat.deepseek.com/*"],

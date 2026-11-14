@@ -33,7 +33,7 @@
 .opencode-tool-header-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   background: transparent !important;
   border: none !important;
   padding: 3px 0 !important;
@@ -44,6 +44,23 @@
   color: #94a3b8;
   border-radius: 4px;
   transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.opencode-tool-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0.9;
+  color: inherit;
+}
+
+.opencode-tool-icon svg {
+  width: 14px;
+  height: 14px;
+  display: block;
 }
 
 .opencode-tool-header-btn:hover {
@@ -282,8 +299,9 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
   display: none !important;
 }
 
-/* --- Native Settings Tab: Skills Panel Styling --- */
-.du-native-skills-panel {
+/* --- Native Settings Tab: Skills & Config Panel Styling --- */
+.du-native-skills-panel,
+.du-native-config-panel {
   width: 100%;
   padding-top: 6px;
   animation: du-fade-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
