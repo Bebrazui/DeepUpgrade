@@ -1,3 +1,4 @@
+// <du-theme>
 (function initDuThemeEngine() {
   'use strict';
 
@@ -52,6 +53,7 @@
   };
   init();
 })();
+// </du-theme>
 
 // <du-settings-bridge>
 // One switch, three worlds.

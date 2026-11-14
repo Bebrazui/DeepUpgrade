@@ -38,6 +38,18 @@
     }
   }
 
+  function isInternalDeepSeekRequest(url, parsedBody) {
+    const u = String(url || '').toLowerCase();
+    if (u.includes('telemetry') || u.includes('generate_title') || u.includes('session_title')) return true;
+    if (parsedBody && typeof parsedBody.prompt === 'string') {
+      const p = parsedBody.prompt.trim();
+      if (p.startsWith('Generate the session title') || p.includes('JSON array of human messages')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * Build the agent prompt for an outgoing message.
    *
@@ -48,6 +60,9 @@
    * Returns the new prompt, or null when the body must stay untouched.
    */
   function buildAgentPrompt(parsedBody) {
+    if (isInternalDeepSeekRequest('', parsedBody)) {
+      return null;
+    }
     const rawPrompt = String(parsedBody.prompt || '').trim();
     if (!rawPrompt) return null;
 
@@ -422,6 +437,10 @@
             parsedBody = reqBody;
           }
 
+          if (isInternalDeepSeekRequest(url, parsedBody)) {
+            return origFetch.apply(this, arguments);
+          }
+
           let headerObj = {};
           if (rawHeaders instanceof Headers) {
             rawHeaders.forEach((v, k) => { headerObj[k] = v; });
@@ -537,6 +556,9 @@
     if (looksLikeChat && typeof body === 'string' && body.includes('"prompt"')) {
       try {
         const parsedBody = JSON.parse(body);
+        if (isInternalDeepSeekRequest(this.__url, parsedBody)) {
+          return origSend.call(this, body);
+        }
         if (parsedBody && typeof parsedBody.prompt === 'string') {
           const newPrompt = buildAgentPrompt(parsedBody);
           if (newPrompt !== null) {
