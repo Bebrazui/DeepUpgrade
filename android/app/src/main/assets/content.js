@@ -2164,8 +2164,8 @@ document.addEventListener('click', async (e) => {
     setTimeout(async () => {
       try {
         const clipText = await navigator.clipboard.readText();
-        if (clipText && (clipText.includes('[SYSTEM CAPABILITY:') || clipText.includes('[SYSTEM INSTRUCTION:'))) {
-          const cleanText = clipText.replace(/\[SYSTEM (?:CAPABILITY|INSTRUCTION):[\s\S]*?\[USER REQUEST\]:\s*/g, '');
+        if (clipText && (clipText.includes('[SYSTEM CAPABILITY:') || clipText.includes('[SYSTEM INSTRUCTION:') || clipText.includes('[AVAILABLE SKILLS') || clipText.includes('[ATTACHED ASSETS'))) {
+          const cleanText = clipText.replace(/\[(?:SYSTEM (?:CAPABILITY|INSTRUCTION)|AVAILABLE SKILLS|ATTACHED ASSETS)[\s\S]*?\[USER REQUEST\]:\s*/g, '');
           await navigator.clipboard.writeText(cleanText);
         }
       } catch (err) {}
@@ -2310,8 +2310,8 @@ function cleanAndUnifyChat() {
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
     let node;
     while ((node = walker.nextNode())) {
-      if (node.nodeValue && (node.nodeValue.includes('[SYSTEM CAPABILITY:') || node.nodeValue.includes('[SYSTEM INSTRUCTION:'))) {
-        node.nodeValue = node.nodeValue.replace(/\[SYSTEM (?:CAPABILITY|INSTRUCTION):[\s\S]*?\[USER REQUEST\]:\s*/g, '');
+      if (node.nodeValue && (node.nodeValue.includes('[SYSTEM CAPABILITY:') || node.nodeValue.includes('[SYSTEM INSTRUCTION:') || node.nodeValue.includes('[AVAILABLE SKILLS') || node.nodeValue.includes('[ATTACHED ASSETS'))) {
+        node.nodeValue = node.nodeValue.replace(/\[(?:SYSTEM (?:CAPABILITY|INSTRUCTION)|AVAILABLE SKILLS|ATTACHED ASSETS)[\s\S]*?\[USER REQUEST\]:\s*/g, '');
       }
     }
   });
@@ -2322,10 +2322,10 @@ function cleanAndUnifyChat() {
     const text = item.innerText || '';
     if (text.includes('[SANDBOX OUTPUT') || text.includes('[USER ANSWER]:')) {
       item.style.setProperty('display', 'none', 'important');
-    } else if (text.includes('[SYSTEM CAPABILITY:') || text.includes('[SYSTEM INSTRUCTION:')) {
-      const targetTextNode = findTextNodeWith(item, '[SYSTEM ');
+    } else if (text.includes('[SYSTEM CAPABILITY:') || text.includes('[SYSTEM INSTRUCTION:') || text.includes('[AVAILABLE SKILLS') || text.includes('[ATTACHED ASSETS')) {
+      const targetTextNode = findTextNodeWith(item, '[');
       if (targetTextNode) {
-        targetTextNode.nodeValue = targetTextNode.nodeValue.replace(/\[SYSTEM (?:CAPABILITY|INSTRUCTION):[\s\S]*?\[USER REQUEST\]:\s*/g, '');
+        targetTextNode.nodeValue = targetTextNode.nodeValue.replace(/\[(?:SYSTEM (?:CAPABILITY|INSTRUCTION)|AVAILABLE SKILLS|ATTACHED ASSETS)[\s\S]*?\[USER REQUEST\]:\s*/g, '');
       }
     }
   });
@@ -3239,35 +3239,14 @@ function hookInput() {
         sessionStorage.setItem('du_active_agent_session', sessId);
         sessionStorage.setItem('du_active_agent_time', String(Date.now()));
       } catch (e) {}
-      const attachedDirective = buildAttachedAssetsDirective();
-      
-      // OpenCode Architecture: Check if this is the very first turn of the session
-      // If messages already exist in chat, we do NOT spam the full 80-line system directive!
-      const existingBubbles = document.querySelectorAll('.ds-message, div._9663006');
-      const isFirstTurn = existingBubbles.length === 0;
 
-      if (isFirstTurn || attachedDirective || buildSkillsDirective()) {
-        const container = inputEl.closest('form, div:has(textarea), div:has([contenteditable])') || inputEl.parentElement;
-        if (container) container.classList.add('du-locked-box');
-        inputEl.classList.add('du-freezing');
-
-        const promptPrefix = `${buildTurnDirective(isFirstTurn)}\n\n[USER REQUEST]: `;
-        // The interceptor reads the directive from here (MAIN world bridge).
-        publishDirectiveToMainWorld(true);
-        updateReactInput(inputEl, `${promptPrefix}${val}`);
-        
-        // Clear staged attachments after successful dispatch
-        stagedAttachments.clear();
-
-        // Keep lock until DeepSeek React clears input on dispatch
-        setTimeout(() => {
-          inputEl.classList.remove('du-freezing');
-          if (container) container.classList.remove('du-locked-box');
-        }, 500);
-      } else {
-        // Subsequent conversation turns: let user text flow naturally without expanding into a massive system prompt!
-        stagedAttachments.clear();
-      }
+      // Publish the full directive (system, skills, assets) to localStorage
+      // so interceptor.js (running in the MAIN world) attaches it cleanly
+      // at the network layer (fetch and XHR). The composer textarea is NEVER
+      // mangled with the 100-line directive, so the user's chat bubble stays
+      // clean with only their own text, never collapses, and is never hidden.
+      publishDirectiveToMainWorld(true);
+      stagedAttachments.clear();
     } else {
       allowExecution = false;
       try {
