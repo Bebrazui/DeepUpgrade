@@ -2289,15 +2289,21 @@ function hideRawToolCallMarkup() {
     const children = Array.from(msg.children);
     if (!children.length) return;
 
-    const openRe = isDsml ? /DSML/i : /<\s*tool_call/i;
-    const closeRe = isDsml ? /DSML[\s\S]*?calls\s*>/i : /<\s*\/\s*tool_call/i;
+    // DSML calls open with <...DSML...calls> and close with </...DSML...calls>
+    // Notice: closeRe MUST require the closing slash '/' so it never matches the opening tag.
+    const openRe = isDsml ? /<\s*(?:[|｜]\s*)+DSML\s*(?:[|｜]\s*)+(?:tool_|function_)?calls/i : /<\s*tool_call/i;
+    const closeRe = isDsml ? /<\s*\/\s*(?:[|｜]\s*)+DSML\s*(?:[|｜]\s*)+(?:tool_|function_)?calls\s*>/i : /<\s*\/\s*tool_call/i;
 
     let start = -1;
     let end = -1;
     children.forEach((child, index) => {
       const childText = child.textContent || '';
-      if (start === -1 && openRe.test(childText)) start = index;
-      if (closeRe.test(childText)) end = index;
+      if (start === -1 && (openRe.test(childText) || (isDsml && /DSML/i.test(childText)))) {
+        start = index;
+      }
+      if (closeRe.test(childText)) {
+        end = index;
+      }
     });
     if (start === -1) return;
     if (end === -1 || end < start) end = children.length - 1;
@@ -2349,7 +2355,8 @@ function hideInjectedDirectiveBlocks() {
       const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
-        if ((node.nodeValue || '').includes('[USER REQUEST]:')) {
+        const val = node.nodeValue || '';
+        if (val.includes('[USER REQUEST') || val.includes('USER REQUEST]:') || val.includes('[USER REQUEST]:')) {
           target = node.parentElement;
           break;
         }
@@ -2361,11 +2368,13 @@ function hideInjectedDirectiveBlocks() {
       const inner = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
       let innerNode;
       while ((innerNode = inner.nextNode())) {
-        const idx = (innerNode.nodeValue || '').indexOf('[USER REQUEST]:');
-        if (idx === -1) continue;
-        innerNode.nodeValue = innerNode.nodeValue.slice(0, idx)
-          + innerNode.nodeValue.slice(idx + '[USER REQUEST]:'.length).replace(/^\s+/, '');
-        break;
+        const val = innerNode.nodeValue || '';
+        const m = val.match(/\[?USER REQUEST\]?:?\s*/);
+        if (m) {
+          innerNode.nodeValue = val.slice(0, m.index)
+            + val.slice(m.index + m[0].length).replace(/^\s+/, '');
+          break;
+        }
       }
     }
 
@@ -3816,40 +3825,38 @@ function stripInvisibleChars(text) {
   return String(text || '').replace(DU_INVISIBLE_RE, '');
 }
 
-// DSML delimiters: DeepSeek uses full-width bars, but ASCII pipes are accepted
-// as well so a model that "helpfully" normalizes them still works.
-const DSML_BAR = '(?:\\uFF5C\\uFF5C|\\|\\|)';
+// DSML delimiters: DeepSeek uses ASCII pipes or full-width bars, with single/double
+// bars and arbitrary spacing (e.g. `< | | DSML | | calls>` or `<｜DSML｜calls>`).
+const DSML_TAG_HEAD_RE = /<\s*(\/?)\s*(?:[|｜]\s*)+DSML\s*(?:[|｜]\s*)+/gi;
+
+function normalizeDsml(text) {
+  return String(text || '').replace(DSML_TAG_HEAD_RE, (match, slash) => '<' + (slash || '') + '|DSML||');
+}
 
 function parseDsmlToolCall(rawText) {
-  const src = stripInvisibleChars(rawText);
-  const invokeRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*invoke\\s+name="([^"]+)"([^>]*)>`, 'i');
+  const src = normalizeDsml(stripInvisibleChars(rawText));
+  const invokeRe = /(?:<\|DSML\|\|invoke|<invoke)\s+name="([^"]+)"([^>]*)>/i;
   const inv = invokeRe.exec(src);
   if (!inv) return null;
 
   const toolName = (inv[1] || '').trim();
   const bodyStart = inv.index + inv[0].length;
-  const closeRe = new RegExp(`</${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*invoke>`, 'i');
+  const closeRe = /(?:<\/\|DSML\|\|invoke\s*>|<\/invoke\s*>)/i;
   const closeMatch = closeRe.exec(src.slice(bodyStart));
   const body = closeMatch ? src.slice(bodyStart, bodyStart + closeMatch.index) : src.slice(bodyStart);
 
   const params = {};
-  const paramRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter\\s+name="([^"]+)"([^>]*)>`, 'gi');
-  const nextParamRe = new RegExp(`<${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter`, 'i');
-  const trailingTagRe = new RegExp(`(?:</?${DSML_BAR}\\s*DSML\\s*${DSML_BAR}\\s*parameter>)\\s*$`, 'i');
+  const paramRe = /(?:<\|DSML\|\|parameter|<parameter)\s+name="([^"]+)"([^>]*)>([\s\S]*?)(?:<\/\|DSML\|\|parameter\s*>|<\/parameter\s*>|$)/gi;
   let pm;
   while ((pm = paramRe.exec(body)) !== null) {
-    const valueStart = pm.index + pm[0].length;
-    const nextParam = nextParamRe.exec(body.slice(valueStart));
-    const valueEnd = nextParam ? valueStart + nextParam.index : body.length;
-    let value = body.slice(valueStart, valueEnd).replace(trailingTagRe, '');
+    let value = (pm[3] || '').trim();
     const attrs = pm[2] || '';
     // string="true" means the payload is raw text; anything else is JSON.
     if (!/string="true"/i.test(attrs)) {
       try { value = JSON.parse(value); } catch (e) { /* keep raw text */ }
     }
     params[pm[1]] = value;
-    paramRe.lastIndex = valueEnd;
-    if (valueEnd >= body.length) break;
+    if (paramRe.lastIndex >= body.length) break;
   }
 
   return { toolName, params, complete: !!closeMatch };
@@ -4202,7 +4209,12 @@ function processToolCalls() {
   }
 
   for (const call of collectInlineToolCalls()) {
-    tasks.push({ block: call.block, codeText: call.block.innerText || '', toolObj: call.toolObj, inline: true });
+    tasks.push({
+      block: call.block,
+      codeText: JSON.stringify(call.toolObj),
+      toolObj: call.toolObj,
+      inline: true
+    });
   }
 
   if (tasks.length === 0) return;
