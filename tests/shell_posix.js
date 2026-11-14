@@ -229,6 +229,69 @@ async function main() {
     r = await out('cd /t && ls -l | head -n 1');
     check('ls -l long format', r.ok && /^-rw/.test(r.text), r.text);
 
+    console.log('control structures (if / elif / else / fi)');
+    r = await out('if [ -f /t/a.txt ]; then echo exists; else echo missing; fi');
+    check('if-then branch', r.ok && r.text.trim() === 'exists', r.text);
+
+    r = await out('if [ -f /t/nonexistent.txt ]; then echo yes; else echo no; fi');
+    check('if-else branch', r.ok && r.text.trim() === 'no', r.text);
+
+    r = await out('x=2; if [ "$x" = "1" ]; then echo one; elif [ "$x" = "2" ]; then echo two; else echo other; fi');
+    check('if-elif-else branch', r.ok && r.text.trim() === 'two', r.text);
+
+    r = await out('if ! false; then echo negated; fi');
+    check('pipeline negation in if condition', r.ok && r.text.trim() === 'negated', r.text);
+
+    console.log('loops (for / while / until / break / continue)');
+    r = await out('for x in a b c; do echo $x; done');
+    check('for in loop', r.ok && r.text === 'a\nb\nc', r.text);
+
+    r = await out('for i in 1 2 3 4; do if [ "$i" = "3" ]; then break; fi; echo $i; done');
+    check('for with break', r.ok && r.text === '1\n2', r.text);
+
+    r = await out('for i in 1 2 3 4; do if [ "$i" = "2" ]; then continue; fi; echo $i; done');
+    check('for with continue', r.ok && r.text === '1\n3\n4', r.text);
+
+    r = await out('i=0; while [ "$i" -lt 3 ]; do echo $i; i=$((i+1)); done');
+    check('while loop with arithmetic', r.ok && r.text === '0\n1\n2', r.text);
+
+    r = await out('i=0; until [ "$i" -ge 3 ]; do echo $i; i=$((i+1)); done');
+    check('until loop', r.ok && r.text === '0\n1\n2', r.text);
+
+    r = await out('for x in alpha beta gamma; do echo $x; done > /t/loop_out.txt; cat /t/loop_out.txt');
+    check('loop output redirect', r.ok && r.text === 'alpha\nbeta\ngamma', r.text);
+
+    r = await out('for x in 10 20 30; do echo $x; done | grep 20');
+    check('loop pipeline', r.ok && r.text.trim() === '20', r.text);
+
+    r = await out('for i in 1 2 3; do for j in a b; do if [ "$j" = "b" ]; then break 2; fi; echo $i-$j; done; done');
+    check('break 2 exits nested loops', r.ok && r.text.trim() === '1-a', r.text);
+
+    console.log('functions (def / args / return)');
+    r = await out('greet() { echo "Hello, $1!"; }; greet World');
+    check('function definition and positional arg', r.ok && r.text.trim() === 'Hello, World!', r.text);
+
+    r = await out('function calc() { echo $(( $1 + $2 )); }; calc 40 2');
+    check('function keyword definition and multiple args', r.ok && r.text.trim() === '42', r.text);
+
+    r = await out('info() { echo count:$# all:$@; }; info x y z');
+    check('function $# and $@ parameters', r.ok && r.text.trim() === 'count:3 all:x y z', r.text);
+
+    r = await out('check_num() { if [ "$1" -lt 0 ]; then return 1; fi; echo ok; return 0; }; check_num -5; echo ret:$?');
+    check('function return status', r.ok && r.text.trim() === 'ret:1', r.text);
+
+    r = await out('square() { echo $(($1 * $1)); }; res=$(square 7); echo "result: $res"');
+    check('function output captured by command substitution', r.ok && r.text.trim() === 'result: 49', r.text);
+
+    r = await out('fact() { if [ "$1" -le 1 ]; then echo 1; else echo $(( $1 * $(fact $(( $1 - 1 ))) )); fi; }; fact 5');
+    check('recursive function call', r.ok && r.text.trim() === '120', r.text);
+
+    r = await out('set_v() { MY_VAR="val_$1"; }; set_v 123; echo $MY_VAR');
+    check('function updates environment', r.ok && r.text.trim() === 'val_123', r.text);
+
+    r = await out('my_cmd() { echo foo; }; type my_cmd');
+    check('type recognizes functions', r.ok && r.text.includes('is a function'), r.text);
+
     console.log('errors');
     r = await out('cat /nope/missing.txt');
     check('missing file fails with status', !r.ok && /No such file/.test(r.text), r.text);

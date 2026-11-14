@@ -760,7 +760,7 @@
     // This is a real (small) POSIX shell: lexer -> parser -> executor over the
     // one shared VFS.
 
-    const SHELL_OPS = ['&&', '||', '2>>', '2>&1', '2>', '&>', '>>', '<<-', '<<', '>', '<', '|', ';', '&'];
+    const SHELL_OPS = ['&&', '||', '2>>', '2>&1', '2>', '&>', '>>', '<<-', '<<', '>', '<', '|', ';', '&', '()', '(', ')'];
 
     function shellState() {
       if (!window.__DU_SHELL_STATE) {
@@ -769,6 +769,10 @@
           status: 0,
           exit: null,
           pid: 4242,
+          positional: [],
+          functions: new Map(),
+          loopSignal: null,
+          returnSignal: null,
           env: {
             HOME: '/home/alex',
             USER: 'alex',
@@ -788,6 +792,8 @@
     function shellResetExit() {
       const st = shellState();
       st.exit = null;
+      st.loopSignal = null;
+      st.returnSignal = null;
       st.status = 0;
     }
 
@@ -1135,9 +1141,163 @@
 
     function shellParse(tokens) {
       let i = 0;
-      const peekOp = (value) => tokens[i] && tokens[i].type === 'op' && tokens[i].value === value;
+      const peekOp = (val) => tokens[i] && tokens[i].type === 'op' && tokens[i].value === val;
+      const peekWord = (w) => tokens[i] && tokens[i].type === 'word' && tokens[i].raw === w;
+      const matchWord = (w) => { if (peekWord(w)) { i++; return true; } return false; };
+      const skipSeparators = () => { while (peekOp(';') || peekOp('&')) i++; };
+      const isIdent = (s) => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(s);
+
+      const parseRedirs = () => {
+        const redirs = [];
+        while (i < tokens.length) {
+          const t = tokens[i];
+          if (t.type === 'op') {
+            if (['>', '>>', '<', '2>', '2>>', '&>'].includes(t.value)) {
+              const target = tokens[i + 1];
+              if (!target || target.type !== 'word') { i++; continue; }
+              redirs.push({ op: t.value, target });
+              i += 2;
+              continue;
+            }
+            if (t.value === '<<' || t.value === '<<-') {
+              redirs.push({ op: t.value, heredoc: t.heredoc || '' });
+              i++;
+              continue;
+            }
+            if (t.value === '2>&1') { redirs.push({ op: '2>&1' }); i++; continue; }
+          }
+          break;
+        }
+        return redirs;
+      };
+
+      const parseCompoundList = (endWords = []) => {
+        const list = [];
+        skipSeparators();
+        while (i < tokens.length) {
+          if (endWords.some((w) => peekWord(w))) break;
+          list.push(parseAndOr());
+          skipSeparators();
+        }
+        return list;
+      };
 
       const parseCommand = () => {
+        // 1. Block: { ...; }
+        if (peekWord('{')) {
+          i++;
+          const body = parseCompoundList(['}']);
+          matchWord('}');
+          const redirs = parseRedirs();
+          return { type: 'block', body, redirs };
+        }
+
+        // 2. if: if test; then body; [elif test; then body;] [else body;] fi
+        if (peekWord('if')) {
+          i++;
+          const test = parseCompoundList(['then']);
+          matchWord('then');
+          const clauses = [{ test, body: parseCompoundList(['elif', 'else', 'fi']) }];
+          while (matchWord('elif')) {
+            const elifTest = parseCompoundList(['then']);
+            matchWord('then');
+            const elifBody = parseCompoundList(['elif', 'else', 'fi']);
+            clauses.push({ test: elifTest, body: elifBody });
+          }
+          let elseBody = null;
+          if (matchWord('else')) {
+            elseBody = parseCompoundList(['fi']);
+          }
+          matchWord('fi');
+          const redirs = parseRedirs();
+          return { type: 'if', clauses, elseBody, redirs };
+        }
+
+        // 3. for: for var [in items...]; do body; done
+        if (peekWord('for')) {
+          i++;
+          const varToken = tokens[i++];
+          const varName = varToken ? varToken.raw : 'x';
+          let items = null;
+          skipSeparators();
+          if (matchWord('in')) {
+            items = [];
+            while (i < tokens.length && !peekOp(';') && !peekWord('do')) {
+              items.push(tokens[i++]);
+            }
+            skipSeparators();
+          }
+          matchWord('do');
+          const body = parseCompoundList(['done']);
+          matchWord('done');
+          const redirs = parseRedirs();
+          return { type: 'for', varName, items, body, redirs };
+        }
+
+        // 4. while: while test; do body; done
+        if (peekWord('while')) {
+          i++;
+          const test = parseCompoundList(['do']);
+          matchWord('do');
+          const body = parseCompoundList(['done']);
+          matchWord('done');
+          const redirs = parseRedirs();
+          return { type: 'while', test, body, redirs };
+        }
+
+        // 5. until: until test; do body; done
+        if (peekWord('until')) {
+          i++;
+          const test = parseCompoundList(['do']);
+          matchWord('do');
+          const body = parseCompoundList(['done']);
+          matchWord('done');
+          const redirs = parseRedirs();
+          return { type: 'until', test, body, redirs };
+        }
+
+        // 6. function definition
+        if (peekWord('function')) {
+          i++;
+          const nameTok = tokens[i++];
+          let name = nameTok ? nameTok.raw : '';
+          if (name.endsWith('()')) name = name.slice(0, -2);
+          if (peekOp('()')) i++;
+          else if (peekOp('(')) { i++; if (peekOp(')')) i++; }
+          skipSeparators();
+          const body = parseCommand();
+          return { type: 'funcdef', name, body };
+        }
+
+        if (tokens[i] && tokens[i].type === 'word') {
+          const raw = tokens[i].raw;
+          if (raw.endsWith('()') && isIdent(raw.slice(0, -2))) {
+            const name = raw.slice(0, -2);
+            i++;
+            skipSeparators();
+            const body = parseCommand();
+            return { type: 'funcdef', name, body };
+          }
+          if (isIdent(raw)) {
+            if (tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].value === '()') {
+              const name = raw;
+              i += 2;
+              skipSeparators();
+              const body = parseCommand();
+              return { type: 'funcdef', name, body };
+            }
+            if (tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].value === '(' &&
+                tokens[i + 2] && tokens[i + 2].type === 'op' && tokens[i + 2].value === ')') {
+              const name = raw;
+              i += 3;
+              skipSeparators();
+              const body = parseCommand();
+              return { type: 'funcdef', name, body };
+            }
+          }
+        }
+
+        // 7. Simple command
         const words = [];
         const redirs = [];
         while (i < tokens.length) {
@@ -1148,27 +1308,40 @@
             i++;
             continue;
           }
-          if (['>', '>>', '<', '2>', '2>>', '&>'].includes(t.value)) {
-            const target = tokens[i + 1];
-            if (!target || target.type !== 'word') { i++; continue; }
-            redirs.push({ op: t.value, target });
-            i += 2;
-            continue;
+          if (t.type === 'op') {
+            if (['>', '>>', '<', '2>', '2>>', '&>'].includes(t.value)) {
+              const target = tokens[i + 1];
+              if (!target || target.type !== 'word') { i++; continue; }
+              redirs.push({ op: t.value, target });
+              i += 2;
+              continue;
+            }
+            if (t.value === '<<' || t.value === '<<-') {
+              redirs.push({ op: t.value, heredoc: t.heredoc || '' });
+              i++;
+              continue;
+            }
+            if (t.value === '2>&1') { redirs.push({ op: '2>&1' }); i++; continue; }
           }
-          if (t.value === '<<' || t.value === '<<-') {
-            redirs.push({ op: t.value, heredoc: t.heredoc || '' });
-            i++;
-            continue;
-          }
-          if (t.value === '2>&1') { redirs.push({ op: '2>&1' }); i++; continue; }
           break;
         }
-        return { words, redirs };
+        return { type: 'simple', words, redirs };
       };
 
       const parsePipeline = () => {
+        let negate = false;
+        if (peekWord('!')) {
+          negate = true;
+          i++;
+          skipSeparators();
+        }
         const commands = [parseCommand()];
-        while (peekOp('|')) { i++; commands.push(parseCommand()); }
+        if (negate) commands.negate = true;
+        while (peekOp('|')) {
+          i++;
+          skipSeparators();
+          commands.push(parseCommand());
+        }
         return commands;
       };
 
@@ -1177,31 +1350,36 @@
         while (peekOp('&&') || peekOp('||')) {
           const op = tokens[i].value;
           i++;
+          skipSeparators();
           chain.push({ op, pipeline: parsePipeline() });
         }
         return chain;
       };
 
-      const script = [];
-      while (i < tokens.length) {
-        if (peekOp(';') || peekOp('&') || peekOp('|')) { i++; continue; }
-        if (tokens[i].type === 'op' && [')'].includes(tokens[i].value)) { i++; continue; }
-        script.push(parseAndOr());
-        while (peekOp(';') || peekOp('&')) i++;
-      }
-      return script;
+      return parseCompoundList();
     }
 
     // --- expansion ---
 
     function shellLookup(spec, state) {
-      const m = /^([A-Za-z_][A-Za-z0-9_]*)(:?-)(.*)$/.exec(spec);
+      const m = /^([A-Za-z_0-9#@*]+)(:?-)(.*)$/.exec(spec);
       const name = m ? m[1] : spec;
       const fallback = m ? m[3] : null;
-      const value = state.env[name];
+      let value;
+      if (/^[0-9]+$/.test(name)) {
+        const idx = parseInt(name, 10);
+        value = state.positional ? (state.positional[idx - 1] ?? '') : '';
+      } else if (name === '#') {
+        value = String(state.positional ? state.positional.length : 0);
+      } else if (name === '@' || name === '*') {
+        value = state.positional ? state.positional.join(' ') : '';
+      } else {
+        value = state.env[name];
+      }
       if (fallback !== null) {
-        if (value === undefined) return shellExpandStatic(fallback, state);
-        if (m[2] === ':-' && value === '') return shellExpandStatic(fallback, state);
+        if (value === undefined || value === '') {
+          if (value === undefined || m[2] === ':-') return shellExpandStatic(fallback, state);
+        }
       }
       return value === undefined ? '' : value;
     }
@@ -1222,7 +1400,14 @@
         if (next === '(') {
           const inner = shellReadBalanced(text, i + 1);
           if (inner.text.startsWith('(')) {
-            out += safeBigIntEval(inner.text.slice(1, -1));
+            let arithExpr = await shellExpandVars(inner.text.slice(1, -1), state, depth);
+            arithExpr = arithExpr.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (_, vName) => {
+              const val = state.env[vName];
+              if (val !== undefined && /^-?[0-9]+$/.test(String(val).trim())) return String(val).trim();
+              if (val !== undefined && val !== '') return String(val);
+              return '0';
+            });
+            out += safeBigIntEval(arithExpr);
           } else {
             const captured = await runShellScript(inner.text, { depth: (depth || 0) + 1 });
             out += captured.stdout.replace(/\n+$/, '');
@@ -1241,11 +1426,20 @@
         }
 
         if (next === '?') { out += String(state.status); i++; continue; }
-        if (next === '#') { out += '0'; i++; continue; }
+        if (next === '#') { out += String(state.positional ? state.positional.length : 0); i++; continue; }
+        if (next === '@' || next === '*') { out += state.positional ? state.positional.join(' ') : ''; i++; continue; }
         if (next === '$') { out += String(state.pid); i++; continue; }
         if (next === '!') { out += String(state.pid); i++; continue; }
         if (next === '0') { out += 'bash'; i++; continue; }
         if (next === '-') { out += 'himBH'; i++; continue; }
+
+        if (next !== undefined && /[0-9]/.test(next)) {
+          const numMatch = /^[0-9]+/.exec(text.slice(i + 1));
+          const idx = parseInt(numMatch[0], 10);
+          out += state.positional ? (state.positional[idx - 1] ?? '') : '';
+          i += numMatch[0].length;
+          continue;
+        }
 
         const nameMatch = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(i + 1));
         if (nameMatch) {
@@ -1253,8 +1447,6 @@
           i += nameMatch[0].length;
           continue;
         }
-
-        if (next !== undefined && /[1-9]/.test(next)) { i++; continue; }
 
         out += ch;
       }
@@ -2220,9 +2412,12 @@
         case 'command':
         case 'type': {
           const target = args.filter((a) => !a.startsWith('-')).pop() || '';
+          if (state.functions && state.functions.has(target)) {
+            return ok(name === 'type' ? `${target} is a function` : `/usr/bin/${target}`);
+          }
           const known = SHELL_COMMANDS.has(target);
           if (!known) return { stdout: '', stderr: `${name}: ${target}: not found`, status: 1 };
-          return ok('/usr/bin/' + target);
+          return ok(name === 'type' ? `${target} is a shell builtin` : '/usr/bin/' + target);
         }
 
         case 'seq': {
@@ -2682,6 +2877,25 @@
           return { stdout: '', stderr: '', status: state.exit };
         }
 
+        case 'return': {
+          const code = args.length > 0 ? parseInt(args[0], 10) : state.status;
+          const status = Number.isNaN(code) ? 0 : code;
+          state.returnSignal = { status };
+          return { stdout: '', stderr: '', status };
+        }
+
+        case 'break': {
+          const count = args.length > 0 ? parseInt(args[0], 10) : 1;
+          state.loopSignal = { type: 'break', count: Math.max(1, Number.isNaN(count) ? 1 : count) };
+          return { stdout: '', stderr: '', status: 0 };
+        }
+
+        case 'continue': {
+          const count = args.length > 0 ? parseInt(args[0], 10) : 1;
+          state.loopSignal = { type: 'continue', count: Math.max(1, Number.isNaN(count) ? 1 : count) };
+          return { stdout: '', stderr: '', status: 0 };
+        }
+
         default:
           return fail(`${name}: command not found`, 127);
       }
@@ -2696,22 +2910,41 @@
       'diff', 'git', 'true', 'false', 'exit', ':',
       // extended toolset
       'jq', 'awk', 'cut', 'base64', 'sha256sum', 'xxd', 'stat', 'du', 'df', 'nl',
-      'tee', 'xargs', 'wget'
+      'tee', 'xargs', 'wget',
+      // control flow
+      'return', 'break', 'continue'
     ]);
+
+    async function shellRunCompoundList(list, io) {
+      let stdout = '';
+      let stderr = '';
+      let status = io.state.status || 0;
+      for (const chain of list) {
+        if (io.state.exit !== null || io.state.returnSignal !== null || io.state.loopSignal !== null) {
+          break;
+        }
+        const res = await shellRunAndOr(chain, io);
+        io.state.status = res.status;
+        status = res.status;
+        stdout += res.stdout;
+        stderr += res.stderr;
+      }
+      return { stdout, stderr, status };
+    }
 
     async function shellRunCommand(command, stdin, io) {
       const state = io.state;
-      const argv = [];
-      for (const word of command.words) {
-        const expanded = await shellExpandWord(word, state, io.depth);
-        argv.push(...expanded);
+
+      if (command.type === 'funcdef') {
+        state.functions.set(command.name, command.body);
+        return { stdout: '', stderr: '', status: 0 };
       }
 
       let input = stdin;
       const outRedirs = [];
       let mergeStderr = false;
 
-      for (const redir of command.redirs) {
+      for (const redir of (command.redirs || [])) {
         if (redir.op === '2>&1') { mergeStderr = true; continue; }
         if (redir.op === '<<' || redir.op === '<<-') { input = redir.heredoc || ''; continue; }
         const target = (await shellExpandWord(redir.target, state, io.depth));
@@ -2728,25 +2961,141 @@
       }
 
       let result = { stdout: '', stderr: '', status: 0 };
-      let commandIndex = 0;
-      while (commandIndex < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[commandIndex])) {
-        const eq = argv[commandIndex].indexOf('=');
-        state.env[argv[commandIndex].slice(0, eq)] = argv[commandIndex].slice(eq + 1);
-        commandIndex++;
-      }
-      if (commandIndex >= argv.length) {
-        result = { stdout: input, stderr: '', status: 0 };
+
+      if (command.type === 'block') {
+        result = await shellRunCompoundList(command.body, io);
+      } else if (command.type === 'if') {
+        let executed = false;
+        result = { stdout: '', stderr: '', status: 0 };
+        for (const clause of command.clauses) {
+          const testRes = await shellRunCompoundList(clause.test, io);
+          if (state.exit !== null || state.returnSignal !== null || state.loopSignal !== null) {
+            result = testRes;
+            executed = true;
+            break;
+          }
+          if (testRes.status === 0) {
+            result = await shellRunCompoundList(clause.body, io);
+            executed = true;
+            break;
+          }
+        }
+        if (!executed && command.elseBody) {
+          result = await shellRunCompoundList(command.elseBody, io);
+        }
+      } else if (command.type === 'while' || command.type === 'until') {
+        let out = '';
+        let err = '';
+        let status = 0;
+        while (true) {
+          if (state.exit !== null || state.returnSignal !== null) break;
+          const testRes = await shellRunCompoundList(command.test, io);
+          out += testRes.stdout;
+          err += testRes.stderr;
+          if (state.exit !== null || state.returnSignal !== null) { status = testRes.status; break; }
+
+          const cond = (command.type === 'while') ? (testRes.status === 0) : (testRes.status !== 0);
+          if (!cond) break;
+
+          const bodyRes = await shellRunCompoundList(command.body, io);
+          out += bodyRes.stdout;
+          err += bodyRes.stderr;
+          status = bodyRes.status;
+
+          if (state.loopSignal) {
+            const sig = state.loopSignal;
+            if (sig.type === 'continue') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; continue; }
+              break;
+            } else if (sig.type === 'break') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; }
+              break;
+            }
+          }
+        }
+        result = { stdout: out, stderr: err, status };
+      } else if (command.type === 'for') {
+        let out = '';
+        let err = '';
+        let status = 0;
+        let values = [];
+        if (command.items === null) {
+          values = state.positional ? [...state.positional] : [];
+        } else {
+          for (const itemTok of command.items) {
+            const expanded = await shellExpandWord(itemTok, state, io.depth);
+            values.push(...expanded);
+          }
+        }
+        for (const val of values) {
+          if (state.exit !== null || state.returnSignal !== null) break;
+          state.env[command.varName] = val;
+          const bodyRes = await shellRunCompoundList(command.body, io);
+          out += bodyRes.stdout;
+          err += bodyRes.stderr;
+          status = bodyRes.status;
+
+          if (state.loopSignal) {
+            const sig = state.loopSignal;
+            if (sig.type === 'continue') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; continue; }
+              break;
+            } else if (sig.type === 'break') {
+              sig.count--;
+              if (sig.count <= 0) { state.loopSignal = null; }
+              break;
+            }
+          }
+        }
+        result = { stdout: out, stderr: err, status };
       } else {
-        const name = argv[commandIndex];
-        try {
-          result = await shellExec(name, argv.slice(commandIndex + 1), {
-            stdin: input,
-            state,
-            depth: io.depth,
-            io
-          });
-        } catch (e) {
-          result = { stdout: '', stderr: `${name}: ${e && e.message ? e.message : String(e)}`, status: 1 };
+        // Simple command
+        const argv = [];
+        for (const word of (command.words || [])) {
+          const expanded = await shellExpandWord(word, state, io.depth);
+          argv.push(...expanded);
+        }
+
+        let commandIndex = 0;
+        while (commandIndex < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[commandIndex])) {
+          const eq = argv[commandIndex].indexOf('=');
+          state.env[argv[commandIndex].slice(0, eq)] = argv[commandIndex].slice(eq + 1);
+          commandIndex++;
+        }
+        if (commandIndex >= argv.length) {
+          result = { stdout: input, stderr: '', status: 0 };
+        } else {
+          const name = argv[commandIndex];
+          const func = state.functions && state.functions.get(name);
+          if (func) {
+            const prevPositional = state.positional;
+            const prevReturn = state.returnSignal;
+            state.positional = argv.slice(commandIndex + 1);
+            state.returnSignal = null;
+            try {
+              result = await shellRunCommand(func, input, io);
+              if (state.returnSignal !== null) {
+                result.status = state.returnSignal.status;
+              }
+            } finally {
+              state.positional = prevPositional;
+              state.returnSignal = prevReturn;
+            }
+          } else {
+            try {
+              result = await shellExec(name, argv.slice(commandIndex + 1), {
+                stdin: input,
+                state,
+                depth: io.depth,
+                io
+              });
+            } catch (e) {
+              result = { stdout: '', stderr: `${name}: ${e && e.message ? e.message : String(e)}`, status: 1 };
+            }
+          }
         }
       }
 
@@ -2799,6 +3148,7 @@
         input = res.stdout;
         if (isLast) finalOut = res.stdout;
       }
+      if (pipeline.negate) status = (status === 0 ? 1 : 0);
       return { stdout: finalOut, stderr: errs.join('\n'), status };
     }
 
@@ -2838,8 +3188,9 @@
         status = res.status;
         if (res.stdout) out.push(res.stdout);
         if (res.stderr) errs.push(res.stderr);
-        if (state.exit !== null) break;
+        if (state.exit !== null || state.returnSignal !== null) break;
       }
+      if (state.loopSignal !== null) state.loopSignal = null;
 
       const stdout = out.join('');
       const stderr = errs.join('');
