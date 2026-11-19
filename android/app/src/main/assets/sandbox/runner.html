@@ -3965,6 +3965,43 @@
             output = `Successfully edited '${filePath}': replaced 1 occurrence.`;
           }
 
+        } else if (tool === 'memory' || tool === 'remember' || tool === 'recall') {
+          const action = (event.data.action || 'save').toLowerCase();
+          const fact = (event.data.fact || event.data.content || event.data.text || '').trim();
+          const memPath = '/memory/MEMORY.md';
+
+          if (action === 'read') {
+            let current = '';
+            try {
+              current = await opfs.readFile(memPath);
+            } catch (e) {
+              current = '';
+            }
+            output = current ? `Long-term user memory (${memPath}):\n${current}` : 'User memory is currently empty.';
+          } else {
+            if (!fact) throw new Error('Parameter "fact" is required for memory save');
+            let current = '';
+            try {
+              current = await opfs.readFile(memPath);
+            } catch (e) {
+              current = '';
+            }
+            const dateStr = new Date().toISOString().slice(0, 10);
+            const entry = `- [${dateStr}] ${fact}`;
+            if (!current.includes(fact)) {
+              current = current ? `${current.trim()}\n${entry}` : `# User Profile & Preferences\n${entry}`;
+              await opfs.writeFile(memPath, current);
+              await flushVfsPersistence();
+            }
+            // Send event to content script so localStorage and UI stay synced in real-time
+            window.parent.postMessage({
+              type: 'DU_MEMORY_UPDATED',
+              content: current,
+              savedFact: fact
+            }, '*');
+            output = `Fact saved to long-term memory (${memPath}):\n"${fact}"`;
+          }
+
         } else if (tool === 'install_skill' || tool === 'add_skill') {
           const name = event.data.name || event.data.skill_name || 'Custom Skill';
           const desc = event.data.desc || event.data.description || name;

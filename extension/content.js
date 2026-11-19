@@ -604,6 +604,38 @@ function syncSkillsToVfs() {
   }
 }
 
+// User Profile & Long-term Memory Engine
+function getUserMemoryContent() {
+  return (localStorage.getItem('du_user_memory') || '').trim();
+}
+
+function setUserMemoryContent(content) {
+  const clean = String(content || '').trim();
+  localStorage.setItem('du_user_memory', clean);
+  syncMemoryToVfs();
+  publishDirectiveToMainWorld(true);
+}
+
+function getCustomInstructions() {
+  return (localStorage.getItem('du_custom_instructions') || '').trim();
+}
+
+function setCustomInstructions(text) {
+  const clean = String(text || '').trim();
+  localStorage.setItem('du_custom_instructions', clean);
+  publishDirectiveToMainWorld(true);
+}
+
+function syncMemoryToVfs() {
+  if (!sandboxIframe || !sandboxIframe.contentWindow) return;
+  const mem = getUserMemoryContent();
+  sandboxIframe.contentWindow.postMessage({
+    type: 'DU_MOUNT_SKILL',
+    path: '/memory/MEMORY.md',
+    content: mem || '# User Memory\n(No memories recorded yet.)'
+  }, '*');
+}
+
 /**
  * The list of active skills.
  *
@@ -653,9 +685,22 @@ ${isPowershell ? `- IMPORTANT FOR TERMINAL & DAEMONS:
     This lets the server run continuously without hanging your response.` : '- IMPORTANT FOR TERMINAL: Use POSIX bash commands. For background servers, append " &" to detach.'}`;
   }
 
+  const customInstructions = getCustomInstructions();
+  const userMemory = getUserMemoryContent();
+  let userProfileSection = '';
+  if (customInstructions || userMemory) {
+    userProfileSection = `\n\n═══════════════════════════════════════════════════════════\nUSER PROFILE & PERSISTENT MEMORY\n═══════════════════════════════════════════════════════════\n`;
+    if (customInstructions) {
+      userProfileSection += `[CUSTOM INSTRUCTIONS / USER PREFERENCES]:\n${customInstructions}\n\n`;
+    }
+    if (userMemory) {
+      userProfileSection += `[LONG-TERM MEMORY (/memory/MEMORY.md)]:\n${userMemory}\n`;
+    }
+  }
+
   return `[SYSTEM CAPABILITY: DEEPSEEK LOCAL AGENT RUNTIME ACTIVE]
 You are DeepSeek, operating with the DeepUpgrade local execution environment enabled for this session.
-${envHeader}
+${envHeader}${userProfileSection}
 
 ═══════════════════════════════════════════════════════════
 TOOL SELECTION & USAGE MATRIX (STRICT ADHERENCE REQUIRED)
@@ -741,7 +786,18 @@ You MUST choose the most specialized tool for the task. Never use general shell 
       ]}
       \`\`\`
 
-11. "install_skill" - Teach Permanent Workflows
+11. "memory" - Remember or Read Long-term User Facts
+    - Usage: Proactively call "save" when the user mentions their name, preferred tech stack, OS, style habits, project facts, or instructions they want remembered. Call "read" to recall all stored facts.
+    - Schema:
+      \`\`\`json:tool
+      { "tool": "memory", "action": "save", "fact": "Пользователь пишет на Python и TypeScript, ОС Windows" }
+      \`\`\`
+      or
+      \`\`\`json:tool
+      { "tool": "memory", "action": "read" }
+      \`\`\`
+
+12. "install_skill" - Teach Permanent Workflows
     - Schema:
       \`\`\`json:tool
       { "tool": "install_skill", "name": "Skill Name", "desc": "Short description", "prompt": "Instructions..." }
@@ -812,6 +868,13 @@ window.addEventListener('message', async (ev) => {
     syncSkillsToVfs();
     publishDirectiveToMainWorld(true);
     if (isSkillsTabActive) renderNativeSkillsContent();
+  } else if (ev.data && ev.data.type === 'DU_MEMORY_UPDATED') {
+    const content = ev.data.content || '';
+    localStorage.setItem('du_user_memory', content);
+    publishDirectiveToMainWorld(true);
+    if (typeof isConfigTabActive !== 'undefined' && isConfigTabActive) {
+      renderNativeConfigContent();
+    }
   }
 });
 
@@ -1711,6 +1774,7 @@ function initSandboxIframe() {
   sandboxIframe.onload = () => {
     flushSandboxQueue();
     syncSkillsToVfs();
+    syncMemoryToVfs();
     // Send persistent packages to sandbox
     const savedPackages = JSON.parse(localStorage.getItem('du_persistent_packages') || '[]');
     sandboxIframe.contentWindow.postMessage({
@@ -1925,6 +1989,37 @@ function runInSandbox(toolObj) {
             id,
             success: writeRes.ok,
             output: writeRes.ok ? `Successfully replaced text in '${path}'.` : `Edit error writing file: ${writeRes.error}`
+          });
+          return;
+        }
+
+        if (name === 'memory' || name === 'remember' || name === 'recall') {
+          const action = (args.action || toolObj.action || 'save').toLowerCase();
+          const fact = (args.fact || toolObj.fact || args.content || toolObj.content || '').trim();
+          if (action === 'read') {
+            const currentMem = getUserMemoryContent();
+            resolve({
+              id,
+              success: true,
+              output: currentMem ? `Long-term user memory (/memory/MEMORY.md):\n${currentMem}` : 'User memory is currently empty.'
+            });
+            return;
+          }
+          if (!fact) {
+            resolve({ id, success: false, output: 'Error: Parameter "fact" cannot be empty for memory save.' });
+            return;
+          }
+          let currentMem = getUserMemoryContent();
+          const timestamp = new Date().toISOString().slice(0, 10);
+          const newEntry = `- [${timestamp}] ${fact}`;
+          if (!currentMem.includes(fact)) {
+            currentMem = currentMem ? `${currentMem}\n${newEntry}` : `# User Profile & Preferences\n${newEntry}`;
+            setUserMemoryContent(currentMem);
+          }
+          resolve({
+            id,
+            success: true,
+            output: `Fact saved to long-term memory (/memory/MEMORY.md):\n"${fact}"`
           });
           return;
         }
@@ -3390,7 +3485,7 @@ function hookInput() {
 
 const KNOWN_TOOL_NAMES = new Set([
   'write', 'edit', 'read', 'glob', 'grep', 'bash', 'python', 'py', 'js',
-  'question', 'ask', 'todowrite', 'todo', 'install_skill', 'add_skill'
+  'question', 'ask', 'todowrite', 'todo', 'memory', 'remember', 'recall', 'install_skill', 'add_skill'
 ]);
 
 // Initial load of JS plugins
@@ -3560,6 +3655,17 @@ function validateToolObject(obj) {
   } else if (tool === 'question' || tool === 'ask') {
     if (!obj.question && obj.prompt) obj.question = obj.prompt;
     if (!obj.question) obj.__parseError = 'question: missing "question"';
+  } else if (tool === 'memory' || tool === 'remember' || tool === 'recall') {
+    obj.tool = 'memory';
+    const action = (obj.action || 'save').toLowerCase();
+    obj.action = action;
+    if (action === 'save') {
+      const fact = asString(obj.fact) ?? asString(obj.content) ?? asString(obj.text) ?? asString(obj.value);
+      obj.fact = fact === null ? '' : fact;
+      if (!obj.fact.trim()) {
+        obj.__parseError = 'memory: "fact" is empty — please provide a non-empty fact to save';
+      }
+    }
   } else if (tool === 'bash' || tool === 'python' || tool === 'py' || tool === 'js') {
     const code = asString(obj.code) ?? asString(obj.text);
     obj.code = code === null ? '' : code;
@@ -3576,7 +3682,7 @@ function extractToolCallFallback(text) {
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       if (parsed.tool) {
-        if (parsed.code || (parsed.tool === 'edit' && parsed.path) || (parsed.tool === 'install_skill' || parsed.tool === 'add_skill') || parsed.tool === 'read' || parsed.tool === 'write' || parsed.tool === 'glob' || parsed.tool === 'grep' || parsed.tool === 'question' || parsed.tool === 'ask' || parsed.tool === 'todowrite' || parsed.tool === 'todo') return parsed;
+        if (parsed.code || (parsed.tool === 'edit' && parsed.path) || (parsed.tool === 'install_skill' || parsed.tool === 'add_skill') || parsed.tool === 'read' || parsed.tool === 'write' || parsed.tool === 'glob' || parsed.tool === 'grep' || parsed.tool === 'question' || parsed.tool === 'ask' || parsed.tool === 'todowrite' || parsed.tool === 'todo' || parsed.tool === 'memory' || parsed.tool === 'remember') return parsed;
       }
     }
   } catch(e) {}
@@ -3919,6 +4025,14 @@ function dsmlParamsToTool(toolName, params) {
     case 'question':
     case 'ask':
       return { tool: 'question', question: pick('question', 'prompt') ?? '', options: pick('options') ?? [] };
+    case 'memory':
+    case 'remember':
+    case 'recall':
+      return {
+        tool: 'memory',
+        action: pick('action', 'type') ?? 'save',
+        fact: pick('fact', 'content', 'text', 'value') ?? ''
+      };
     default:
       return { tool: name, ...params };
   }
@@ -4364,6 +4478,9 @@ function getToolIcon(toolName, customIcon) {
   if (t === 'glob' || t === 'grep') {
     return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
   }
+  if (t === 'memory' || t === 'remember' || t === 'recall') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04z"/></svg>`;
+  }
   if (t === 'todowrite' || t === 'todo') {
     return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`;
   }
@@ -4419,6 +4536,10 @@ function toolCardStreamingContent(toolObj) {
   if (tool === 'js') return { label: 'JavaScript', iconHtml, inputHtml: toolCardPending('Приём кода…') };
   if (tool === 'glob') return { label: `Поиск файлов: ${(toolObj && toolObj.pattern) || '*'}`, iconHtml, inputHtml: toolCardPending('Приём шаблона…') };
   if (tool === 'grep') return { label: `Поиск в коде: ${(toolObj && toolObj.pattern) || ''}`, iconHtml, inputHtml: toolCardPending('Приём шаблона…') };
+  if (tool === 'memory' || tool === 'remember' || tool === 'recall') {
+    const act = (toolObj && toolObj.action === 'read') ? 'Чтение памяти' : 'Запоминание факта';
+    return { label: act, iconHtml, inputHtml: toolCardPending('Обращение к долговременной памяти…') };
+  }
   if (tool === 'todowrite' || tool === 'todo') return { label: 'План выполнения', iconHtml, inputHtml: toolCardPending('Обновление плана…') };
   return { label: 'Терминал', iconHtml, inputHtml: toolCardPending('Приём команды…') };
 }
@@ -4446,6 +4567,13 @@ function toolCardContent(toolObj, streaming) {
     }
     inputContent = `<div class="du-diff-file-tag">JS PLUGIN: ${escapeHtml(customTool.name)}</div>`
       + (argsText ? toolCardCode(argsText) : '<div style="opacity:0.7;font-size:12px;">Вызов инструмента</div>');
+  } else if (toolObj.tool === 'memory' || toolObj.tool === 'remember' || toolObj.tool === 'recall') {
+    const isRead = toolObj.action === 'read';
+    label = isRead ? 'Чтение памяти' : 'Запоминание факта';
+    inputContent = `<div class="du-diff-file-tag">LONG-TERM MEMORY (/memory/MEMORY.md)</div>`
+      + (isRead
+        ? '<div style="font-size: 12px; opacity: 0.85;">Чтение сохраненных данных профиля пользователя</div>'
+        : `<div class="du-diff-add">+ ${escapeHtml(toolObj.fact || toolObj.content || '')}</div>`);
   } else if (toolObj.tool === 'todowrite' || toolObj.tool === 'todo') {
     const rawTodos = toolObj.todos || [];
     const todos = Array.isArray(rawTodos) ? rawTodos : [];
@@ -5288,6 +5416,46 @@ function renderNativeConfigContent() {
         <span class="du-native-badge">${plugins.filter(p => p.enabled).length} плагинов акт.</span>
       </div>
 
+      <!-- Section: User Profile & Custom Instructions -->
+      <div class="du-native-add-box" style="margin-top: 0; margin-bottom: 12px;">
+        <div class="du-native-add-header">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+            <circle cx="12" cy="7" r="4"></circle>
+          </svg>
+          <span class="du-native-add-title">Обо мне и системные предпочтения (Custom Instructions)</span>
+        </div>
+        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin: 6px 0 10px;">
+          Инструкции и факты о вас, которые агент ВСЕГДА держит в контексте каждого первого сообщения (ваш стек, ОС, правила кода, манера ответов).
+        </div>
+        <textarea class="du-textarea du-custom-instructions-input" placeholder="Например: Меня зовут Алекс. Пишу на Go и Python под Arch Linux. Отвечай кратко, код пиши без лишних комментариев и boilerplate." rows="3" style="min-height: 70px;">${escapeHtml(getCustomInstructions())}</textarea>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px;">
+          <span class="du-instructions-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">✓ Инструкции сохранены</span>
+          <button class="du-btn-primary du-save-instructions-btn" type="button" style="padding: 6px 14px; font-size: 12px; margin-left: auto;">Сохранить предпочтения</button>
+        </div>
+
+        <!-- Long-term Memory preview (/memory/MEMORY.md) -->
+        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,0.08));">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+            <div style="display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary, #f1f5f9);">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04z"/>
+                <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04z"/>
+              </svg>
+              <span>Авто-память агента (/memory/MEMORY.md)</span>
+            </div>
+            <button class="du-clear-memory-btn" type="button" style="background: none; border: none; color: #ef4444; font-size: 11px; cursor: pointer; padding: 2px 6px; opacity: 0.8;">Очистить память</button>
+          </div>
+          <div style="font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin-bottom: 8px;">
+            Факты, которые DeepSeek автоматически запоминает через инструмент <code>memory</code> в ходе разговоров:
+          </div>
+          <textarea class="du-textarea du-memory-preview" rows="3" style="min-height: 60px; font-family: monospace; font-size: 11px;" placeholder="Агент пока ничего не сохранил. Он начнет запоминать важные факты о вас в ходе бесед...">${escapeHtml(getUserMemoryContent())}</textarea>
+          <div style="display: flex; justify-content: flex-end; margin-top: 6px;">
+            <button class="du-btn-primary du-save-memory-btn" type="button" style="padding: 4px 10px; font-size: 11px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);">Сохранить правку памяти</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Section: Context Limit -->
       <div class="du-native-add-box" style="margin-top: 0;">
         <div class="du-native-add-header">
@@ -5408,6 +5576,39 @@ function renderNativeConfigContent() {
       </div>
     </div>
   `;
+
+  // Bind Custom Instructions & Memory
+  const instrInput = panel.querySelector('.du-custom-instructions-input');
+  const instrBtn = panel.querySelector('.du-save-instructions-btn');
+  const instrStatus = panel.querySelector('.du-instructions-status');
+  if (instrBtn && instrInput) {
+    instrBtn.onclick = () => {
+      setCustomInstructions(instrInput.value);
+      if (instrStatus) {
+        instrStatus.style.display = 'inline';
+        setTimeout(() => { instrStatus.style.display = 'none'; }, 2000);
+      }
+    };
+  }
+
+  const memPreview = panel.querySelector('.du-memory-preview');
+  const saveMemBtn = panel.querySelector('.du-save-memory-btn');
+  const clearMemBtn = panel.querySelector('.du-clear-memory-btn');
+  if (saveMemBtn && memPreview) {
+    saveMemBtn.onclick = () => {
+      setUserMemoryContent(memPreview.value);
+      saveMemBtn.textContent = '✓ Сохранено';
+      setTimeout(() => { saveMemBtn.textContent = 'Сохранить правку памяти'; }, 2000);
+    };
+  }
+  if (clearMemBtn) {
+    clearMemBtn.onclick = () => {
+      if (confirm('Очистить всю долговременную память агента?')) {
+        setUserMemoryContent('');
+        if (memPreview) memPreview.value = '';
+      }
+    };
+  }
 
   // Bind Context Limit Pills & Input
   const limitInput = panel.querySelector('.du-custom-limit-input');
