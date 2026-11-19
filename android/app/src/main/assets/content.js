@@ -976,20 +976,40 @@ function formatBytes(bytes) {
 
 function buildAttachedAssetsDirective() {
   if (stagedAttachments.size === 0 && duStoreAssets.size === 0) return '';
-  const lines = [];
+  const allAssets = [];
   const seen = new Set();
+
   for (const info of stagedAttachments.values()) {
     if (seen.has(info.path)) continue;
     seen.add(info.path);
-    lines.push(`- ${info.path} (${info.type || 'application/octet-stream'}, ${formatBytes(info.size)})`);
+    allAssets.push(info);
   }
   for (const [path, info] of duStoreAssets) {
     if (seen.has(path)) continue;
-    if (lines.length >= 20) break;
     seen.add(path);
-    lines.push(`- ${path} (${info.type || 'application/octet-stream'}, ${formatBytes(info.size)})`);
+    allAssets.push({ path, size: info.size, type: info.type });
   }
-  if (lines.length === 0) return '';
+
+  if (allAssets.length === 0) return '';
+
+  const totalCount = allAssets.length;
+  const totalBytes = allAssets.reduce((sum, a) => sum + (a.size || 0), 0);
+
+  const lines = [];
+  // If user dropped 100s or 800 log files, do not blow up token context with a massive list!
+  const MAX_DIRECT_LISTING = 12;
+  const sliceCount = totalCount > MAX_DIRECT_LISTING ? 10 : totalCount;
+
+  for (let i = 0; i < sliceCount; i++) {
+    const a = allAssets[i];
+    lines.push(`- ${a.path} (${a.type || 'application/octet-stream'}, ${formatBytes(a.size)})`);
+  }
+
+  if (totalCount > MAX_DIRECT_LISTING) {
+    const remaining = totalCount - sliceCount;
+    lines.push(`- ... and ${remaining} more files in /added/ (total: ${totalCount} files, ${formatBytes(totalBytes)}). Use 'glob' or 'bash' ('ls /added/') to list/filter them.`);
+  }
+
   return `\n\n[ATTACHED ASSETS AVAILABLE IN VFS]:\n${lines.join('\n')}\n(You can access or inspect these files in python, js, or shell tools)`;
 }
 
@@ -4127,6 +4147,9 @@ function collectInlineToolCalls() {
   const messages = document.querySelectorAll('.ds-markdown');
   messages.forEach((msg) => {
     if (msg.closest('.fbb737a4')) return;              // user bubbles never hold tool calls
+    if (msg.hasAttribute('data-du-inline-rendered')) return;
+    if (msg.querySelector('.opencode-tool-root')) return; // Already has rendered card
+
     const raw = msg.innerText || '';
     if (!raw) return;
     if (!/tool_call|DSML/i.test(raw)) return;
@@ -4144,7 +4167,11 @@ function collectInlineToolCalls() {
     if (!el) el = msg;
     if (el.closest('.md-code-block') || el.tagName.toLowerCase() === 'pre') return; // handled by the fenced path
     el = climbToCallHost(el, msg, marker);
-    if (el.hasAttribute('data-du-rendered')) return;
+    if (el.hasAttribute('data-du-rendered') || el.hasAttribute('data-du-widget-attached')) return;
+
+    // Synchronously flag both element and message to prevent duplicate enqueueing
+    el.setAttribute('data-du-rendered', 'true');
+    msg.setAttribute('data-du-inline-rendered', 'true');
 
     out.push({ block: el, toolObj: parsed.toolObj, kind: parsed.kind });
   });
@@ -4745,8 +4772,14 @@ function renderOpenCode1to1(originalPre, toolObj) {
   let root = originalPre.__duStreamWidget || targetToReplace.__duStreamWidget;
   if (root && !root.isConnected) root = null;
 
+  // Check if a tool root already exists in parent or following sibling
+  if (!root && targetToReplace.parentNode) {
+    const existing = targetToReplace.parentNode.querySelector(':scope > .opencode-tool-root');
+    if (existing) root = existing;
+  }
+
   if (root) {
-    // Reuse the card that already appeared while the block was streaming.
+    // Reuse the card that already appeared while the block was streaming or on previous render.
     root.removeAttribute('data-du-streaming');
   } else {
     root = createToolCard();
