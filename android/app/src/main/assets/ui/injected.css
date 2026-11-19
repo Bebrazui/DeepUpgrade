@@ -299,18 +299,21 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
   display: none !important;
 }
 
-/* --- Native Settings Tab: Skills & Config Panel Styling --- */
+/* --- Native Settings Tab: Skills & Config Panel Styling (Refined Clean Native Design) --- */
 .du-native-skills-panel,
-.du-native-config-panel {
+.du-native-config-panel,
+.du-native-files-panel {
   width: 100%;
-  padding-top: 6px;
+  padding-top: 4px;
   animation: du-fade-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  box-sizing: border-box;
 }
 
-.du-native-skills-container {
+.du-native-skills-container,
+.du-native-files-container {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
 }
 
 .du-native-header-row {
@@ -322,30 +325,32 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
 }
 
 .du-native-title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
   color: var(--dsw-alias-label-primary, #ededed);
+  letter-spacing: -0.01em;
 }
 
 .du-native-sub {
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--dsw-alias-label-tertiary, #94a3b8);
-  margin-top: 2px;
+  margin-top: 3px;
 }
 
 .du-native-badge {
-  font-size: 11px;
+  font-size: 12px;
   background: rgba(59, 130, 246, 0.15);
   color: #60a5fa;
-  padding: 3px 10px;
+  padding: 4px 10px;
   border-radius: 12px;
   font-weight: 500;
 }
 
+/* Native List & Rows matching DeepSeek Data tab */
 .du-native-skills-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
 }
 
 .du-native-skill-row {
@@ -353,33 +358,153 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px;
-  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.03));
-  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
-  border-radius: 12px;
+  padding: 14px 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: 0;
   transition: background 0.15s;
 }
 
-.du-native-skill-row:hover {
-  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.05));
+.du-native-skill-row:last-child {
+  border-bottom: none;
 }
 
 .du-native-skill-info {
   flex: 1;
+  min-width: 0;
 }
 
 .du-native-skill-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 4px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, #ededed);
 }
 
 .du-skill-svg-icon {
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   color: #3b82f6;
   flex-shrink: 0;
+}
+
+.du-native-skill-desc {
+  font-size: 13px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  margin-top: 3px;
+  line-height: 1.45;
+}
+
+.du-native-skill-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+/* Expandable detail spoiler for SKILL prompt */
+.du-native-skill-details {
+  margin-top: 8px;
+}
+
+.du-native-prompt-toggle {
+  background: none;
+  border: none;
+  color: #60a5fa;
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.du-native-prompt-toggle:hover {
+  text-decoration: underline;
+}
+
+.du-native-prompt-box {
+  display: none;
+  font-size: 11px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: #94a3b8;
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow-y: auto;
+  margin-top: 6px;
+}
+
+.du-native-prompt-box.open {
+  display: block;
+}
+
+/* Native buttons matching DeepSeek secondary capsule buttons */
+.du-native-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary, #ededed);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.du-native-pill-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.du-native-pill-btn.primary {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #ffffff;
+}
+
+.du-native-pill-btn.primary:hover {
+  background: #2563eb;
+}
+
+.du-native-pill-btn.danger {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+  background: transparent;
+}
+
+.du-native-pill-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+}
+
+/* Clean Collapsible Add Skill Section */
+.du-native-add-section {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+}
+
+.du-native-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.du-native-section-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, #ededed);
 }
 
 /* Empty state styling */

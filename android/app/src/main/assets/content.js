@@ -4925,6 +4925,8 @@ async function renderNativeFilesContent() {
   const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
   if (!contentArea) return;
 
+  const t = getDuI18n();
+
   // Hide original settings items (Theme, Language, Voice)
   Array.from(contentArea.children).forEach(ch => {
     if (!ch.classList.contains('du-native-files-panel')) {
@@ -4972,8 +4974,8 @@ async function renderNativeFilesContent() {
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M1.5 5.5a1 1 0 011-1h5l2 2.5h11a1 1 0 011 1v10a1 1 0 01-1 1h-18a1 1 0 01-1-1v-12z" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
-        <div class="du-empty-text">Файлов пока нет</div>
-        <div class="du-empty-hint">Файлы, созданные агентом в Python или шелле, попадут сюда автоматически и переживут перезагрузку страницы</div>
+        <div class="du-empty-text">${escapeHtml(t.noFiles)}</div>
+        <div class="du-empty-hint">${escapeHtml(t.noFilesHint)}</div>
       </div>
     `;
   } else {
@@ -4995,17 +4997,17 @@ async function renderNativeFilesContent() {
               <div class="du-files-meta">${formatBytes(item.size || 0)} • ${escapeHtml(duFormatDate(item.mtime))}</div>
             </div>
             <div class="du-files-actions">
-              <button class="du-files-btn du-files-preview-btn" title="Просмотр" type="button">
+              <button class="du-files-btn du-files-preview-btn" title="${escapeAttr(t.previewBtn)}" type="button">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/>
                 </svg>
               </button>
-              <button class="du-files-btn du-files-download-btn" title="Скачать" type="button">
+              <button class="du-files-btn du-files-download-btn" title="${escapeAttr(t.downloadBtn)}" type="button">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
                 </svg>
               </button>
-              <button class="du-files-btn du-files-delete-btn" title="Удалить" type="button">
+              <button class="du-files-btn du-files-delete-btn" title="${escapeAttr(t.deleteBtn)}" type="button">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>
                 </svg>
@@ -5021,17 +5023,17 @@ async function renderNativeFilesContent() {
     <div class="du-native-files-container">
       <div class="du-native-header-row">
         <div>
-          <div class="du-native-title">Файлы</div>
-          <div class="du-native-sub">${mode === 'opfs' ? 'Дюрабельное хранилище OPFS' : 'Временное хранилище (OPFS недоступен)'}</div>
+          <div class="du-native-title">${escapeHtml(t.filesTitle)}</div>
+          <div class="du-native-sub">${mode === 'opfs' ? escapeHtml(t.filesSubOpfs) : escapeHtml(t.filesSubMem)}</div>
         </div>
         <div class="du-files-head-actions">
           <span class="du-native-badge">${files.length} • ${formatBytes(totalSize)}</span>
-          <button class="du-files-btn du-files-refresh-btn" title="Обновить" type="button">
+          <button class="du-files-btn du-files-refresh-btn" title="${escapeAttr(t.refreshBtn)}" type="button">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 12a9 9 0 11-2.6-6.4"/><polyline points="21 3 21 9 15 9"/>
             </svg>
           </button>
-          <button class="du-files-btn du-files-upload-btn" title="Загрузить свой файл" type="button">
+          <button class="du-files-btn du-files-upload-btn" title="${escapeAttr(t.uploadBtn)}" type="button">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
@@ -5214,6 +5216,192 @@ async function duDeleteFile(path) {
   for (const [key, info] of [...stagedAttachments.entries()]) {
     if (info.path === path) stagedAttachments.delete(key);
   }
+}
+
+// --- DeepSeek Language & Localization Helper ---
+function getDeepSeekLanguage() {
+  const htmlLang = (document.documentElement.lang || '').toLowerCase();
+  if (htmlLang.startsWith('ru')) return 'ru';
+  if (htmlLang.startsWith('zh')) return 'zh';
+  if (htmlLang.startsWith('en')) return 'en';
+
+  try {
+    for (const key of ['user_language', 'ds_language', 'language', 'locale', 'i18n_lang']) {
+      const val = (localStorage.getItem(key) || '').toLowerCase();
+      if (val.includes('ru')) return 'ru';
+      if (val.includes('zh')) return 'zh';
+      if (val.includes('en')) return 'en';
+    }
+  } catch (e) {}
+
+  const navLang = (navigator.language || '').toLowerCase();
+  if (navLang.startsWith('ru')) return 'ru';
+  if (navLang.startsWith('zh')) return 'zh';
+  return 'en';
+}
+
+const DU_I18N = {
+  ru: {
+    skillsTitle: 'Agent Skills',
+    skillsSub: 'Управление навыками агента (SKILL.md)',
+    activeBadge: 'активно',
+    noSkills: 'Нет установленных скиллов',
+    noSkillsHint: 'Добавьте ссылку на SKILL.md или установите файл ниже',
+    detailsPrompt: 'Показать промпт скилла',
+    hidePrompt: 'Скрыть промпт',
+    installTitle: 'Установка скилла',
+    urlPlaceholder: 'Вставьте ссылку на GitHub / Gist SKILL.md...',
+    loadBtn: 'Загрузить',
+    loadingBtn: 'Загрузка...',
+    loadedBtn: 'Успешно',
+    orFile: 'или загрузите файл',
+    dragSkill: 'Перетащите SKILL.md сюда или выберите файл',
+    rawPlaceholder: 'Или вставьте содержимое SKILL.md напрямую...',
+    installBtn: 'Установить скилл',
+    delSkillTitle: 'Удалить скилл',
+    filesTitle: 'Файлы',
+    filesSubOpfs: 'Дюрабельное хранилище OPFS',
+    filesSubMem: 'Временное хранилище (OPFS недоступен)',
+    noFiles: 'Файлов пока нет',
+    noFilesHint: 'Файлы, созданные агентом в Python или шелле, сохраняются здесь',
+    previewBtn: 'Просмотр',
+    downloadBtn: 'Скачать',
+    deleteBtn: 'Удалить',
+    refreshBtn: 'Обновить',
+    uploadBtn: 'Загрузить свой файл',
+    configTitle: 'DeepUpgrade Settings',
+    configSub: 'Контекст, долговременная память и JS-плагины',
+    customInstrTitle: 'Обо мне и системные предпочтения (Custom Instructions)',
+    customInstrDesc: 'Инструкции и факты о вас, которые агент ВСЕГДА держит в контексте каждого первого сообщения.',
+    customInstrPlaceholder: 'Например: Меня зовут Саша. Пишу на TypeScript под Linux. Отвечай кратко и по делу.',
+    savePreferences: 'Сохранить предпочтения',
+    savedCheck: '✓ Сохранено',
+    memoryTitle: 'Авто-память агента (/memory/MEMORY.md)',
+    memoryDesc: 'Факты, которые DeepSeek автоматически запоминает через инструмент memory:',
+    clearMemory: 'Очистить память',
+    confirmClearMemory: 'Очистить всю долговременную память агента?',
+    saveMemory: 'Сохранить правку памяти',
+    limitTitle: 'Ограничение контекста вывода (Tool Context Limit)',
+    limitDesc: 'Максимальное число символов вывода одного инструмента, отправляемое в LLM.',
+    exactLimit: 'Точный лимит символов:',
+    noLimitPill: 'Без лимита',
+    pluginsTitle: 'Установленные JS-плагины',
+    loadSamplePlugin: '+ Пример плагина',
+    noPlugins: 'Нет установленных JS-плагинов',
+    noPluginsHint: 'Перетащите ZIP-архив с плагином ниже для установки.',
+    zipDropTitle: 'Перетащите сюда ZIP-архив с плагином или нажмите для выбора',
+    zipDropDesc: 'Поддерживаются многофайловые скрипты, манифест plugin.json и ассеты.',
+    pluginFilesBtn: 'Файлы'
+  },
+  en: {
+    skillsTitle: 'Agent Skills',
+    skillsSub: 'Manage agent skills and system prompts (SKILL.md)',
+    activeBadge: 'active',
+    noSkills: 'No skills installed',
+    noSkillsHint: 'Enter a SKILL.md URL or drop a file below to install',
+    detailsPrompt: 'View skill prompt',
+    hidePrompt: 'Hide prompt',
+    installTitle: 'Install Skill',
+    urlPlaceholder: 'Paste link to GitHub / Gist SKILL.md...',
+    loadBtn: 'Fetch',
+    loadingBtn: 'Fetching...',
+    loadedBtn: 'Success',
+    orFile: 'or drop a file',
+    dragSkill: 'Drag SKILL.md here or choose a file',
+    rawPlaceholder: 'Or paste SKILL.md contents directly here...',
+    installBtn: 'Install skill',
+    delSkillTitle: 'Delete skill',
+    filesTitle: 'Files',
+    filesSubOpfs: 'Durable OPFS Storage',
+    filesSubMem: 'Temporary VFS Storage (OPFS unavailable)',
+    noFiles: 'No files found',
+    noFilesHint: 'Files created by the agent in Python or shell are saved here',
+    previewBtn: 'Preview',
+    downloadBtn: 'Download',
+    deleteBtn: 'Delete',
+    refreshBtn: 'Refresh',
+    uploadBtn: 'Upload file',
+    configTitle: 'DeepUpgrade Settings',
+    configSub: 'Context limits, persistent memory & JS plugins',
+    customInstrTitle: 'User Profile & Custom Instructions',
+    customInstrDesc: 'Instructions & facts about you that the agent always keeps in initial context.',
+    customInstrPlaceholder: 'E.g.: My name is Sasha. I work in TypeScript on Linux. Keep responses concise.',
+    savePreferences: 'Save Preferences',
+    savedCheck: '✓ Saved',
+    memoryTitle: 'Long-term Memory (/memory/MEMORY.md)',
+    memoryDesc: 'Facts that DeepSeek autonomously records using the memory tool:',
+    clearMemory: 'Clear Memory',
+    confirmClearMemory: 'Clear all long-term memory facts?',
+    saveMemory: 'Save Memory Edits',
+    limitTitle: 'Tool Context Output Limit',
+    limitDesc: 'Maximum characters of tool output sent to LLM per execution.',
+    exactLimit: 'Exact character limit:',
+    noLimitPill: 'No limit',
+    pluginsTitle: 'Installed JS Plugins',
+    loadSamplePlugin: '+ Sample Plugin',
+    noPlugins: 'No JS plugins installed',
+    noPluginsHint: 'Drag and drop a plugin ZIP file below to install.',
+    zipDropTitle: 'Drop plugin ZIP file here or click to browse',
+    zipDropDesc: 'Supports multi-file scripts, plugin.json manifest and assets.',
+    pluginFilesBtn: 'Files'
+  },
+  zh: {
+    skillsTitle: 'Agent Skills (技能)',
+    skillsSub: '管理智能体技能与系统提示词 (SKILL.md)',
+    activeBadge: '已启用',
+    noSkills: '暂无已安装的技能',
+    noSkillsHint: '在下方输入 SKILL.md 链接或上传文件即可安装',
+    detailsPrompt: '查看技能提示词',
+    hidePrompt: '收起提示词',
+    installTitle: '安装技能',
+    urlPlaceholder: '粘贴 GitHub / Gist SKILL.md 链接...',
+    loadBtn: '获取',
+    loadingBtn: '获取中...',
+    loadedBtn: '成功',
+    orFile: '或上传文件',
+    dragSkill: '将 SKILL.md 拖入此处或选择文件',
+    rawPlaceholder: '或直接在此粘贴 SKILL.md 内容...',
+    installBtn: '安装技能',
+    delSkillTitle: '删除技能',
+    filesTitle: '文件',
+    filesSubOpfs: 'OPFS 持久化存储',
+    filesSubMem: '临时 VFS 存储 (OPFS 不可用)',
+    noFiles: '暂无文件',
+    noFilesHint: '智能体在 Python 或 Shell 中生成的文件将保存在这里',
+    previewBtn: '预览',
+    downloadBtn: '下载',
+    deleteBtn: '删除',
+    refreshBtn: '刷新',
+    uploadBtn: '上传文件',
+    configTitle: 'DeepUpgrade Settings',
+    configSub: '上下文限制、长期记忆与 JS 插件',
+    customInstrTitle: '关于我与自定义指令 (Custom Instructions)',
+    customInstrDesc: '智能体在首条消息中始终保留的关于您的信息与偏好设置。',
+    customInstrPlaceholder: '例如：我叫 Sasha。常用 TypeScript 和 Linux。回答请保持简明扼要。',
+    savePreferences: '保存偏好设置',
+    savedCheck: '✓ 已保存',
+    memoryTitle: '智能体长期记忆 (/memory/MEMORY.md)',
+    memoryDesc: 'DeepSeek 在对话中通过 memory 工具自主记录的事实：',
+    clearMemory: '清空记忆',
+    confirmClearMemory: '确定要清空所有长期记忆吗？',
+    saveMemory: '保存记忆修改',
+    limitTitle: '工具输出上下文上限 (Tool Context Limit)',
+    limitDesc: '单次工具执行发送给大模型的最大字符数限制。',
+    exactLimit: '精确字符限制：',
+    noLimitPill: '无限制',
+    pluginsTitle: '已安装的 JS 插件',
+    loadSamplePlugin: '+ 示例插件',
+    noPlugins: '未安装任何 JS 插件',
+    noPluginsHint: '将插件 ZIP 文件拖放到下方即可安装。',
+    zipDropTitle: '将插件 ZIP 拖放到此处或点击选择',
+    zipDropDesc: '支持多文件脚本、plugin.json 清单及静态资源。',
+    pluginFilesBtn: '文件'
+  }
+};
+
+function getDuI18n() {
+  const lang = getDeepSeekLanguage();
+  return DU_I18N[lang] || DU_I18N.ru;
 }
 
 // --- Native Settings Tab: Skills + Files + DeepUpgrade Integration ---
@@ -5422,6 +5610,8 @@ function renderNativeConfigContent() {
   const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
   if (!contentArea) return;
 
+  const t = getDuI18n();
+
   // Hide original settings items (Theme, Language, Voice)
   Array.from(contentArea.children).forEach(ch => {
     if (!ch.classList.contains('du-native-config-panel')) {
@@ -5443,96 +5633,88 @@ function renderNativeConfigContent() {
     <div class="du-native-skills-container">
       <div class="du-native-header-row">
         <div>
-          <div class="du-native-title">DeepUpgrade Settings</div>
-          <div class="du-native-sub">Управление лимитом контекста и JavaScript-плагинами</div>
+          <div class="du-native-title">${escapeHtml(t.configTitle)}</div>
+          <div class="du-native-sub">${escapeHtml(t.configSub)}</div>
         </div>
-        <span class="du-native-badge">${plugins.filter(p => p.enabled).length} плагинов акт.</span>
+        <span class="du-native-badge">${plugins.filter(p => p.enabled).length} ${escapeHtml(t.activeBadge)}</span>
       </div>
 
       <!-- Section: User Profile & Custom Instructions -->
-      <div class="du-native-add-box" style="margin-top: 0; margin-bottom: 12px;">
-        <div class="du-native-add-header">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <div class="du-native-skill-row" style="flex-direction: column; align-items: stretch; gap: 8px;">
+        <div class="du-native-skill-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
             <circle cx="12" cy="7" r="4"></circle>
           </svg>
-          <span class="du-native-add-title">Обо мне и системные предпочтения (Custom Instructions)</span>
+          <span>${escapeHtml(t.customInstrTitle)}</span>
         </div>
-        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin: 6px 0 10px;">
-          Инструкции и факты о вас, которые агент ВСЕГДА держит в контексте каждого первого сообщения (ваш стек, ОС, правила кода, манера ответов).
-        </div>
-        <textarea class="du-textarea du-custom-instructions-input" placeholder="Например: Меня зовут Алекс. Пишу на Go и Python под Arch Linux. Отвечай кратко, код пиши без лишних комментариев и boilerplate." rows="3" style="min-height: 70px;">${escapeHtml(getCustomInstructions())}</textarea>
-        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px;">
-          <span class="du-instructions-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">✓ Инструкции сохранены</span>
-          <button class="du-btn-primary du-save-instructions-btn" type="button" style="padding: 6px 14px; font-size: 12px; margin-left: auto;">Сохранить предпочтения</button>
+        <div class="du-native-skill-desc">${escapeHtml(t.customInstrDesc)}</div>
+        <textarea class="du-textarea du-custom-instructions-input" placeholder="${escapeAttr(t.customInstrPlaceholder)}" rows="3" style="font-size: 12px; min-height: 60px;">${escapeHtml(getCustomInstructions())}</textarea>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+          <span class="du-instructions-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">${escapeHtml(t.savedCheck)}</span>
+          <button class="du-native-pill-btn primary du-save-instructions-btn" type="button" style="margin-left: auto;">${escapeHtml(t.savePreferences)}</button>
         </div>
 
         <!-- Long-term Memory preview (/memory/MEMORY.md) -->
-        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,0.08));">
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
-            <div style="display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary, #f1f5f9);">
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,0.06));">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+            <div style="display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #ededed);">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04z"/>
                 <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04z"/>
               </svg>
-              <span>Авто-память агента (/memory/MEMORY.md)</span>
+              <span>${escapeHtml(t.memoryTitle)}</span>
             </div>
-            <button class="du-clear-memory-btn" type="button" style="background: none; border: none; color: #ef4444; font-size: 11px; cursor: pointer; padding: 2px 6px; opacity: 0.8;">Очистить память</button>
+            <button class="du-native-pill-btn danger du-clear-memory-btn" type="button" style="padding: 3px 10px; font-size: 11px;">${escapeHtml(t.clearMemory)}</button>
           </div>
-          <div style="font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin-bottom: 8px;">
-            Факты, которые DeepSeek автоматически запоминает через инструмент <code>memory</code> в ходе разговоров:
-          </div>
-          <textarea class="du-textarea du-memory-preview" rows="3" style="min-height: 60px; font-family: monospace; font-size: 11px;" placeholder="Агент пока ничего не сохранил. Он начнет запоминать важные факты о вас в ходе бесед...">${escapeHtml(getUserMemoryContent())}</textarea>
+          <div class="du-native-skill-desc">${escapeHtml(t.memoryDesc)}</div>
+          <textarea class="du-textarea du-memory-preview" rows="3" style="min-height: 55px; font-family: monospace; font-size: 11px;">${escapeHtml(getUserMemoryContent())}</textarea>
           <div style="display: flex; justify-content: flex-end; margin-top: 6px;">
-            <button class="du-btn-primary du-save-memory-btn" type="button" style="padding: 4px 10px; font-size: 11px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);">Сохранить правку памяти</button>
+            <button class="du-native-pill-btn du-save-memory-btn" type="button" style="padding: 4px 12px; font-size: 11px;">${escapeHtml(t.saveMemory)}</button>
           </div>
         </div>
       </div>
 
       <!-- Section: Context Limit -->
-      <div class="du-native-add-box" style="margin-top: 0;">
-        <div class="du-native-add-header">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <div class="du-native-skill-row" style="flex-direction: column; align-items: stretch; gap: 8px;">
+        <div class="du-native-skill-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
             <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
-            <line x1="6" y1="6" x2="6.01" y2="6"></line>
-            <line x1="6" y1="18" x2="6.01" y2="18"></line>
           </svg>
-          <span class="du-native-add-title">Ограничение контекста вывода (Tool Context Limit)</span>
+          <span>${escapeHtml(t.limitTitle)}</span>
         </div>
-        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin: 6px 0 12px;">
-          Максимальное число символов вывода одного инструмента, отправляемое в LLM. Предотвращает ошибку Context Overflow и зависание браузера при больших выводах.
-        </div>
-        <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+        <div class="du-native-skill-desc">${escapeHtml(t.limitDesc)}</div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
           ${[
-            { label: '8 KB (8 тыс.)', val: 8000 },
-            { label: '16 KB (Рекомендуется)', val: 16000 },
-            { label: '32 KB (32 тыс.)', val: 32000 },
-            { label: '64 KB (64 тыс.)', val: 64000 },
-            { label: 'Без лимита', val: 0 }
+            { label: '8 KB', val: 8000 },
+            { label: '16 KB (Default)', val: 16000 },
+            { label: '32 KB', val: 32000 },
+            { label: '64 KB', val: 64000 },
+            { label: t.noLimitPill, val: 0 }
           ].map(p => `
-            <button class="du-limit-pill" data-val="${p.val}" type="button" style="padding: 6px 12px; border-radius: 8px; border: 1px solid ${currentLimit === p.val ? '#3b82f6' : 'rgba(255,255,255,0.1)'}; background: ${currentLimit === p.val ? 'rgba(59,130,246,0.2)' : 'rgba(0,0,0,0.2)'}; color: ${currentLimit === p.val ? '#60a5fa' : 'inherit'}; cursor: pointer; font-size: 12px; font-weight: ${currentLimit === p.val ? '600' : '400'};">
+            <button class="du-limit-pill du-native-pill-btn ${currentLimit === p.val ? 'primary' : ''}" data-val="${p.val}" type="button">
               ${p.label}
             </button>
           `).join('')}
         </div>
         <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="font-size: 12.5px; color: var(--dsw-alias-label-secondary, #cbd5e1);">Точный лимит символов:</span>
+          <span style="font-size: 12.5px; color: var(--dsw-alias-label-secondary, #cbd5e1);">${escapeHtml(t.exactLimit)}</span>
           <input class="du-input du-custom-limit-input" type="number" min="0" max="1000000" step="1000" value="${currentLimit}" style="width: 140px; padding: 6px 10px;" />
-          <span class="du-limit-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">✓ Сохранено</span>
+          <span class="du-limit-status" style="font-size: 12px; color: #10b981; font-weight: 500; display: none;">${escapeHtml(t.savedCheck)}</span>
         </div>
       </div>
 
       <!-- Section: JS Plugins -->
-      <div class="du-native-skills-list" style="margin-top: 8px;">
-        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
-          <div style="font-size: 14px; font-weight: 600;">Установленные JS-плагины</div>
-          <button class="du-btn-primary du-load-sample-plugin-btn" type="button" style="padding: 4px 10px; font-size: 11px;">+ Загрузить пример плагина</button>
+      <div class="du-native-add-section">
+        <div class="du-native-section-head">
+          <span class="du-native-section-title">${escapeHtml(t.pluginsTitle)}</span>
+          <button class="du-native-pill-btn du-load-sample-plugin-btn" type="button">${escapeHtml(t.loadSamplePlugin)}</button>
         </div>
         ${plugins.length === 0 ? `
-          <div class="du-skills-empty-state" style="padding: 24px; text-align: center;">
-            <div class="du-empty-text" style="font-size: 14px; font-weight: 500;">Нет установленных JS-плагинов</div>
-            <div class="du-empty-hint" style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Перетащите ZIP-архив с плагином ниже для установки.</div>
+          <div class="du-skills-empty-state" style="padding: 20px; text-align: center;">
+            <div class="du-empty-text">${escapeHtml(t.noPlugins)}</div>
+            <div class="du-empty-hint">${escapeHtml(t.noPluginsHint)}</div>
           </div>
         ` : plugins.map(p => {
           const fileKeys = p.files ? Object.keys(p.files) : [];
@@ -5546,20 +5728,20 @@ function renderNativeConfigContent() {
                   <span class="du-skill-main-name" style="font-weight: 600;">${escapeHtml(p.name)}</span>
                   <span style="font-size: 11px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.08); color: #94a3b8;">v${escapeHtml(p.version || '1.0.0')}</span>
                 </div>
-                <div class="du-native-skill-desc" style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${escapeHtml(p.desc || 'ZIP-плагин')}</div>
-                <div style="font-size: 11px; color: #64748b; margin-top: 3px;">
-                  Точка входа: <code>${escapeHtml(p.entryFile || 'index.js')}</code> • ${assetCount > 0 ? `${assetCount} файл(ов)/ассет(ов)` : 'Одиночный скрипт'}
+                <div class="du-native-skill-desc">${escapeHtml(p.desc || 'ZIP-плагин')}</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 2px;">
+                  <code>${escapeHtml(p.entryFile || 'index.js')}</code> • ${assetCount > 0 ? `${assetCount} assets` : 'Script'}
                 </div>
               </div>
-              <div class="du-native-skill-controls" style="display: flex; align-items: center; gap: 8px;">
-                <button class="du-toggle-files-btn" data-plugin-id="${p.id}" type="button" style="background: none; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; color: inherit; padding: 4px 8px; font-size: 11px; cursor: pointer;">
-                  Файлы (${assetCount})
+              <div class="du-native-skill-controls">
+                <button class="du-native-pill-btn du-toggle-files-btn" data-plugin-id="${escapeAttr(p.id)}" type="button" style="padding: 3px 8px; font-size: 11px;">
+                  ${escapeHtml(t.pluginFilesBtn)} (${assetCount})
                 </button>
                 <label class="du-switch">
-                  <input type="checkbox" data-plugin-id="${p.id}" ${p.enabled ? 'checked' : ''}>
+                  <input type="checkbox" data-plugin-id="${escapeAttr(p.id)}" ${p.enabled ? 'checked' : ''}>
                   <span class="du-slider"></span>
                 </label>
-                <button class="du-native-del-btn" data-del-plugin="${p.id}" title="Удалить плагин">
+                <button class="du-native-del-btn" data-del-plugin="${escapeAttr(p.id)}" title="${escapeAttr(t.deleteBtn)}">
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                     <path d="M2 4h12M5.333 4V2.667a1.333 1.333 0 011.334-1.334h2.666a1.333 1.333 0 011.334 1.334V4m2 0v9.333a1.333 1.333 0 01-1.334 1.334H4.667a1.333 1.333 0 01-1.334-1.334V4h9.334z"/>
                   </svg>
@@ -5567,18 +5749,18 @@ function renderNativeConfigContent() {
               </div>
             </div>
             <!-- Collapsible files list -->
-            <div class="du-plugin-files-box" id="files_${p.id}" style="display: none; margin-top: 6px; background: rgba(0,0,0,0.25); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.06);">
-              <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1;">Файлы и ассеты архива:</div>
-              <div style="display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto;">
+            <div class="du-plugin-files-box" id="files_${escapeAttr(p.id)}" style="display: none; margin-top: 6px; background: rgba(0,0,0,0.3); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="font-size: 11.5px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1;">Assets:</div>
+              <div style="display: flex; flex-direction: column; gap: 4px; max-height: 140px; overflow-y: auto;">
                 ${fileKeys.length === 0 ? `
-                  <div style="font-size: 11px; color: #64748b;">(Нет прикрепленных файлов)</div>
+                  <div style="font-size: 11px; color: #64748b;">(No files)</div>
                 ` : fileKeys.map(fk => {
                   const f = p.files[fk];
                   const sizeKb = f && f.size ? (f.size / 1024).toFixed(1) + ' KB' : '0 KB';
                   return `
-                    <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; font-family: monospace; padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-family: monospace; padding: 2px 4px;">
                       <span>${fk === p.entryFile ? '⚡ ' : '📄 '}${escapeHtml(fk)}</span>
-                      <span style="color: #64748b; font-size: 10.5px;">${f && f.isBinary ? 'Binary • ' : ''}${sizeKb}</span>
+                      <span style="color: #64748b; font-size: 10px;">${f && f.isBinary ? 'Binary • ' : ''}${sizeKb}</span>
                     </div>
                   `;
                 }).join('')}
@@ -5590,22 +5772,15 @@ function renderNativeConfigContent() {
       </div>
 
       <!-- Install Plugin from ZIP -->
-      <div class="du-native-add-box du-zip-dropzone" style="margin-top: 14px; border: 2px dashed rgba(255,255,255,0.2); border-radius: 12px; padding: 22px 16px; text-align: center; cursor: pointer; transition: all 0.2s ease;">
+      <div class="du-native-add-box du-zip-dropzone" style="margin-top: 14px; border: 1px dashed rgba(255,255,255,0.15); border-radius: 12px; padding: 16px; text-align: center; cursor: pointer; transition: all 0.2s ease;">
         <input type="file" class="du-zip-file-input" accept=".zip" style="display: none;" />
-        <div style="display: flex; justify-content: center; margin-bottom: 8px;">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="17 8 12 3 7 8"></polyline>
-            <line x1="12" y1="3" x2="12" y2="15"></line>
-          </svg>
+        <div style="font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #ededed);">
+          ${escapeHtml(t.zipDropTitle)}
         </div>
-        <div style="font-size: 13.5px; font-weight: 600; color: var(--dsw-alias-label-primary, #f1f5f9);">
-          Перетащите сюда ZIP-архив с плагином или нажмите для выбора
+        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin-top: 3px;">
+          ${escapeHtml(t.zipDropDesc)}
         </div>
-        <div style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8); margin-top: 5px;">
-          Поддерживаются многофайловые скрипты, манифест <code>plugin.json</code> и ассеты (CSS, HTML, изображения, JSON).
-        </div>
-        <div class="du-zip-status" style="font-size: 12px; margin-top: 10px; font-weight: 500; display: none;"></div>
+        <div class="du-zip-status" style="font-size: 12px; margin-top: 8px; font-weight: 500; display: none;"></div>
       </div>
     </div>
   `;
@@ -5630,13 +5805,13 @@ function renderNativeConfigContent() {
   if (saveMemBtn && memPreview) {
     saveMemBtn.onclick = () => {
       setUserMemoryContent(memPreview.value);
-      saveMemBtn.textContent = '✓ Сохранено';
-      setTimeout(() => { saveMemBtn.textContent = 'Сохранить правку памяти'; }, 2000);
+      saveMemBtn.textContent = t.savedCheck;
+      setTimeout(() => { saveMemBtn.textContent = t.saveMemory; }, 2000);
     };
   }
   if (clearMemBtn) {
     clearMemBtn.onclick = () => {
-      if (confirm('Очистить всю долговременную память агента?')) {
+      if (confirm(t.confirmClearMemory)) {
         setUserMemoryContent('');
         if (memPreview) memPreview.value = '';
       }
@@ -5660,10 +5835,11 @@ function renderNativeConfigContent() {
       if (limitInput) limitInput.value = val;
       panel.querySelectorAll('.du-limit-pill').forEach(p => {
         const pVal = parseInt(p.getAttribute('data-val'), 10);
-        p.style.border = pVal === val ? '1px solid #3b82f6' : '1px solid rgba(255,255,255,0.1)';
-        p.style.background = pVal === val ? 'rgba(59,130,246,0.2)' : 'rgba(0,0,0,0.2)';
-        p.style.color = pVal === val ? '#60a5fa' : 'inherit';
-        p.style.fontWeight = pVal === val ? '600' : '400';
+        if (pVal === val) {
+          p.classList.add('primary');
+        } else {
+          p.classList.remove('primary');
+        }
       });
       showSaved();
     };
@@ -5673,6 +5849,14 @@ function renderNativeConfigContent() {
     limitInput.onchange = () => {
       const val = Math.max(0, parseInt(limitInput.value, 10) || 0);
       setContextLimit(val);
+      panel.querySelectorAll('.du-limit-pill').forEach(p => {
+        const pVal = parseInt(p.getAttribute('data-val'), 10);
+        if (pVal === val) {
+          p.classList.add('primary');
+        } else {
+          p.classList.remove('primary');
+        }
+      });
       showSaved();
     };
   }
@@ -5878,6 +6062,8 @@ function renderNativeSkillsContent() {
   const contentArea = document.querySelector('.ds-scroll-area__content._2db4123');
   if (!contentArea) return;
 
+  const t = getDuI18n();
+
   // Hide original settings items (Theme, Language, Voice)
   Array.from(contentArea.children).forEach(ch => {
     if (!ch.classList.contains('du-native-skills-panel')) {
@@ -5903,8 +6089,8 @@ function renderNativeSkillsContent() {
           <path d="M2 17L12 22L22 17" stroke-linecap="round" stroke-linejoin="round"/>
           <path d="M2 12L12 17L22 12" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
-        <div class="du-empty-text">Нет установленных скиллов</div>
-        <div class="du-empty-hint">Добавьте ссылку на SKILL.md, загрузите файл или вставьте текст ниже</div>
+        <div class="du-empty-text">${escapeHtml(t.noSkills)}</div>
+        <div class="du-empty-hint">${escapeHtml(t.noSkillsHint)}</div>
       </div>
     `;
   } else {
@@ -5914,21 +6100,26 @@ function renderNativeSkillsContent() {
         <div class="du-native-skill-row">
           <div class="du-native-skill-info">
             <div class="du-native-skill-title">
-              <svg class="du-skill-svg-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <svg class="du-skill-svg-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <path d="M8.5 1.5L2.5 9H7.5L6.5 14.5L13.5 7H8.5L9.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
               <span class="du-skill-main-name">${escapeHtml(skill.name)}</span>
             </div>
-            <div class="du-native-skill-desc">${escapeHtml(skill.desc)}</div>
-            <div class="du-native-prompt-box">${escapeHtml(skill.prompt)}</div>
+            <div class="du-native-skill-desc">${escapeHtml(skill.desc || '')}</div>
+            <div class="du-native-skill-details">
+              <button class="du-native-prompt-toggle" type="button" data-toggle-target="prompt_${escapeAttr(skill.id)}">
+                <span>▸ ${escapeHtml(t.detailsPrompt)}</span>
+              </button>
+              <div class="du-native-prompt-box" id="prompt_${escapeAttr(skill.id)}">${escapeHtml(skill.prompt || '')}</div>
+            </div>
           </div>
           <div class="du-native-skill-controls">
             <label class="du-switch">
-              <input type="checkbox" data-skill-id="${skill.id}" ${isChecked ? 'checked' : ''}>
+              <input type="checkbox" data-skill-id="${escapeAttr(skill.id)}" ${isChecked ? 'checked' : ''}>
               <span class="du-slider"></span>
             </label>
-            <button class="du-native-del-btn" data-delete-id="${skill.id}" title="Удалить скилл">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <button class="du-native-del-btn" data-delete-id="${escapeAttr(skill.id)}" title="${escapeAttr(t.delSkillTitle)}">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M2 4h12M5.333 4V2.667a1.333 1.333 0 011.334-1.334h2.666a1.333 1.333 0 011.334 1.334V4m2 0v9.333a1.333 1.333 0 01-1.334 1.334H4.667a1.333 1.333 0 01-1.334-1.334V4h9.334z"/>
               </svg>
             </button>
@@ -5942,58 +6133,80 @@ function renderNativeSkillsContent() {
     <div class="du-native-skills-container">
       <div class="du-native-header-row">
         <div>
-          <div class="du-native-title">Agent Skills</div>
-          <div class="du-native-sub">Управление навыками агента (SKILL.md)</div>
+          <div class="du-native-title">${escapeHtml(t.skillsTitle)}</div>
+          <div class="du-native-sub">${escapeHtml(t.skillsSub)}</div>
         </div>
-        <span class="du-native-badge">${activeSkills.length} активно</span>
+        <span class="du-native-badge">${activeSkills.length} ${escapeHtml(t.activeBadge)}</span>
       </div>
 
       <div class="du-native-skills-list">
         ${listHtml}
       </div>
 
-      <div class="du-native-add-box">
-        <div class="du-native-add-header">
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 3v10M3 8h10"/>
-          </svg>
-          <span class="du-native-add-title">Установка скилла</span>
+      <!-- Clean Collapsible Add Skill Section -->
+      <div class="du-native-add-section">
+        <div class="du-native-section-head">
+          <span class="du-native-section-title">${escapeHtml(t.installTitle)}</span>
+          <button class="du-native-pill-btn du-toggle-install-box" type="button">+ ${escapeHtml(t.installTitle)}</button>
         </div>
-        
-        <div class="du-smart-import-area">
+
+        <div class="du-install-foldable" style="display: none; margin-top: 12px; display: flex; flex-direction: column; gap: 10px;">
           <div class="du-input-with-action">
             <div class="du-input-wrapper">
               <svg class="du-input-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                 <circle cx="8" cy="8" r="6"/>
                 <path d="M2 8h12M8 2a9.9 9.9 0 013 6 9.9 9.9 0 01-3 6 9.9 9.9 0 01-3-6 9.9 9.9 0 013-6z"/>
               </svg>
-              <input class="du-input du-smart-url" placeholder="Вставьте ссылку на GitHub / Gist SKILL.md..." />
+              <input class="du-input du-smart-url" placeholder="${escapeAttr(t.urlPlaceholder)}" />
             </div>
-            <button class="du-btn-primary du-fetch-url-btn" type="button">Загрузить</button>
+            <button class="du-native-pill-btn du-fetch-url-btn" type="button">${escapeHtml(t.loadBtn)}</button>
           </div>
           
-          <div class="du-drop-divider"><span>или загрузите файл</span></div>
-
-          <div class="du-file-dropzone" id="duSkillDropzone">
+          <div class="du-file-dropzone" id="duSkillDropzone" style="padding: 12px; text-align: center; border: 1px dashed var(--dsw-alias-border-subtle, rgba(255,255,255,0.12)); border-radius: 10px; cursor: pointer;">
             <input type="file" id="duSkillFileInput" accept=".md,.txt,.yaml" style="display: none;" />
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
-            </svg>
-            <span class="du-dropzone-text">Перетащите <b>SKILL.md</b> сюда или <a href="#" class="du-browse-link">выберите файл</a></span>
+            <span class="du-dropzone-text" style="font-size: 12px; color: var(--dsw-alias-label-tertiary, #94a3b8);">${escapeHtml(t.dragSkill)}</span>
           </div>
 
-          <textarea class="du-textarea du-smart-raw" placeholder="Или вставьте содержимое SKILL.md / YAML напрямую сюда..." rows="3"></textarea>
+          <textarea class="du-textarea du-smart-raw" placeholder="${escapeAttr(t.rawPlaceholder)}" rows="3" style="font-size: 12px; min-height: 60px;"></textarea>
 
-          <button class="du-btn-install du-submit-skill-btn" type="button">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M8 2v9M4 7l4 4 4-4M2 14h12"/>
-            </svg>
-            <span>Установить скилл</span>
-          </button>
+          <div style="display: flex; justify-content: flex-end;">
+            <button class="du-native-pill-btn primary du-submit-skill-btn" type="button">${escapeHtml(t.installBtn)}</button>
+          </div>
         </div>
       </div>
     </div>
   `;
+
+  // Bind toggles for prompt details
+  panel.querySelectorAll('.du-native-prompt-toggle').forEach(btn => {
+    btn.onclick = () => {
+      const targetId = btn.getAttribute('data-toggle-target');
+      const box = panel.querySelector('#' + targetId);
+      if (box) {
+        const isOpen = box.classList.contains('open');
+        if (isOpen) {
+          box.classList.remove('open');
+          btn.innerHTML = `<span>▸ ${escapeHtml(t.detailsPrompt)}</span>`;
+        } else {
+          box.classList.add('open');
+          btn.innerHTML = `<span>▾ ${escapeHtml(t.hidePrompt)}</span>`;
+        }
+      }
+    };
+  });
+
+  // Fold/Unfold install box
+  const toggleInstallBtn = panel.querySelector('.du-toggle-install-box');
+  const installFoldable = panel.querySelector('.du-install-foldable');
+  if (toggleInstallBtn && installFoldable) {
+    let open = false;
+    installFoldable.style.display = 'none';
+    toggleInstallBtn.onclick = () => {
+      open = !open;
+      installFoldable.style.display = open ? 'flex' : 'none';
+      toggleInstallBtn.textContent = open ? '✕ ' + t.delSkillTitle.replace(/ .*/, '') : '+ ' + t.installTitle;
+    };
+  }
 
   // Bind toggles
   panel.querySelectorAll('input[type="checkbox"]').forEach(chk => {
@@ -6032,16 +6245,16 @@ function renderNativeSkillsContent() {
     fetchUrlBtn.onclick = async () => {
       const url = urlInput.value.trim();
       if (!url) return;
-      fetchUrlBtn.innerText = 'Загрузка...';
+      fetchUrlBtn.innerText = t.loadingBtn;
       try {
         const resp = await fetch(url);
         const text = await resp.text();
         rawTextarea.value = text;
-        fetchUrlBtn.innerText = 'Успешно';
-        setTimeout(() => { fetchUrlBtn.innerText = 'Загрузить'; }, 1500);
+        fetchUrlBtn.innerText = t.loadedBtn;
+        setTimeout(() => { fetchUrlBtn.innerText = t.loadBtn; }, 1500);
       } catch (e) {
-        alert('Ошибка загрузки: ' + e.message);
-        fetchUrlBtn.innerText = 'Ошибка';
+        alert('Fetch error: ' + e.message);
+        fetchUrlBtn.innerText = 'Error';
       }
     };
   }
@@ -6049,16 +6262,9 @@ function renderNativeSkillsContent() {
   // File Drop / Browse
   const dropzone = panel.querySelector('#duSkillDropzone');
   const fileInput = panel.querySelector('#duSkillFileInput');
-  const browseLink = panel.querySelector('.du-browse-link');
 
-  if (browseLink && fileInput) {
-    browseLink.onclick = (e) => {
-      e.preventDefault();
-      fileInput.click();
-    };
-  }
-
-  if (fileInput) {
+  if (dropzone && fileInput) {
+    dropzone.onclick = () => fileInput.click();
     fileInput.onchange = (e) => {
       const file = e.target.files[0];
       if (file) {
@@ -6069,14 +6275,11 @@ function renderNativeSkillsContent() {
         reader.readAsText(file);
       }
     };
-  }
-
-  if (dropzone) {
-    dropzone.ondragover = (e) => { e.preventDefault(); dropzone.classList.add('dragover'); };
-    dropzone.ondragleave = () => { dropzone.classList.remove('dragover'); };
+    dropzone.ondragover = (e) => { e.preventDefault(); dropzone.style.borderColor = '#3b82f6'; };
+    dropzone.ondragleave = () => { dropzone.style.borderColor = ''; };
     dropzone.ondrop = (e) => {
       e.preventDefault();
-      dropzone.classList.remove('dragover');
+      dropzone.style.borderColor = '';
       const file = e.dataTransfer.files[0];
       if (file) {
         const reader = new FileReader();
@@ -6094,7 +6297,7 @@ function renderNativeSkillsContent() {
     submitBtn.onclick = () => {
       const raw = rawTextarea.value.trim();
       if (!raw) {
-        alert('Пожалуйста, укажите ссылку, выберите файл или вставьте текст SKILL.md!');
+        alert(t.rawPlaceholder);
         return;
       }
 
@@ -6118,8 +6321,8 @@ function renderNativeSkillsContent() {
           prompt: parsed.prompt
         });
       }
-      if (!activeSkills.includes(skillId)) activeSkills.push(skillId);
 
+      if (!activeSkills.includes(skillId)) activeSkills.push(skillId);
       localStorage.setItem('du_custom_skills', JSON.stringify(customSkills));
       localStorage.setItem('du_active_skills', JSON.stringify(activeSkills));
       syncSkillsToVfs();
