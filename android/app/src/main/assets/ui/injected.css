@@ -414,17 +414,20 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
 .du-native-prompt-toggle {
   background: none;
   border: none;
-  color: #60a5fa;
-  font-size: 11.5px;
+  color: var(--dsw-alias-label-tertiary, #94a3b8);
+  font-size: 12px;
   cursor: pointer;
   padding: 0;
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  transition: color 0.15s ease;
+  text-decoration: none;
 }
 
 .du-native-prompt-toggle:hover {
-  text-decoration: underline;
+  color: var(--dsw-alias-label-primary, #ededed);
+  text-decoration: none;
 }
 
 .du-native-prompt-box {
@@ -446,7 +449,7 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
   display: block;
 }
 
-/* Native buttons matching DeepSeek secondary capsule buttons */
+/* Native buttons matching DeepSeek secondary capsule buttons (borderless flat design) */
 .du-native-pill-btn {
   display: inline-flex;
   align-items: center;
@@ -456,20 +459,21 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
   font-size: 13px;
   font-weight: 500;
   color: var(--dsw-alias-label-primary, #ededed);
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.08));
+  border: none !important;
+  outline: none;
   border-radius: 16px;
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
 .du-native-pill-btn:hover {
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.14));
 }
 
 .du-native-pill-btn.primary {
   background: #3b82f6;
-  border-color: #3b82f6;
+  border: none !important;
   color: #ffffff;
 }
 
@@ -479,7 +483,7 @@ div._9663006:has(.opencode-tool-root) div.ds-flex._0a3d93b {
 
 .du-native-pill-btn.danger {
   color: #ef4444;
-  border-color: rgba(239, 68, 68, 0.3);
+  border: none !important;
   background: transparent;
 }
 
@@ -1681,7 +1685,7 @@ html[data-du-theme] body {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.08));
+  border: none !important;
   background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.04));
   color: var(--dsw-alias-label-secondary, #a1a1aa);
   cursor: pointer;
@@ -1721,7 +1725,7 @@ html[data-du-theme] body {
   gap: 10px;
   padding: 9px 12px;
   background: var(--dsw-alias-interactive-bg-subtle, rgba(255, 255, 255, 0.03));
-  border: 1px solid var(--dsw-alias-border-subtle, rgba(255, 255, 255, 0.06));
+  border: none !important;
   border-radius: 10px;
   transition: background 0.15s;
 }

@@ -5027,7 +5027,6 @@ async function renderNativeFilesContent() {
           <div class="du-native-sub">${mode === 'opfs' ? escapeHtml(t.filesSubOpfs) : escapeHtml(t.filesSubMem)}</div>
         </div>
         <div class="du-files-head-actions">
-          <span class="du-native-badge">${files.length} • ${formatBytes(totalSize)}</span>
           <button class="du-files-btn du-files-refresh-btn" title="${escapeAttr(t.refreshBtn)}" type="button">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 12a9 9 0 11-2.6-6.4"/><polyline points="21 3 21 9 15 9"/>
@@ -5636,7 +5635,6 @@ function renderNativeConfigContent() {
           <div class="du-native-title">${escapeHtml(t.configTitle)}</div>
           <div class="du-native-sub">${escapeHtml(t.configSub)}</div>
         </div>
-        <span class="du-native-badge">${plugins.filter(p => p.enabled).length} ${escapeHtml(t.activeBadge)}</span>
       </div>
 
       <!-- Section: User Profile & Custom Instructions -->
@@ -6100,9 +6098,6 @@ function renderNativeSkillsContent() {
         <div class="du-native-skill-row">
           <div class="du-native-skill-info">
             <div class="du-native-skill-title">
-              <svg class="du-skill-svg-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M8.5 1.5L2.5 9H7.5L6.5 14.5L13.5 7H8.5L9.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
               <span class="du-skill-main-name">${escapeHtml(skill.name)}</span>
             </div>
             <div class="du-native-skill-desc">${escapeHtml(skill.desc || '')}</div>
@@ -6136,7 +6131,6 @@ function renderNativeSkillsContent() {
           <div class="du-native-title">${escapeHtml(t.skillsTitle)}</div>
           <div class="du-native-sub">${escapeHtml(t.skillsSub)}</div>
         </div>
-        <span class="du-native-badge">${activeSkills.length} ${escapeHtml(t.activeBadge)}</span>
       </div>
 
       <div class="du-native-skills-list">
